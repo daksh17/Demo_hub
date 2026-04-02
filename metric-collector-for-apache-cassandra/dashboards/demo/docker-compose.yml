@@ -454,10 +454,214 @@ services:
     depends_on:
       cassandra2:
         condition: service_healthy
+
+  # --- PostgreSQL 1 primary + 2 replicas (Bitnami), Kafka + ZooKeeper, Debezium Connect ---
+  # CQL/users: DB demo, app user demo/demopass, replication replicator/replicatorpass, CDC debezium/debezium
+  # Host CQL: 15432 primary, 15433 replica-1, 15434 replica-2 | Kafka localhost:9092 | Connect REST localhost:8083
+  # After stack is healthy: cd postgres-kafka && chmod +x register-connectors.sh && ./register-connectors.sh
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - demo_net
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    restart: unless-stopped
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server kafka:29092 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 8
+      start_period: 40s
+    networks:
+      - demo_net
+
+  postgresql-primary:
+    # Bitnami frequently removes dated tags; use :latest or pin by digest in production.
+    image: docker.io/bitnami/postgresql:latest
+    restart: unless-stopped
+    ports:
+      - "15432:5432"
+    environment:
+      POSTGRESQL_REPLICATION_MODE: master
+      POSTGRESQL_REPLICATION_USER: replicator
+      POSTGRESQL_REPLICATION_PASSWORD: replicatorpass
+      POSTGRESQL_USERNAME: demo
+      POSTGRESQL_PASSWORD: demopass
+      POSTGRESQL_DATABASE: demo
+      POSTGRESQL_EXTRA_FLAGS: "-c wal_level=logical -c max_replication_slots=8 -c max_wal_senders=8"
+    volumes:
+      - postgres_primary_data:/bitnami/postgresql
+      - "./postgres-kafka/01-init-debezium.sql:/docker-entrypoint-initdb.d/01-init-debezium.sql:ro"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U demo -d demo -h 127.0.0.1 -p 5432"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    networks:
+      - demo_net
+
+  postgresql-replica-1:
+    image: docker.io/bitnami/postgresql:latest
+    restart: unless-stopped
+    ports:
+      - "15433:5432"
+    environment:
+      POSTGRESQL_REPLICATION_MODE: slave
+      POSTGRESQL_REPLICATION_USER: replicator
+      POSTGRESQL_REPLICATION_PASSWORD: replicatorpass
+      POSTGRESQL_MASTER_HOST: postgresql-primary
+      POSTGRESQL_MASTER_PORT_NUMBER: "5432"
+      POSTGRESQL_USERNAME: demo
+      POSTGRESQL_PASSWORD: demopass
+    volumes:
+      - postgres_replica1_data:/bitnami/postgresql
+    depends_on:
+      postgresql-primary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U demo -d demo -h 127.0.0.1 -p 5432"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    networks:
+      - demo_net
+
+  postgresql-replica-2:
+    image: docker.io/bitnami/postgresql:latest
+    restart: unless-stopped
+    ports:
+      - "15434:5432"
+    environment:
+      POSTGRESQL_REPLICATION_MODE: slave
+      POSTGRESQL_REPLICATION_USER: replicator
+      POSTGRESQL_REPLICATION_PASSWORD: replicatorpass
+      POSTGRESQL_MASTER_HOST: postgresql-primary
+      POSTGRESQL_MASTER_PORT_NUMBER: "5432"
+      POSTGRESQL_USERNAME: demo
+      POSTGRESQL_PASSWORD: demopass
+    volumes:
+      - postgres_replica2_data:/bitnami/postgresql
+    depends_on:
+      postgresql-primary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U demo -d demo -h 127.0.0.1 -p 5432"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    networks:
+      - demo_net
+
+  kafka-connect:
+    image: quay.io/debezium/connect:2.7.3.Final
+    restart: unless-stopped
+    ports:
+      - "8083:8083"
+    environment:
+      BOOTSTRAP_SERVERS: kafka:29092
+      GROUP_ID: pgdemo-connect-cluster
+      CONFIG_STORAGE_TOPIC: pgdemo_connect_configs
+      OFFSET_STORAGE_TOPIC: pgdemo_connect_offsets
+      STATUS_STORAGE_TOPIC: pgdemo_connect_statuses
+      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgresql-primary:
+        condition: service_healthy
+    networks:
+      - demo_net
+
+  postgres-exporter-primary:
+    image: prometheuscommunity/postgres-exporter:v0.17.1
+    restart: unless-stopped
+    environment:
+      # v0.17+: URI is host:port/db only; user/pass are separate (full URL here breaks scraping).
+      DATA_SOURCE_URI: "postgresql-primary:5432/demo?sslmode=disable"
+      DATA_SOURCE_USER: demo
+      DATA_SOURCE_PASS: demopass
+    networks:
+      - demo_net
+    depends_on:
+      postgresql-primary:
+        condition: service_healthy
+
+  postgres-exporter-replica-1:
+    image: prometheuscommunity/postgres-exporter:v0.17.1
+    restart: unless-stopped
+    environment:
+      DATA_SOURCE_URI: "postgresql-replica-1:5432/demo?sslmode=disable"
+      DATA_SOURCE_USER: demo
+      DATA_SOURCE_PASS: demopass
+    networks:
+      - demo_net
+    depends_on:
+      postgresql-replica-1:
+        condition: service_healthy
+
+  postgres-exporter-replica-2:
+    image: prometheuscommunity/postgres-exporter:v0.17.1
+    restart: unless-stopped
+    environment:
+      DATA_SOURCE_URI: "postgresql-replica-2:5432/demo?sslmode=disable"
+      DATA_SOURCE_USER: demo
+      DATA_SOURCE_PASS: demopass
+    networks:
+      - demo_net
+    depends_on:
+      postgresql-replica-2:
+        condition: service_healthy
+
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:v1.7.0
+    restart: unless-stopped
+    command:
+      - "--kafka.server=kafka:29092"
+    ports:
+      - "9308:9308"
+    networks:
+      - demo_net
+    depends_on:
+      kafka:
+        condition: service_healthy
+
 networks:
   demo_net:
     name: mcac_net
     driver: bridge
 volumes:
   mcac_data:
+    driver: local
+  postgres_primary_data:
+    driver: local
+  postgres_replica1_data:
+    driver: local
+  postgres_replica2_data:
     driver: local

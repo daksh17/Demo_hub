@@ -1,0 +1,16 @@
+sequenceDiagram
+  participant App
+  participant Primary
+  participant Wal as WAL + publication
+  participant Connect as Kafka Connect
+  participant Kafka
+  participant Sink as JDBC sink
+
+  App->>Primary: SQL on demo_items
+  Primary->>Wal: commit + logical msg
+  Connect->>Primary: poll slot (replicator user)
+  Wal-->>Connect: change event
+  Connect->>Kafka: produce to demopg.public.demo_items
+  Kafka->>Sink: consume batch
+  Sink->>Primary: INSERT/UPSERT demo_items_from_kafka
+  Note over Primary,Sink: Sink table not in publication → no CDC loop

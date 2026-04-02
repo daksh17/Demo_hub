@@ -1,0 +1,39 @@
+flowchart TB
+  subgraph pg["PostgreSQL cluster"]
+    P[("Primary\nwritable")]
+    R1[("Replica 1")]
+    R2[("Replica 2")]
+    P -->|streaming replication| R1
+    P -->|streaming replication| R2
+  end
+
+  subgraph k["Kafka"]
+    Z[ZooKeeper]
+    B[Kafka broker]
+    Z --- B
+  end
+
+  subgraph kc["Kafka Connect (Debezium)"]
+    SRC["PostgresConnector\n(CDC source)"]
+    SNK["JdbcSinkConnector\n(Kafka → PG)"]
+  end
+
+  APP["Apps / psql"] -->|INSERT/UPDATE demo_items| P
+  SRC -->|read WAL / logical slot| P
+  SRC -->|produce change events| B
+  B -->|consume events| SNK
+  SNK -->|writes demo_items_from_kafka| P
+
+  subgraph obs["Observability"]
+    PE[postgres_exporter ×3]
+    KE[kafka_exporter]
+    PR[Prometheus]
+    GF[Grafana]
+    PE -.->|SQL stats| P
+    PE -.->|SQL stats| R1
+    PE -.->|SQL stats| R2
+    KE -.->|Kafka API| B
+    PE -->|/metrics| PR
+    KE -->|/metrics| PR
+    PR -->|queries| GF
+  end

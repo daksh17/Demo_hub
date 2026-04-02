@@ -299,3 +299,38 @@ scrape_configs:
        replacement: ${1}${2}
      - regex: prom_name
        action: labeldrop
+
+  # PostgreSQL (Bitnami demo: primary + replicas) via postgres_exporter
+  - job_name: "postgres_pgdemo"
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    metrics_path: /metrics
+    scheme: http
+    static_configs:
+      - targets:
+          - postgres-exporter-primary:9187
+        labels:
+          pg_cluster: pgdemo
+          pg_role: primary
+      - targets:
+          - postgres-exporter-replica-1:9187
+        labels:
+          pg_cluster: pgdemo
+          pg_role: replica_1
+      - targets:
+          - postgres-exporter-replica-2:9187
+        labels:
+          pg_cluster: pgdemo
+          pg_role: replica_2
+
+  # Kafka (danielqsj/kafka-exporter; broker PLAINTEXT kafka:29092)
+  - job_name: "kafka_pgdemo"
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    metrics_path: /metrics
+    scheme: http
+    static_configs:
+      - targets:
+          - kafka-exporter:9308
+        labels:
+          kafka_cluster: pgdemo
