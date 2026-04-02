@@ -18,13 +18,14 @@ services:
       - demo_net
   grafana:
     container_name: mcac-metric-dashboards_grafana_1
-    image: "grafana/grafana:6.7.2"
+    image: "grafana/grafana:11.4.0"
     ports:
       - "3001:3000"
     environment:
       GF_INSTALL_PLUGINS: "grafana-polystat-panel"
       GF_SECURITY_ADMIN_PASSWORD: admin
       GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
     volumes:
       - "${GRAFANA_DATA_DIR:-grafana}:/var/lib/grafana"
       - "./grafana/prometheus-datasource.yaml:/etc/grafana/provisioning/datasources/prometheus-datasource.yaml"
