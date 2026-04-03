@@ -694,6 +694,7 @@ services:
     # Mount app.py so UI/API changes apply after `docker compose restart hub-demo-ui` without rebuild.
     volumes:
       - ./realtime-orders-search-hub/demo-ui/app.py:/app/app.py:ro
+      - ./realtime-orders-search-hub/demo-ui/scenario.py:/app/scenario.py:ro
     restart: unless-stopped
     ports:
       - "8888:8888"
@@ -705,6 +706,7 @@ services:
       CASSANDRA_KEYSPACE: demo_hub
       OPENSEARCH_URL: http://opensearch:9200
       OPENSEARCH_INDEX: hub-orders
+      KAFKA_BOOTSTRAP: kafka:29092
     networks:
       - demo_net
     depends_on:
@@ -714,6 +716,8 @@ services:
         condition: service_healthy
       mongo-kafka-prepare:
         condition: service_completed_successfully
+      kafka:
+        condition: service_healthy
       redis:
         condition: service_healthy
       opensearch:

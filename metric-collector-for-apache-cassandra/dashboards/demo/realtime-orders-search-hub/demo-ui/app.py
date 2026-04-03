@@ -19,6 +19,8 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pymongo import MongoClient
 
+import scenario
+
 WORKLOAD_SUSTAIN_MAX_SECONDS = int(
     os.environ.get("WORKLOAD_SUSTAIN_MAX_SECONDS", str(9 * 3600))
 )
@@ -149,8 +151,13 @@ async def lifespan(app: FastAPI):
     _cassandra_insert_prep = _cassandra_session.prepare(
         f"INSERT INTO {HUB_KEYSPACE}.orders (order_id, label, created_at) VALUES (?, ?, ?)"
     )
+    scenario.ensure_cassandra_scenario_schema(_cassandra_session)
+    with psycopg.connect(PG_DSN) as conn:
+        scenario.ensure_postgres_scenario_schema(conn)
+        conn.commit()
     with httpx.Client(timeout=120.0) as hc:
         _ensure_opensearch_index(hc)
+        scenario.ensure_scenario_os_index(hc)
     yield
     cluster.shutdown()
 
@@ -160,7 +167,7 @@ app = FastAPI(title="Realtime hub demo UI", lifespan=lifespan)
 NAV = """
   <nav style="margin-bottom:1rem;font-size:0.95rem;">
     <a href="/">Single order</a> · <a href="/workload">Workload</a> ·
-    <a href="/reads">Read-back</a>
+    <a href="/reads">Read-back</a> · <a href="/scenario">Scenario</a>
   </nav>
 """
 
@@ -480,6 +487,256 @@ READS_PAGE = f"""<!DOCTYPE html>
       doRead();
       timer = setInterval(doRead, ms);
     }});
+  </script>
+</body>
+</html>
+"""
+
+_SCENARIO_PAGE_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Multi-DB scenario — hub demo</title>
+  <style>
+    :root { font-family: ui-sans-serif, system-ui, sans-serif; background: #0f1419; color: #e7e9ea; }
+    body { margin: 0; padding: 1rem 1.25rem 2rem; line-height: 1.55; }
+    a { color: #6cb5f4; }
+    h1 { font-size: 1.35rem; margin-top: 0; }
+    h2 { font-size: 1.05rem; margin-top: 1.25rem; color: #8899a6; }
+    h3 { font-size: 0.95rem; margin: 1rem 0 0.35rem; color: #c4cfd6; }
+    .layout {
+      display: grid;
+      grid-template-columns: 1fr minmax(280px, 400px);
+      gap: 1.5rem;
+      align-items: start;
+      max-width: 75rem;
+      margin: 0 auto;
+    }
+    @media (max-width: 960px) {
+      .layout { grid-template-columns: 1fr; }
+      .diagram-aside { position: static !important; max-height: none !important; }
+    }
+    .main-col { min-width: 0; }
+    .diagram-aside {
+      position: sticky;
+      top: 0.75rem;
+      background: #16181c;
+      border: 1px solid #38444d;
+      border-radius: 10px;
+      padding: 0.75rem;
+      max-height: calc(100vh - 1.5rem);
+      overflow: auto;
+    }
+    .diagram-aside h2 { margin-top: 0; font-size: 0.95rem; color: #8899a6; }
+    .flow-svg { width: 100%; height: auto; display: block; }
+    .flow-svg text { font-family: ui-sans-serif, system-ui, sans-serif; fill: #e7e9ea; }
+    .flow-svg .muted { fill: #71767b; font-size: 10px; }
+    .flow-svg .box { fill: #252a35; stroke: #6cb5f4; stroke-width: 1.25; }
+    .flow-svg .step { fill: #1d9bf0; font-size: 11px; font-weight: 700; }
+    .flow-svg .arrow { stroke: #8899a6; stroke-width: 1.5; fill: none; marker-end: url(#ah); }
+    button {
+      background: #1d9bf0; color: #fff; border: 0; border-radius: 9999px;
+      padding: 0.5rem 1.1rem; font-size: 0.95rem; font-weight: 600; cursor: pointer; margin: 0.35rem 0.35rem 0 0;
+    }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    pre {
+      background: #16181c; border: 1px solid #2f3336; border-radius: 8px;
+      padding: 1rem; overflow: auto; font-size: 0.72rem; max-height: 18rem;
+    }
+    .grid { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0.75rem 0; }
+    .ok { color: #7af87a; } .err { color: #f66; }
+    .hint { color: #71767b; font-size: 0.88rem; }
+    details.behind { margin: 0.5rem 0; border-left: 3px solid #38444d; padding-left: 0.75rem; }
+    details.behind summary { cursor: pointer; color: #6cb5f4; font-weight: 600; }
+    code { font-size: 0.88em; background: #252a30; padding: 0.12em 0.35em; border-radius: 4px; }
+    .line-flow-wrap {
+      background: #16181c;
+      border: 1px solid #38444d;
+      border-radius: 10px;
+      padding: 0.75rem 0.5rem 1rem;
+      margin: 1rem 0 1.25rem;
+      overflow-x: auto;
+    }
+    .line-flow-wrap h2 { margin: 0 0 0.5rem; font-size: 1rem; color: #8899a6; }
+    .line-flow { width: 100%; min-width: 560px; height: auto; display: block; }
+    .line-flow .spine { stroke: #6cb5f4; stroke-width: 2.5; fill: none; }
+    .line-flow .node { fill: #1d9bf0; stroke: #e7e9ea; stroke-width: 1.5; }
+    .line-flow .lbl { font-size: 11px; fill: #e7e9ea; font-weight: 600; }
+    .line-flow .sub { font-size: 9px; fill: #71767b; }
+    .line-flow .fan { stroke: #4a5f78; stroke-width: 1.2; fill: none; }
+    .flow-svg .fan { stroke: #4a5f78; stroke-width: 1.2; fill: none; }
+  </style>
+</head>
+<body>
+  @@NAV@@
+  <div class="layout">
+    <div class="main-col">
+      <h1>Multi-DB scenario (Faker + pipelines)</h1>
+      <div class="line-flow-wrap">
+        <h2>Pipeline line diagram</h2>
+        <svg class="line-flow" viewBox="0 0 620 125" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Horizontal pipeline: four connected steps">
+          <defs>
+            <marker id="line-arr" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+              <path d="M0,0 L6,3 L0,6 Z" fill="#6cb5f4"/>
+            </marker>
+          </defs>
+          <line class="spine" x1="82" y1="52" x2="172" y2="52" marker-end="url(#line-arr)"/>
+          <line class="spine" x1="202" y1="52" x2="292" y2="52" marker-end="url(#line-arr)"/>
+          <line class="spine" x1="322" y1="52" x2="412" y2="52" marker-end="url(#line-arr)"/>
+          <line class="spine" x1="442" y1="52" x2="532" y2="52" marker-end="url(#line-arr)"/>
+          <circle class="node" cx="70" cy="52" r="10"/>
+          <circle class="node" cx="190" cy="52" r="10"/>
+          <circle class="node" cx="310" cy="52" r="10"/>
+          <circle class="node" cx="430" cy="52" r="10"/>
+          <circle class="node" cx="550" cy="52" r="10"/>
+          <text x="70" y="28" text-anchor="middle" class="lbl">1 · Seed</text>
+          <text x="190" y="28" text-anchor="middle" class="lbl">2 · Sync</text>
+          <text x="310" y="28" text-anchor="middle" class="lbl">3 · Order</text>
+          <text x="430" y="28" text-anchor="middle" class="lbl">4 · Fulfill</text>
+          <text x="550" y="28" text-anchor="middle" class="lbl">◆</text>
+          <text x="70" y="78" text-anchor="middle" class="sub">Faker→Mongo</text>
+          <text x="190" y="78" text-anchor="middle" class="sub">PG+K+OS+R</text>
+          <text x="310" y="78" text-anchor="middle" class="sub">PG+K+OS+R+C*</text>
+          <text x="430" y="78" text-anchor="middle" class="sub">PG+K+OS+C*</text>
+          <text x="550" y="78" text-anchor="middle" class="sub">end</text>
+          <text x="300" y="108" text-anchor="middle" class="sub">C* = Cassandra · K = Kafka · OS = hub-scenario-pipeline · R = Redis · PG = Postgres</text>
+        </svg>
+      </div>
+      <p class="hint"><strong>Mongo</strong> is the <em>catalog service</em>: rich product docs in <code>demo.scenario_products</code>.
+        <strong>Postgres</strong> holds a <em>relational mirror</em> (<code>scenario_catalog_mirror</code>), <em>orders</em> (<code>scenario_orders</code>), and <em>fulfillment lines</em> (<code>scenario_fulfillment_lines</code>).
+        <strong>Kafka</strong> gets event payloads for integration testing; the same JSON is written to <strong>OpenSearch</strong> index <code>hub-scenario-pipeline</code> (simulating what a Kafka→OpenSearch sink would index).
+        <strong>Redis</strong> stores a small dashboard summary + a rolling list of recent pipeline events + per-order cache keys.
+        <strong>Cassandra</strong> appends an <em>order timeline</em> (<code>demo_hub.scenario_timeline</code>) for steps 3–4.</p>
+
+      <h2>Behind the scenes (each button)</h2>
+      <details class="behind" open>
+        <summary>1 · Seed Mongo catalog (Faker)</summary>
+        <p class="hint">Runs <code>scenario.op_seed_catalog</code>: <strong>Faker</strong> generates titles, categories, prices, stock, warehouse, description. Inserts <strong>one document per product</strong> into MongoDB <code>demo.scenario_products</code> (unique <code>sku</code>). No other database is touched yet.</p>
+      </details>
+      <details class="behind">
+        <summary>2 · Sync catalog → Postgres + Kafka + OpenSearch</summary>
+        <p class="hint">Runs <code>op_pipeline_mongo_to_postgres_and_kafka</code>: reads up to 80 products from Mongo, <strong>UPSERTs</strong> into Postgres <code>scenario_catalog_mirror</code>. For each row it sends a message to Kafka topic <code>scenario.catalog.changes</code> (if the broker is reachable) and <strong>indexes the same payload</strong> into OpenSearch <code>hub-scenario-pipeline</code> with direction <code>mongo→kafka+os</code>. Pushes a short entry onto Redis list <code>scenario:kafka:recent</code> and refreshes <code>scenario:dashboard:summary</code> (counts from Postgres + Mongo).</p>
+      </details>
+      <details class="behind">
+        <summary>3 · Place random order</summary>
+        <p class="hint">Runs <code>op_place_order</code>: loads SKUs from Mongo, loads prices from <code>scenario_catalog_mirror</code> when possible (otherwise random cents). Inserts one row into <code>scenario_orders</code> with JSON <code>lines</code>, customer fields, <code>order_ref</code>. Produces <code>scenario.orders.events</code> on Kafka, mirrors to OpenSearch, writes <code>ORDER_PLACED</code> to Cassandra <code>scenario_timeline</code>, sets Redis key <code>scenario:order:latest:&lt;order_ref&gt;</code> (1h TTL), updates recent list + dashboard summary.</p>
+      </details>
+      <details class="behind">
+        <summary>4 · Fulfillment rows + Kafka + OS + Cassandra</summary>
+        <p class="hint">Runs <code>op_pipeline_postgres_to_fulfillment_and_kafka</code>: finds Postgres orders that have <strong>no</strong> rows in <code>scenario_fulfillment_lines</code> yet, expands each order’s <code>lines</code> JSON into fulfillment rows, produces <code>scenario.pipeline.sync</code> on Kafka, indexes OpenSearch with <code>postgres→kafka+os</code>, appends <code>FULFILLMENT_READY</code> on Cassandra timeline, commits Postgres.</p>
+      </details>
+
+      <h2>Run pipelines (order matters the first time)</h2>
+      <p class="hint">You need <strong>catalog in Mongo</strong> before sync; <strong>mirror in Postgres</strong> helps pricing on step 3; step 4 needs <strong>orders</strong> in Postgres that are not yet fulfilled.</p>
+      <div>
+        <button type="button" id="b_seed">1 · Seed Mongo catalog (Faker)</button>
+        <button type="button" id="b_sync">2 · Sync catalog → Postgres + Kafka + OpenSearch</button>
+        <button type="button" id="b_order">3 · Place random order</button>
+        <button type="button" id="b_fulfill">4 · Fulfillment rows + Kafka + OS + Cassandra</button>
+      </div>
+      <p id="st"></p>
+      <pre id="out">Click a step to see JSON.</pre>
+      <h2>View data per store</h2>
+      <div class="grid">
+        <a href="/scenario/data/postgres">Postgres</a>
+        <a href="/scenario/data/mongo">Mongo</a>
+        <a href="/scenario/data/redis">Redis</a>
+        <a href="/scenario/data/cassandra">Cassandra</a>
+        <a href="/scenario/data/opensearch">OpenSearch</a>
+        <a href="/scenario/data/kafka">Kafka (meta)</a>
+      </div>
+    </div>
+    <aside class="diagram-aside">
+      <h2>Vertical line (detail)</h2>
+      <p class="hint" style="margin-top:0">Spine + branches. Same steps as the horizontal line above.</p>
+      <svg class="flow-svg" viewBox="0 0 300 560" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Vertical scenario timeline">
+        <defs>
+          <marker id="ah" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto">
+            <path d="M0,0 L8,4 L0,8 Z" fill="#8899a6"/>
+          </marker>
+        </defs>
+        <line x1="40" y1="28" x2="40" y2="480" stroke="#6cb5f4" stroke-width="3" stroke-linecap="round"/>
+        <circle class="node" cx="40" cy="40" r="9" fill="#1d9bf0" stroke="#e7e9ea" stroke-width="1.5"/>
+        <circle class="node" cx="40" cy="140" r="9" fill="#1d9bf0" stroke="#e7e9ea" stroke-width="1.5"/>
+        <circle class="node" cx="40" cy="260" r="9" fill="#1d9bf0" stroke="#e7e9ea" stroke-width="1.5"/>
+        <circle class="node" cx="40" cy="380" r="9" fill="#1d9bf0" stroke="#e7e9ea" stroke-width="1.5"/>
+        <path class="arrow" d="M55 40 L115 40"/>
+        <text x="120" y="44" font-size="11px" fill="#e7e9ea" font-weight="700">① Faker → Mongo</text>
+        <text x="120" y="58" class="muted">demo.scenario_products</text>
+        <path class="arrow" d="M55 140 L115 140"/>
+        <text x="120" y="132" font-size="11px" fill="#e7e9ea" font-weight="700">② Mongo → bus</text>
+        <text x="120" y="146" class="muted">PG mirror · Kafka · OS · Redis</text>
+        <path class="fan" stroke="#4a5f78" d="M115 152 L115 168 L200 168 M115 168 L230 152 M115 168 L260 180"/>
+        <text x="205" y="176" class="muted">catalog.changes</text>
+        <text x="240" y="190" class="muted">hub-scenario-pipeline</text>
+        <path class="arrow" d="M55 260 L115 260"/>
+        <text x="120" y="252" font-size="11px" fill="#e7e9ea" font-weight="700">③ New order</text>
+        <text x="120" y="266" class="muted">scenario_orders · events · OS · Redis · C*</text>
+        <path class="arrow" d="M55 380 L115 380"/>
+        <text x="120" y="372" font-size="11px" fill="#e7e9ea" font-weight="700">④ Fulfillment</text>
+        <text x="120" y="386" class="muted">fulfillment_lines · pipeline.sync · OS · C*</text>
+        <text x="55" y="430" font-size="10px" fill="#8899a6">*C* = Cassandra timeline</text>
+        <text x="55" y="448" class="muted">ORDER_PLACED · FULFILLMENT_READY</text>
+        <text x="55" y="472" font-size="10px" fill="#8899a6">Topics</text>
+        <text x="55" y="488" class="muted">scenario.catalog / .orders / .pipeline</text>
+      </svg>
+    </aside>
+  </div>
+  <script>
+    async function call(path, st, out) {
+      st.textContent = "…";
+      st.className = "";
+      out.textContent = "";
+      try {
+        const r = await fetch(path, { method: "POST" });
+        const data = await r.json();
+        out.textContent = JSON.stringify(data, null, 2);
+        st.textContent = r.ok && data.ok !== false ? "OK." : "See JSON.";
+        st.className = r.ok && data.ok !== false ? "ok" : "err";
+      } catch (e) {
+        st.textContent = String(e);
+        st.className = "err";
+      }
+    }
+    const st = document.getElementById("st");
+    const out = document.getElementById("out");
+    document.getElementById("b_seed").onclick = () => call("/api/scenario/seed?count=12", st, out);
+    document.getElementById("b_sync").onclick = () => call("/api/scenario/pipeline/mongo-sync", st, out);
+    document.getElementById("b_order").onclick = () => call("/api/scenario/order", st, out);
+    document.getElementById("b_fulfill").onclick = () => call("/api/scenario/pipeline/fulfill", st, out);
+  </script>
+</body>
+</html>
+"""
+
+SCENARIO_PAGE = _SCENARIO_PAGE_TEMPLATE.replace("@@NAV@@", NAV)
+
+SCENARIO_DATA_PAGE = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Scenario data view — hub demo</title>
+  <style>
+    :root {{ font-family: ui-sans-serif, system-ui, sans-serif; background: #0f1419; color: #e7e9ea; }}
+    body {{ max-width: 58rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }}
+    a {{ color: #6cb5f4; }}
+    pre {{ background: #16181c; border: 1px solid #2f3336; border-radius: 8px; padding: 1rem; overflow: auto; font-size: 0.76rem; max-height: 36rem; white-space: pre-wrap; }}
+  </style>
+</head>
+<body>
+  {NAV}
+  <h1 id="title">Loading…</h1>
+  <p><a href="/scenario">← Scenario hub</a></p>
+  <pre id="out"></pre>
+  <script>
+    const store = location.pathname.split("/").pop();
+    document.getElementById("title").textContent = "Data: " + store;
+    fetch("/api/scenario/view/" + encodeURIComponent(store))
+      .then((r) => r.json())
+      .then((d) => {{ document.getElementById("out").textContent = JSON.stringify(d, null, 2); }})
+      .catch((e) => {{ document.getElementById("out").textContent = String(e); }});
   </script>
 </body>
 </html>
@@ -855,6 +1112,58 @@ async def workload_page():
 @app.get("/reads", response_class=HTMLResponse)
 async def reads_page():
     return HTMLResponse(READS_PAGE)
+
+
+@app.get("/scenario", response_class=HTMLResponse)
+async def scenario_page():
+    return HTMLResponse(SCENARIO_PAGE)
+
+
+@app.get("/scenario/data/{store}", response_class=HTMLResponse)
+async def scenario_data_page(store: str):
+    _ = store  # rendered client-side from path
+    return HTMLResponse(SCENARIO_DATA_PAGE)
+
+
+@app.post("/api/scenario/seed")
+async def api_scenario_seed(count: int = 12):
+    return scenario.op_seed_catalog(min(max(count, 1), 50))
+
+
+@app.post("/api/scenario/pipeline/mongo-sync")
+async def api_scenario_mongo_sync():
+    return scenario.op_pipeline_mongo_to_postgres_and_kafka()
+
+
+@app.post("/api/scenario/order")
+async def api_scenario_order():
+    return scenario.op_place_order(cassandra_session=_cassandra_session)
+
+
+@app.post("/api/scenario/pipeline/fulfill")
+async def api_scenario_fulfill():
+    return scenario.op_pipeline_postgres_to_fulfillment_and_kafka(_cassandra_session)
+
+
+@app.get("/api/scenario/view/{store}")
+async def api_scenario_view(store: str):
+    key = store.lower().strip()
+    try:
+        if key == "postgres":
+            return scenario.fetch_view_postgres()
+        if key == "mongo":
+            return scenario.fetch_view_mongo()
+        if key == "redis":
+            return scenario.fetch_view_redis()
+        if key == "cassandra":
+            return scenario.fetch_view_cassandra(_cassandra_session)
+        if key == "opensearch":
+            return scenario.fetch_view_opensearch()
+        if key == "kafka":
+            return scenario.fetch_view_kafka_meta()
+    except Exception as e:
+        raise HTTPException(500, str(e)) from e
+    raise HTTPException(404, f"unknown store: {store}")
 
 
 @app.post("/api/workload/read")

@@ -34,6 +34,8 @@ Service **`hub-demo-ui`** in **`../docker-compose.yml`** serves a small page on 
 
 **Tunable load:** open **http://localhost:8888/workload** to drive batches with **total records**, **batch size**, **payload size (KB)**, and choose **Postgres / Mongo / Redis / Cassandra / OpenSearch**. OpenSearch writes go to index **`hub-workload`** (large payloads × many rows can stress disk; stay within the UI limits).
 
+**Multi-DB scenario (Faker, pipelines):** **http://localhost:8888/scenario** seeds a **MongoDB** product catalog (rich documents), syncs a mirror into **Postgres**, emits **Kafka** topics (`scenario.catalog.changes`, `scenario.orders.events`, `scenario.pipeline.sync`), indexes the same payloads in **OpenSearch** (`hub-scenario-pipeline`) as a stand-in for a Kafka→OpenSearch sink, refreshes **Redis** dashboard keys, and writes order timelines to **Cassandra**. Use the numbered buttons, then open each store’s **View data** page. Requires **`docker compose build hub-demo-ui`** after pulling (adds Faker + kafka-python). **Full narrative with Mermaid diagrams, connector counts, source/sink tables, and Mongo sharding:** [`scenario-flow/README.md`](scenario-flow/README.md). **Compact version:** [`README-SCENARIO-FLOW.md`](README-SCENARIO-FLOW.md).
+
 | Store | What the UI writes | Quick verify |
 |--------|-------------------|--------------|
 | **Postgres** | Row in **`demo_items`** (CDC to Kafka if the Postgres connector is registered) | JSON shows `id` / `name`; or `SELECT * FROM demo_items ORDER BY id DESC LIMIT 5;` on **15432** |

@@ -6,3 +6,5 @@ redis==5.2.1
 cassandra-driver==3.29.2
 httpx==0.28.1
 pydantic==2.10.3
+Faker==33.1.0
+kafka-python==2.0.2
