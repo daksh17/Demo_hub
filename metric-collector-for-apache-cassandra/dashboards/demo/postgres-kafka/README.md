@@ -1,5 +1,7 @@
 # PostgreSQL, Debezium, and Kafka (demo stack)
 
+Part of **`dashboards/demo`**: Postgres, Kafka, Connect, and exporters are defined in **`../docker-compose.yml`**. Shared broker docs: **[`../kafka/README.md`](../kafka/README.md)**. Metrics UI: **[`../observability/README.md`](../observability/README.md)**.
+
 This folder documents the **PostgreSQL primary + two streaming replicas**, **Apache Kafka** with **ZooKeeper**, **Debezium Kafka Connect** (CDC in both directions via source + JDBC sink), and **observability** wired into the same Prometheus and Grafana used by the MCAC demo.
 
 ## Architecture
@@ -126,6 +128,99 @@ The Prometheus config includes jobs **`postgres_pgdemo`** and **`kafka_pgdemo`**
 curl -s 'http://localhost:9090/api/v1/targets' | head -c 2000
 ```
 
+## MongoDB sharded cluster + Kafka (optional)
+
+The same **ZooKeeper**, **Kafka** broker, and **Kafka Connect** instance used for PostgreSQL can run a **second CDC pipeline** against the demo **sharded MongoDB** cluster (config replica set **`configReplSet`**, shards **`tic`**, **`tac`**, **`toe`**, three **`mongos`** routers). Scripts and the custom Connect image live under **`../mongo-kafka/`** (short reference: [mongo-kafka/README.md](../mongo-kafka/README.md)).
+
+### Architecture (Mongo + Kafka)
+
+- **Topology (nine data-plane containers):** three **config servers**, three **shard replica sets** (one mongod each in this demo), three **`mongos`** processes. Clients (and Debezium) talk to **`mongos`** on **`mongodb://mongo-mongos1:27017`** inside the Compose network; on the host, **mongos1** is mapped to **27025** (see main `docker-compose.yml`).
+- **CDC source:** Debezium **`MongoDbConnector`** uses MongoDB **change streams** ( **`capture.mode` = `change_streams_update_full`** ) via **`mongos`**—the supported path for a **sharded cluster** in current Debezium releases.
+- **Kafka topics:** logical prefix **`demomongo`**. Per Debezium naming, captured collection **`demo.demo_items`** produces topic **`demomongo.demo.demo_items`**.
+- **Sink:** The official **`MongoSinkConnector`** ( **`-all`** JAR from Maven Central, bundled in the custom Connect image) consumes that topic and writes **`demo.demo_items_from_kafka`**. The sink applies **`io.debezium.connector.mongodb.transforms.ExtractNewDocumentState`** so the Debezium envelope becomes plain document fields the sink can persist (**do not** use **`ExtractNewRecordState`** here—it expects a JDBC-style `Struct` and fails on Mongo’s JSON-style payloads).
+- **Prepare step:** Compose service **`mongo-kafka-prepare`** runs **`prepare-demo-collections.sh`** after **`mongo-shard-add`** completes: **`sh.enableSharding("demo")`**, **`shardCollection`** on **`demo.demo_items`** and **`demo.demo_items_from_kafka`**, seed inserts on **`demo_items`**.
+- **Loop safety:** **`collection.include.list`** is only **`demo.demo_items`**. The sink target collection is **not** captured, so **CDC → Kafka → sink** does not feed back into the source stream (same pattern as **`demo_items_from_kafka`** in Postgres).
+- **Connect image:** **`docker compose build kafka-connect`** builds **`mcac-demo/kafka-connect:2.7.3-mongo-sink`** from **`../mongo-kafka/Dockerfile.connect`** (Debezium **`connect:2.7.3.Final`** + **`mongo-kafka-connect-1.14.1-all.jar`**).
+
+### How the Mongo workflow works (short)
+
+1. Applications or **`mongosh`** issue writes to **`demo.demo_items`** through **`mongos`**; documents land on the appropriate shard (tic / tac / toe).
+2. **`mongo-source-demo`** reads the **change stream** through **`mongos`**, emits Debezium events, and **produces** to **`demomongo.demo.demo_items`**.
+3. **`mongo-sink-demo`** **consumes** that topic, runs **ExtractNewDocumentState**, and **writes** documents into **`demo.demo_items_from_kafka`** via **`mongos`**.
+4. **Prometheus** scrapes **`mongodb-exporter`** (targeting **`mongo-mongos1`**) and **kafka-exporter**; **Grafana** can show the **MongoDB tic/tac/toe** overview dashboard (`mongodb-tictactoe-overview.json` in `generated-dashboards`).
+
+### Mongo component diagram
+
+![MongoDB sharded cluster, Kafka, Kafka Connect, prepare job, observability](diagrams/mongo-workflow-components.svg)
+
+_Source: [`diagrams/mongo-workflow-components.mmd`](diagrams/mongo-workflow-components.mmd). Regenerate the SVG (from `postgres-kafka`):_
+
+`npx --yes @mermaid-js/mermaid-cli@11.4.0 -i diagrams/mongo-workflow-components.mmd -o diagrams/mongo-workflow-components.svg -b transparent`
+
+### Mongo CDC and round-trip sequence
+
+![MongoDB change capture: demo_items → Kafka → demo_items_from_kafka](diagrams/mongo-cdc-sequence.svg)
+
+_Source: [`diagrams/mongo-cdc-sequence.mmd`](diagrams/mongo-cdc-sequence.mmd). Regenerate:_
+
+`npx --yes @mermaid-js/mermaid-cli@11.4.0 -i diagrams/mongo-cdc-sequence.mmd -o diagrams/mongo-cdc-sequence.svg -b transparent`
+
+### Mongo step-by-step walkthrough
+
+1. **Start Mongo dependencies** (from `dashboards/demo`): config servers, shard nodes, **`mongo-shard-init-rs`**, **`mongos`** ×3, **`mongo-shard-add`**, then **`mongo-kafka-prepare`**. Ensure **Kafka** and **ZooKeeper** are up if you have not already started the Postgres demo stack.
+2. **Build and start Kafka Connect** so the worker loads the **Mongo sink** plugin:  
+   `docker compose build kafka-connect`  
+   `docker compose up -d kafka-connect`
+3. **Register connectors** from the repo (paths relative to `dashboards/demo`):  
+   `chmod +x mongo-kafka/register-mongo-connectors.sh`  
+   `./mongo-kafka/register-mongo-connectors.sh`  
+   Optional URL: `./mongo-kafka/register-mongo-connectors.sh http://localhost:8083`
+4. **Confirm connector state:**  
+   `curl -s http://localhost:8083/connectors/mongo-source-demo/status`  
+   `curl -s http://localhost:8083/connectors/mongo-sink-demo/status`  
+   Both connectors should show **`RUNNING`** tasks after the initial snapshot.
+
+### Mongo ports (host)
+
+| Service | Port (typical) |
+|---------|-----------------|
+| mongos 1 | **27025** |
+| mongos 2 | **27026** |
+| mongos 3 | **27027** |
+| Kafka (same as Postgres flow) | **9092** |
+| Kafka Connect REST | **8083** |
+| mongodb-exporter (optional) | **9216** |
+| Prometheus / Grafana | **9090** / **3000** |
+
+### Mongo connectors (reference)
+
+| Name | Class | Role |
+|------|--------|------|
+| **`mongo-source-demo`** | `io.debezium.connector.mongodb.MongoDbConnector` | CDC from **`demo.demo_items`**; **`topic.prefix`** **`demomongo`**; connection **`mongodb://mongo-mongos1:27017`**. |
+| **`mongo-sink-demo`** | `com.mongodb.kafka.connect.MongoSinkConnector` | Consumes **`demomongo.demo.demo_items`**; **`connection.uri`** **`mongodb://mongo-mongos1:27017`**; writes **`demo.demo_items_from_kafka`**; **SMT** **`ExtractNewDocumentState`**. |
+
+### Mongo quick verification
+
+```bash
+# From dashboards/demo — compare source vs sink collections on mongos
+docker compose exec mongo-mongos1 mongosh demo --eval 'db.demo_items.find().limit(3); db.demo_items_from_kafka.find().limit(3)'
+```
+
+Insert a test document on the host (example uses **mongos1** port **27025**):
+
+```bash
+mongosh "mongodb://127.0.0.1:27025/demo" --eval 'db.demo_items.insertOne({ name: "cdc-test", qty: 42 })'
+```
+
+After a short delay, the same logical document (with flattened **`_id`**) should appear in **`demo_items_from_kafka`** if both connectors are healthy.
+
+### Mongo troubleshooting
+
+1. **Sink task `FAILED` with “Only Struct objects supported … found: java.lang.String”** — the sink is using **`ExtractNewRecordState`**. Use **`io.debezium.connector.mongodb.transforms.ExtractNewDocumentState`** (as in **`register-mongo-connectors.sh`**).
+2. **`mongo-source-demo` cannot connect** — ensure **`mongos`** is healthy and the URI uses **`mongo-mongos1:27017`** from **inside** the Connect container (not `localhost`).
+3. **No topics or empty sink** — run **`mongo-kafka-prepare`** successfully once; confirm **`sh.status()`** shows **`demo`** enabled and **`demo_items`** sharded. Re-run **`./mongo-kafka/register-mongo-connectors.sh`** after fixing the cluster.
+4. **Connect missing `MongoSinkConnector`** — rebuild the image: **`docker compose build kafka-connect`** and recreate the **`kafka-connect`** container.
+
 ## Register Debezium connectors
 
 When **Kafka Connect** answers on [http://localhost:8083](http://localhost:8083):
@@ -239,8 +334,10 @@ Adjust volume names if your Compose project name is not `demo` (`docker volume l
 | `apply-ensure-debezium.sh` | Applies `ensure-debezium-cdc.sql` as `demo` (fixes old DBs missing publication/`replicator` **SELECT**). |
 | `seed-dummy-data.sql` | Inserts **30** extra `demo_items` rows (run anytime on an existing DB). |
 | `register-connectors.sh` | Registers Debezium PostgreSQL source and JDBC sink via Connect REST API. |
-| `diagrams/*.mmd` | Mermaid source for README diagrams. |
+| `diagrams/*.mmd` | Mermaid source for README diagrams (Postgres + Mongo). |
 | `diagrams/*.svg` | Rendered diagrams embedded in this README. |
+| `diagrams/mongo-workflow-components.mmd` / `.svg` | Mongo sharding + Connect + observability component diagram. |
+| `diagrams/mongo-cdc-sequence.mmd` / `.svg` | Mongo CDC → Kafka → sink sequence diagram. |
 | `README.md` | This document. |
 
-Service definitions are in `../docker-compose.yml` (ZooKeeper, Kafka, Postgres ×3, Connect, exporters).
+Mongo connector scripts and **Connect Dockerfile** live in **`../mongo-kafka/`**. **Single** service file: `../docker-compose.yml`. Other area guides: **`../cassandra/README.md`**, **`../kafka/README.md`**, **`../observability/README.md`**, **`../mongo-sharded/README.md`**.

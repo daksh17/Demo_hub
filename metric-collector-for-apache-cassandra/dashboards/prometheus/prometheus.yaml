@@ -29,7 +29,7 @@ scrape_configs:
       - targets:
           - nodetool-exporter:9104
 
-  # MongoDB: sharded cluster (mongos:8000) + local instance (27017).
+  # MongoDB: 9-node sharded demo (3 cfg + 3 shards tic/tac/toe + 3 mongos) via Percona exporter on mongos1.
   - job_name: "mongodb"
     scrape_interval: 15s
     scrape_timeout: 10s
@@ -39,12 +39,14 @@ scrape_configs:
       - targets:
           - mongodb-exporter:9216
         labels:
-          cluster: "local"
-          shard_topology: "tic-tac-toe"
+          mongo_cluster: "tictactoe"
+          mongo_topology: "sharded"
+          mongo_exporter_target: "mongos"
       - targets:
           - mongodb-exporter-local:9216
         labels:
-          cluster: "local-standalone"
+          mongo_cluster: "host-standalone"
+          mongo_topology: "standalone"
 
   - job_name: "mcac"
     scrape_interval: 15s

@@ -1,0 +1,44 @@
+flowchart TB
+  subgraph mongo["MongoDB sharded cluster (9 containers)"]
+    CFG["configReplSet\n3× config server"]
+    TIC["Replica set tic"]
+    TAC["Replica set tac"]
+    TOE["Replica set toe"]
+    MS["mongos ×3\n(routers)"]
+    MS --> CFG
+    MS --> TIC
+    MS --> TAC
+    MS --> TOE
+  end
+
+  subgraph k["Kafka"]
+    Z[ZooKeeper]
+    B[Kafka broker]
+    Z --- B
+  end
+
+  subgraph kc["Kafka Connect (Debezium + Mongo sink JAR)"]
+    MSRC["MongoDbConnector\nmongo-source-demo"]
+    MSNK["MongoSinkConnector\nmongo-sink-demo\n+ ExtractNewDocumentState SMT"]
+  end
+
+  subgraph prep["One-shot prepare (compose)"]
+    MKP["mongo-kafka-prepare\nshard DB demo + seed demo_items"]
+  end
+
+  APP["mongosh / drivers"] -->|read/write via mongos| MS
+  MKP -.->|enableSharding + shardCollection| MS
+  MSRC -->|change streams\nmongodb://mongo-mongos1:27017| MS
+  MSRC -->|produce CDC events| B
+  B -->|demomongo.demo.demo_items| MSNK
+  MSNK -->|writes demo_items_from_kafka\nnot in capture list| MS
+
+  subgraph obs["Observability (main compose)"]
+    MXP["mongodb_exporter to mongos"]
+    KE[kafka_exporter]
+    PR[Prometheus]
+    GF[Grafana]
+    MXP -.->|/metrics| PR
+    KE -.->|/metrics| PR
+    PR -->|MongoDB tic/tac/toe dashboard| GF
+  end

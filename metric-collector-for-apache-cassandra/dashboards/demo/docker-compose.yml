@@ -1,3 +1,8 @@
+# dashboards/demo — single compose file for Cassandra, Kafka/ZK/Connect, Postgres, Mongo sharded,
+# Prometheus, Grafana, exporters. Per-area docs (same directory):
+#   cassandra/README.md · kafka/README.md · observability/README.md
+#   postgres-kafka/README.md · mongo-kafka/README.md · mongo-sharded/README.md
+# Index: README.md
 services:
   prometheus:
     image: "prom/prometheus:v2.17.1"
@@ -45,22 +50,6 @@ services:
     depends_on:
       cassandra2:
         condition: service_healthy
-
-  # MongoDB exporter for locally hosted sharded cluster (mongos:8000, config:8010, shards tic/tac/toe).
-  # Connects to mongos; Prometheus scrapes this container. Use host.docker.internal to reach host MongoDB.
-  mongodb-exporter:
-    image: percona/mongodb_exporter:0.40
-    restart: unless-stopped
-    ports:
-      - "9216:9216"
-    environment:
-      - MONGODB_URI=mongodb://host.docker.internal:8000
-    command: ["--collect-all", "--compatible-mode"]
-    extra_hosts:
-      # Required on Linux for host.docker.internal; no-op on Mac/Windows
-      - "host.docker.internal:host-gateway"
-    networks:
-      - demo_net
 
   # MongoDB exporter for local standalone/replica on port 27017.
   mongodb-exporter-local:
@@ -459,7 +448,7 @@ services:
   # --- PostgreSQL 1 primary + 2 replicas (Bitnami), Kafka + ZooKeeper, Debezium Connect ---
   # CQL/users: DB demo, app user demo/demopass, replication replicator/replicatorpass, CDC debezium/debezium
   # Host CQL: 15432 primary, 15433 replica-1, 15434 replica-2 | Kafka localhost:9092 | Connect REST localhost:8083
-  # After stack is healthy: cd postgres-kafka && chmod +x register-connectors.sh && ./register-connectors.sh
+  # kafka-connect image: build ./mongo-kafka (Debezium 2.7 + Mongo sink). Postgres: postgres-kafka/register-connectors.sh | Mongo: mongo-kafka/register-mongo-connectors.sh
   zookeeper:
     image: confluentinc/cp-zookeeper:7.6.1
     restart: unless-stopped
@@ -580,7 +569,10 @@ services:
       - demo_net
 
   kafka-connect:
-    image: quay.io/debezium/connect:2.7.3.Final
+    build:
+      context: ./mongo-kafka
+      dockerfile: Dockerfile.connect
+    image: mcac-demo/kafka-connect:2.7.3-mongo-sink
     restart: unless-stopped
     ports:
       - "8083:8083"
@@ -653,6 +645,206 @@ services:
       kafka:
         condition: service_healthy
 
+  # --- MongoDB sharded cluster (9 containers): 3 configsvr + 3 shard RS (tic,tac,toe) + 3 mongos ---
+  mongo-config1:
+    image: mongo:7.0
+    command: ["mongod", "--port", "27017", "--configsvr", "--replSet", "configReplSet", "--bind_ip_all"]
+    volumes:
+      - mongo_cfg1_data:/data/db
+    networks:
+      - demo_net
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.runCommand({ ping: 1 })"]
+      interval: 5s
+      timeout: 10s
+      retries: 40
+
+  mongo-config2:
+    image: mongo:7.0
+    command: ["mongod", "--port", "27017", "--configsvr", "--replSet", "configReplSet", "--bind_ip_all"]
+    volumes:
+      - mongo_cfg2_data:/data/db
+    networks:
+      - demo_net
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.runCommand({ ping: 1 })"]
+      interval: 5s
+      timeout: 10s
+      retries: 40
+
+  mongo-config3:
+    image: mongo:7.0
+    command: ["mongod", "--port", "27017", "--configsvr", "--replSet", "configReplSet", "--bind_ip_all"]
+    volumes:
+      - mongo_cfg3_data:/data/db
+    networks:
+      - demo_net
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.runCommand({ ping: 1 })"]
+      interval: 5s
+      timeout: 10s
+      retries: 40
+
+  mongo-shard-tic:
+    image: mongo:7.0
+    command: ["mongod", "--port", "27017", "--shardsvr", "--replSet", "tic", "--bind_ip_all"]
+    volumes:
+      - mongo_shard_tic_data:/data/db
+    networks:
+      - demo_net
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.runCommand({ ping: 1 })"]
+      interval: 5s
+      timeout: 10s
+      retries: 40
+
+  mongo-shard-tac:
+    image: mongo:7.0
+    command: ["mongod", "--port", "27017", "--shardsvr", "--replSet", "tac", "--bind_ip_all"]
+    volumes:
+      - mongo_shard_tac_data:/data/db
+    networks:
+      - demo_net
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.runCommand({ ping: 1 })"]
+      interval: 5s
+      timeout: 10s
+      retries: 40
+
+  mongo-shard-toe:
+    image: mongo:7.0
+    command: ["mongod", "--port", "27017", "--shardsvr", "--replSet", "toe", "--bind_ip_all"]
+    volumes:
+      - mongo_shard_toe_data:/data/db
+    networks:
+      - demo_net
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.runCommand({ ping: 1 })"]
+      interval: 5s
+      timeout: 10s
+      retries: 40
+
+  mongo-shard-init-rs:
+    image: mongo:7.0
+    depends_on:
+      mongo-config1:
+        condition: service_healthy
+      mongo-config2:
+        condition: service_healthy
+      mongo-config3:
+        condition: service_healthy
+      mongo-shard-tic:
+        condition: service_healthy
+      mongo-shard-tac:
+        condition: service_healthy
+      mongo-shard-toe:
+        condition: service_healthy
+    volumes:
+      - "./mongo-sharded/init-replica-sets.sh:/init-replica-sets.sh:ro"
+    entrypoint: ["bash", "/init-replica-sets.sh"]
+    networks:
+      - demo_net
+    restart: "no"
+
+  mongo-mongos1:
+    image: mongo:7.0
+    depends_on:
+      mongo-shard-init-rs:
+        condition: service_completed_successfully
+    command:
+      - mongos
+      - --configdb
+      - configReplSet/mongo-config1:27017,mongo-config2:27017,mongo-config3:27017
+      - --bind_ip_all
+    ports:
+      - "27025:27017"
+    networks:
+      - demo_net
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.runCommand({ ping: 1 })"]
+      interval: 5s
+      timeout: 10s
+      retries: 40
+
+  mongo-mongos2:
+    image: mongo:7.0
+    depends_on:
+      mongo-shard-init-rs:
+        condition: service_completed_successfully
+    command:
+      - mongos
+      - --configdb
+      - configReplSet/mongo-config1:27017,mongo-config2:27017,mongo-config3:27017
+      - --bind_ip_all
+    ports:
+      - "27026:27017"
+    networks:
+      - demo_net
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.runCommand({ ping: 1 })"]
+      interval: 5s
+      timeout: 10s
+      retries: 40
+
+  mongo-mongos3:
+    image: mongo:7.0
+    depends_on:
+      mongo-shard-init-rs:
+        condition: service_completed_successfully
+    command:
+      - mongos
+      - --configdb
+      - configReplSet/mongo-config1:27017,mongo-config2:27017,mongo-config3:27017
+      - --bind_ip_all
+    ports:
+      - "27027:27017"
+    networks:
+      - demo_net
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.runCommand({ ping: 1 })"]
+      interval: 5s
+      timeout: 10s
+      retries: 40
+
+  mongo-shard-add:
+    image: mongo:7.0
+    depends_on:
+      mongo-mongos1:
+        condition: service_healthy
+    volumes:
+      - "./mongo-sharded/add-shards.sh:/add-shards.sh:ro"
+    entrypoint: ["bash", "/add-shards.sh"]
+    networks:
+      - demo_net
+    restart: "no"
+
+  mongodb-exporter:
+    image: percona/mongodb_exporter:0.40
+    restart: unless-stopped
+    ports:
+      - "9216:9216"
+    environment:
+      - MONGODB_URI=mongodb://mongo-mongos1:27017
+    command: ["--collect-all", "--compatible-mode"]
+    networks:
+      - demo_net
+    depends_on:
+      mongo-shard-add:
+        condition: service_completed_successfully
+
+  # Sharded collections + seeds for Debezium Mongo source (after tic/tac/toe shards are registered).
+  mongo-kafka-prepare:
+    image: mongo:7.0
+    depends_on:
+      mongo-shard-add:
+        condition: service_completed_successfully
+    volumes:
+      - "./mongo-kafka/prepare-demo-collections.sh:/prepare-demo-collections.sh:ro"
+    entrypoint: ["bash", "/prepare-demo-collections.sh"]
+    networks:
+      - demo_net
+    restart: "no"
+
 networks:
   demo_net:
     name: mcac_net
@@ -665,4 +857,16 @@ volumes:
   postgres_replica1_data:
     driver: local
   postgres_replica2_data:
+    driver: local
+  mongo_cfg1_data:
+    driver: local
+  mongo_cfg2_data:
+    driver: local
+  mongo_cfg3_data:
+    driver: local
+  mongo_shard_tic_data:
+    driver: local
+  mongo_shard_tac_data:
+    driver: local
+  mongo_shard_toe_data:
     driver: local

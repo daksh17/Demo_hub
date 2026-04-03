@@ -1,0 +1,17 @@
+sequenceDiagram
+  participant App as App / mongosh
+  participant Mongos as mongos
+  participant Shards as Shards tic/tac/toe
+  participant Connect as Kafka Connect
+  participant Kafka as Kafka broker
+  participant Sink as Mongo sink + SMT
+
+  App->>Mongos: insert/update demo.demo_items
+  Mongos->>Shards: routed document writes
+  Note over Shards: Change streams on shard primaries
+  Connect->>Mongos: MongoDbConnector polls change stream
+  Connect->>Kafka: produce demomongo.demo.demo_items
+  Kafka->>Sink: consume records
+  Note over Sink: ExtractNewDocumentState flattens Debezium envelope for BSON
+  Sink->>Mongos: write demo.demo_items_from_kafka
+  Note over App,Mongos: demo_items_from_kafka not in collection.include.list → no CDC loop

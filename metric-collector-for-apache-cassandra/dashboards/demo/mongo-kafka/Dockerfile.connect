@@ -1,0 +1,9 @@
+# Debezium Connect 2.7 + MongoDB Kafka sink (fat JAR from Maven Central).
+FROM quay.io/debezium/connect:2.7.3.Final
+USER root:root
+ARG MKC_VERSION=1.14.1
+RUN mkdir -p /kafka/connect/mongodb-kafka-connect \
+    && curl -fsSL \
+      "https://repo1.maven.org/maven2/org/mongodb/kafka/mongo-kafka-connect/${MKC_VERSION}/mongo-kafka-connect-${MKC_VERSION}-all.jar" \
+      -o /kafka/connect/mongodb-kafka-connect/mongo-kafka-connect-all.jar
+USER kafka:kafka
