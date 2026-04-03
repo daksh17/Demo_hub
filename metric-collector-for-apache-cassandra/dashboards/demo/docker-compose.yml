@@ -1,6 +1,6 @@
 # dashboards/demo — single compose file for Cassandra, Kafka/ZK/Connect, Postgres, Mongo sharded,
-# Prometheus, Grafana, exporters. Per-area docs (same directory):
-#   cassandra/README.md · kafka/README.md · observability/README.md
+# Redis 7, OpenSearch, Prometheus, Grafana, exporters. Per-area docs (same directory):
+#   cassandra/README.md · kafka/README.md · observability/README.md · redis/README.md · opensearch/README.md
 #   postgres-kafka/README.md · mongo-kafka/README.md · mongo-sharded/README.md
 # Index: README.md
 services:
@@ -845,6 +845,95 @@ services:
       - demo_net
     restart: "no"
 
+  # --- Redis 7 (password required); see redis/README.md ---
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: "${REDIS_PASSWORD:-demoredispass}"
+    command: ["sh", "-c", "exec redis-server --appendonly yes --requirepass \"$$REDIS_PASSWORD\""]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - demo_net
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.62.0
+    restart: unless-stopped
+    environment:
+      REDIS_ADDR: "redis:6379"
+      REDIS_PASSWORD: "${REDIS_PASSWORD:-demoredispass}"
+    ports:
+      - "9121:9121"
+    networks:
+      - demo_net
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # --- OpenSearch single-node (dev: security plugin disabled); see opensearch/README.md ---
+  opensearch:
+    image: opensearchproject/opensearch:2.11.1
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - DISABLE_SECURITY_PLUGIN=true
+      - DISABLE_INSTALL_DEMO_CONFIG=true
+      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m -XX:MaxDirectMemorySize=256m"
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    ports:
+      - "9200:9200"
+      - "9600:9600"
+    volumes:
+      - opensearch_data:/usr/share/opensearch/data
+    networks:
+      - demo_net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sSf http://127.0.0.1:9200 >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 90s
+
+  opensearch-dashboards:
+    image: opensearchproject/opensearch-dashboards:2.11.1
+    restart: unless-stopped
+    environment:
+      - OPENSEARCH_HOSTS=["http://opensearch:9200"]
+      - DISABLE_SECURITY_DASHBOARDS_PLUGIN=true
+    ports:
+      - "5601:5601"
+    networks:
+      - demo_net
+    depends_on:
+      opensearch:
+        condition: service_healthy
+
+  opensearch-exporter:
+    image: quay.io/prometheuscommunity/elasticsearch-exporter:v1.7.0
+    restart: unless-stopped
+    command:
+      - "--es.uri=http://opensearch:9200"
+      - "--es.all"
+      - "--es.indices"
+      - "--es.timeout=30s"
+    networks:
+      - demo_net
+    depends_on:
+      opensearch:
+        condition: service_healthy
+
 networks:
   demo_net:
     name: mcac_net
@@ -869,4 +958,8 @@ volumes:
   mongo_shard_tac_data:
     driver: local
   mongo_shard_toe_data:
+    driver: local
+  redis_data:
+    driver: local
+  opensearch_data:
     driver: local

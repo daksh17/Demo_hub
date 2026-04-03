@@ -336,3 +336,27 @@ scrape_configs:
           - kafka-exporter:9308
         labels:
           kafka_cluster: pgdemo
+
+  # Redis 7 (oliver006/redis_exporter; password via compose REDIS_PASSWORD)
+  - job_name: "redis_demo"
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    metrics_path: /metrics
+    scheme: http
+    static_configs:
+      - targets:
+          - redis-exporter:9121
+        labels:
+          redis_cluster: demo
+
+  # OpenSearch (prometheuscommunity/elasticsearch-exporter; HTTP to opensearch:9200, security off in demo)
+  - job_name: "opensearch_demo"
+    scrape_interval: 30s
+    scrape_timeout: 25s
+    metrics_path: /metrics
+    scheme: http
+    static_configs:
+      - targets:
+          - opensearch-exporter:9114
+        labels:
+          os_cluster: demo

@@ -21,6 +21,8 @@ Defined in **`../../prometheus/prometheus.yaml`** (path inside the repo: `dashbo
 | `mongodb` | `mongodb-exporter`, optional `mongodb-exporter-local` | Sharded demo + host Mongo |
 | `postgres_pgdemo` | postgres exporters ×3 | Bitnami Postgres demo |
 | `kafka_pgdemo` | `kafka-exporter` | Broker / consumer lag style metrics |
+| `redis_demo` | `redis-exporter:9121` | Redis 7 via [oliver006/redis_exporter](https://github.com/oliver006/redis_exporter); provisioned **Redis (demo broker)** (`redis-demo-overview.json`, UID **`demo-redis`**). Community IDs **763** / **11835** often need K8s variable fixes — see **`../redis/README.md`** |
+| `opensearch_demo` | `opensearch-exporter:9114` | OpenSearch via [prometheuscommunity/elasticsearch-exporter](https://github.com/prometheus-community/elasticsearch-exporter); Grafana IDs **14191**, **2322** — see **`../opensearch/README.md`** |
 
 After editing **`prometheus.yaml`**, reload the stack or restart Prometheus:
 

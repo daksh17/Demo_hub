@@ -1,12 +1,14 @@
 ### Cluster Demo
 
-This directory’s **`docker-compose.yml`** defines **one** stack (Cassandra, ZooKeeper/Kafka/Connect, optional Postgres and Mongo demos, Prometheus, Grafana). Topic-specific guides live in subfolders:
+This directory’s **`docker-compose.yml`** defines **one** stack (Cassandra, ZooKeeper/Kafka/Connect, optional Postgres and Mongo demos, **Redis 7**, **OpenSearch**, Prometheus, Grafana). Topic-specific guides live in subfolders:
 
 | Folder | Focus |
 |--------|--------|
 | **[`cassandra/`](cassandra/README.md)** | Cassandra + MCAC + nodetool-exporter |
 | **[`kafka/`](kafka/README.md)** | ZooKeeper, Kafka broker, Kafka Connect image |
 | **[`observability/`](observability/README.md)** | Prometheus + Grafana provisioning |
+| **[`redis/`](redis/README.md)** | Redis **7** (password, AOF, volume) |
+| **[`opensearch/`](opensearch/README.md)** | OpenSearch single-node + Dashboards (dev, HTTP) |
 | **[`postgres-kafka/`](postgres-kafka/README.md)** | PostgreSQL HA + Debezium + JDBC sink |
 | **[`mongo-kafka/`](mongo-kafka/README.md)** | Sharded Mongo + Debezium + Mongo sink |
 | **[`mongo-sharded/`](mongo-sharded/README.md)** | Init scripts for config/shard/mongos (`tic` / `tac` / `toe`) |
