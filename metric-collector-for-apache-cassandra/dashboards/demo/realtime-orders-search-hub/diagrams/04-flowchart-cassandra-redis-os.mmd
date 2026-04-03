@@ -1,0 +1,29 @@
+%% Cassandra + Redis + OpenSearch — how they complement Kafka CDC
+flowchart LR
+  subgraph ingest [From Kafka or API]
+    K[Kafka topics]
+    A[API direct]
+  end
+
+  subgraph write_path [Write paths]
+    C1[Step 1: High volume timeline events to Cassandra]
+    R1[Step 2: Short TTL read models in Redis]
+    O1[Step 3: Denormalized docs bulk to OpenSearch]
+  end
+
+  subgraph read_path [Read paths]
+    CQ[Analytics CQL time range by partition]
+    RQ[Cache aside GET order status]
+    OQ[Search browse fuzzy filters]
+  end
+
+  K --> C1
+  K --> R1
+  K --> O1
+  A --> C1
+  A --> R1
+  A --> O1
+
+  C1 --> CQ
+  R1 --> RQ
+  O1 --> OQ

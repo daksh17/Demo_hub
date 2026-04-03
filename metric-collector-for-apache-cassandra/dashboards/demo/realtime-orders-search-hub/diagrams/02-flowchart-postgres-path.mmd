@@ -1,0 +1,18 @@
+%% Postgres → Kafka → downstream (stepped flow)
+flowchart TD
+  S1[Step 1: Application connects to Postgres primary host 15432]
+  S2[Step 2: INSERT UPDATE DELETE on captured tables e.g. demo_items]
+  S3[Step 3: WAL committed on primary replicas catch up physically]
+  S4[Step 4: Debezium PostgresConnector polls replication slot]
+  S5[Step 5: Serialize change event Avro or JSON to Kafka topic]
+  S6[Step 6: Topic demopg schema table consumers subscribe]
+  S7[Step 7a: JdbcSink writes demo_items_from_kafka not in publication loop safe]
+  S8[Step 7b: Your worker updates OpenSearch index]
+  S9[Step 7c: Your worker invalidates or updates Redis keys]
+  S10[Step 7d: Your worker appends analytics row to Cassandra]
+
+  S1 --> S2 --> S3 --> S4 --> S5 --> S6
+  S6 --> S7
+  S6 --> S8
+  S6 --> S9
+  S6 --> S10

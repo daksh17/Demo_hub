@@ -1,0 +1,65 @@
+%% Realtime orders & search hub — all components on mcac_net (demo compose)
+flowchart TB
+  subgraph clients [Clients]
+    U[Browser / mobile app]
+    API[Your API service]
+  end
+
+  subgraph rdbms [PostgreSQL HA demo]
+    PG[(Primary :15432)]
+    PR1[(Replica 1)]
+    PR2[(Replica 2)]
+  end
+
+  subgraph mongo [MongoDB sharded]
+    MS[mongos :27025 host]
+    TIC[tic / tac / toe shards]
+  end
+
+  subgraph kafka_stack [Kafka plane]
+    ZK[ZooKeeper]
+    K[Kafka :9092]
+    KC[Kafka Connect :8083]
+  end
+
+  subgraph nosql [Cassandra + cache + search]
+    CS[(Cassandra cluster)]
+    RD[(Redis :6379)]
+    OS[(OpenSearch :9200)]
+    OSD[Dashboards :5601]
+  end
+
+  subgraph obs [Observability]
+    PROM[Prometheus :9090]
+    GF[Grafana :3000]
+  end
+
+  U --> API
+  API --> PG
+  API --> MS
+  API --> CS
+  API --> RD
+  API --> OS
+
+  PG --> PR1
+  PG --> PR2
+  MS --> TIC
+
+  PG --> KC
+  MS --> KC
+  KC --> K
+  ZK --> K
+
+  KC -. optional consumers / sinks .-> OS
+  KC -. optional consumers .-> RD
+  KC -. optional consumers .-> CS
+
+  OSD --> OS
+
+  PG --> PROM
+  MS --> PROM
+  K --> PROM
+  CS --> PROM
+  RD --> PROM
+  OS --> PROM
+  PROM --> GF

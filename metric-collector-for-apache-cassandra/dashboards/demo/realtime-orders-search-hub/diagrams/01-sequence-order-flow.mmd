@@ -1,0 +1,36 @@
+%% End-to-end sequence: one "order" touches Postgres, Mongo, Kafka, Cassandra, Redis, OpenSearch
+sequenceDiagram
+  autonumber
+  participant App as API / worker
+  participant PG as Postgres primary
+  participant M as Mongos
+  participant Connect as Kafka Connect
+  participant K as Kafka
+  participant C as Cassandra
+  participant R as Redis
+  participant O as OpenSearch
+  participant OS as OpenSearch Dashboards
+
+  Note over App, O: Step A — persist order (OLTP)
+  App->>PG: INSERT order + line items
+  PG-->>App: OK (order_id)
+
+  Note over App, M: Step B — update catalog / stock (document)
+  App->>M: update catalog collection (e.g. sku stockByWarehouse)
+  M-->>App: OK
+
+  Note over PG, K: Step C — CDC to Kafka (Debezium sources)
+  PG--)Connect: logical replication / WAL events
+  Connect->>K: produce demopg.public.*
+  M--)Connect: change streams via mongos
+  Connect->>K: produce demomongo.demo.*
+
+  Note over App, K: Step D — fan-out (your microservices or Flink-style jobs)
+  K--)App: consume order + catalog topics
+  App->>C: INSERT INTO order_events PARTITION ...
+  App->>R: SET order:status:{id} EX TTL
+  App->>O: bulk index orders_search doc
+
+  Note over App, OS: Step E — human visibility
+  OS->>O: queries / dev tools
+  App-->>OS: (optional) deep links from support UI

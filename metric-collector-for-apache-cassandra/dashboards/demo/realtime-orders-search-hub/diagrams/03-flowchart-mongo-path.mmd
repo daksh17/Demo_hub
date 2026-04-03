@@ -1,0 +1,15 @@
+%% Mongo sharded → Kafka → sink (stepped flow)
+flowchart TD
+  M1[Step 1: Application connects to mongos e.g. localhost 27025]
+  M2[Step 2: Writes to sharded collection demo.demo_items]
+  M3[Step 3: Hashed shard key routes doc to tic tac or toe shard]
+  M4[Step 4: Debezium MongoDbConnector reads change stream via mongos]
+  M5[Step 5: Events published to demomongo.demo.demo_items]
+  M6[Step 6: MongoSinkConnector with ExtractNewDocumentState]
+  M7[Step 7: Writes to demo.demo_items_from_kafka not captured loop safe]
+  M8[Step 8: Optional consumer updates OpenSearch for catalog search]
+  M9[Step 9: Optional consumer caches hot SKUs in Redis]
+
+  M1 --> M2 --> M3 --> M4 --> M5 --> M6 --> M7
+  M5 --> M8
+  M5 --> M9

@@ -12,6 +12,7 @@ This directory’s **`docker-compose.yml`** defines **one** stack (Cassandra, Zo
 | **[`postgres-kafka/`](postgres-kafka/README.md)** | PostgreSQL HA + Debezium + JDBC sink |
 | **[`mongo-kafka/`](mongo-kafka/README.md)** | Sharded Mongo + Debezium + Mongo sink |
 | **[`mongo-sharded/`](mongo-sharded/README.md)** | Init scripts for config/shard/mongos (`tic` / `tac` / `toe`) |
+| **[`realtime-orders-search-hub/`](realtime-orders-search-hub/README.md)** | **Reference scenario**: Postgres + Mongo CDC, Kafka, Cassandra, Redis, OpenSearch, observability (workflows + Mermaid diagrams) |
 
 ---
 
