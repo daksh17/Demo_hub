@@ -2,6 +2,12 @@
 
 This directory’s **`docker-compose.yml`** defines **one** stack (Cassandra, ZooKeeper/Kafka/Connect, optional Postgres and Mongo demos, **Redis 7**, **OpenSearch**, Prometheus, Grafana). A plain **`docker compose up`** here starts **every service in that file** (no Compose profiles). Prefer **[`start-full-stack.sh`](start-full-stack.sh)** so `PROJECT_VERSION` is set and **`mcac`** / **`kafka-connect`** images are built first.
 
+**Kafka Connect:** a one-shot **`kafka-connect-register`** service runs **[`kafka-connect-register/register-all.sh`](kafka-connect-register/register-all.sh)** so all four demo connectors are registered (**Postgres** Debezium + JDBC sink, **Mongo** Debezium + Mongo sink). **Hub UI** “Single order” / “Workload” write to **`demo_items`** (Postgres) and **`demo.demo_items`** (Mongo), which those connectors capture. Re-register from the host with **`./kafka-connect-register/register-all.sh`** if Connect was restarted.
+
+**Reset Connect sink copies** (Postgres **`demo_items_from_kafka`**, Mongo **`demo.demo_items_from_kafka`**) before re-testing: [`./clean-kafka-connect-sinks.sh`](clean-kafka-connect-sinks.sh) from this directory (stack must be running).
+
+**Sinks stay empty after Workload / Single order:** the hub only writes the **source** tables (`public.demo_items`, `demo.demo_items`). Rows appear in **`demo_items_from_kafka`** / **`demo.demo_items_from_kafka`** only if **all four connectors are registered** and **RUNNING** (Kafka Connect → topics → sinks). Run **[`./diagnose-kafka-connect.sh`](diagnose-kafka-connect.sh)** from this directory; if connectors are missing or `FAILED`, run **`./kafka-connect-register/register-all.sh`** and check **`docker compose logs kafka-connect`**.
+
 **Note:** **`../docker-compose.yaml`** (parent `dashboards/` folder) runs **only** Prometheus + Grafana on ports **9091** / **3001** and does **not** start Kafka, Postgres, Mongo, Redis, OpenSearch, or Cassandra.
 
 Topic-specific guides live in subfolders:

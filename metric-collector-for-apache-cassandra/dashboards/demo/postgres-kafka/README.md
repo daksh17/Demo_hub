@@ -138,6 +138,14 @@ chmod +x register-connectors.sh
 # or: ./register-connectors.sh http://localhost:8083
 ```
 
+**`pg-source-demo` already running but `jdbc-sink-demo` missing** (for example the full script was still waiting on removing the source): add the sink without touching the source:
+
+```bash
+./register-connectors.sh http://127.0.0.1:8083 jdbc-only
+# or: JDBC_SINK_ONLY=1 ./register-connectors.sh http://127.0.0.1:8083
+# or default URL: ./register-connectors.sh jdbc-only
+```
+
 The script registers `pg-source-demo` and `jdbc-sink-demo`. To list connectors:
 
 ```bash
@@ -145,6 +153,18 @@ curl -s http://localhost:8083/connectors
 ```
 
 To remove and re-register, delete connectors via the REST API (sink first), then run the script again.
+
+### `pg-source-demo` task `FAILED` — `OutOfMemoryError` during snapshot (`PgResultSet.getString`)
+
+Usually **`demo_items.name`** contains **very large** `TEXT` (e.g. hub Workload with multi‑MiB pad in a single column). Debezium loads each cell fully during snapshot. **Mitigations:** cap workload names (**`POSTGRES_WORKLOAD_NAME_MAX_CHARS`** on **hub-demo-ui**, default 16 KiB), raise **`KAFKA_HEAP_OPTS`** on **`kafka-connect`** (compose uses **8 GiB**), use **`snapshot.fetch.size`** (see **`register-connectors.sh`**), and/or `TRUNCATE demo_items` / delete oversized rows before re‑snapshot.
+
+### `curl …/connectors` shows only `pg-source-demo`
+
+Usually **`jdbc-sink-demo`** was never created because the script exited or timed out while **removing** `pg-source-demo` (slow Connect shutdown). Register the sink only:
+
+`./register-connectors.sh http://127.0.0.1:8083 jdbc-only`
+
+If removing the source stays stuck for minutes, see Connect logs (`docker compose logs kafka-connect`); restarting the **`kafka-connect`** container and then **`jdbc-only`** is often enough if the source is already healthy.
 
 ### `register-connectors.sh` stops after “Kafka Connect is up” and `curl …/connectors` is `[]`
 
@@ -205,6 +225,19 @@ After CDC and the sink run, check the sink table on the primary:
 ```bash
 psql "postgresql://demo:demopass@127.0.0.1:15432/demo" -c "SELECT * FROM demo_items_from_kafka ORDER BY id DESC LIMIT 3;"
 ```
+
+### Debezium logs: `permission denied for table demo_items` (snapshot failed)
+
+The **init script used to `GRANT SELECT … TO replicator` before `demo_items` existed**, so on a fresh volume **`replicator` had no `SELECT` on `demo_items`** and the **pg-source** snapshot never finished (no Kafka topic traffic → empty **`demo_items_from_kafka`**).
+
+- **Existing volume:** from `dashboards/demo` run **`./postgres-kafka/apply-ensure-debezium.sh`**, then restart / re-register **`pg-source-demo`** (`./kafka-connect-register/register-all.sh` or delete + `register-connectors.sh`).
+- **New volume:** `01-init-debezium.sql` is fixed; recreate the primary volume if you need init to re-run.
+
+### `demo_items_from_kafka` stays empty while Mongo sink has data
+
+1. Check **`jdbc-sink-demo`** status: `curl -s http://localhost:8083/connectors/jdbc-sink-demo/status` — if **`FAILED`**, read **`docker compose logs kafka-connect`**.
+2. **Stale sink table schema** (common after iterating connector versions): from `dashboards/demo` run **[`clean-kafka-connect-sinks.sh`](../clean-kafka-connect-sinks.sh)** — it **`DROP`**s `public.demo_items_from_kafka` so **`auto.create`** can rebuild it, then re-run **`./kafka-connect-register/register-all.sh`** (or **`postgres-kafka/register-connectors.sh`**).
+3. **`register-connectors.sh`** uses **`io.debezium.connector.jdbc.JdbcSinkConnector`** with **`dialect.name: postgresql`** and **no** unwrap SMT (Debezium JDBC sink reads the native CDC envelope; **`ExtractNewRecordState`** on the sink can prevent rows from being applied). Re-register after pulling the script.
 
 ## Resetting Postgres data
 

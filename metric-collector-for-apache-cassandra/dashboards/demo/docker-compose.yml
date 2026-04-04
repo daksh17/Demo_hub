@@ -1,4 +1,5 @@
 # dashboards/demo — single compose file for Cassandra (3-node Test Cluster), Kafka/ZK/Connect, Postgres, Mongo sharded,
+# Kafka Connect: one-shot kafka-connect-register runs kafka-connect-register/register-all.sh (4 connectors: PG+Mongo CDC/sinks).
 # Redis 7, OpenSearch, Prometheus, Grafana, exporters. `docker compose up` starts all services (no profiles).
 # Recommended first run: ./start-full-stack.sh (sets PROJECT_VERSION, builds mcac + kafka-connect + hub-demo-ui).
 # Not to be confused with ../docker-compose.yaml (dashboards root) — that file is Prometheus+Grafana only.
@@ -209,6 +210,10 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Default ~1 MiB breaks Debezium Mongo/PG source when hub Workload uses large pad/name fields.
+      KAFKA_MESSAGE_MAX_BYTES: "33554432"
+      KAFKA_REPLICA_FETCH_MAX_BYTES: "33554432"
+      KAFKA_SOCKET_REQUEST_MAX_BYTES: "33554432"
     healthcheck:
       test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server kafka:29092 || exit 1"]
       interval: 15s
@@ -314,13 +319,46 @@ services:
       STATUS_STORAGE_TOPIC: pgdemo_connect_statuses
       KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
       VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      # Debezium default is -Xmx2G; Postgres + Mongo snapshots and large CDC rows share one JVM.
+      KAFKA_HEAP_OPTS: "-Xms512m -Xmx8192m"
     depends_on:
       kafka:
         condition: service_healthy
       postgresql-primary:
         condition: service_healthy
+    healthcheck:
+      test:
+        ["CMD-SHELL", "curl -fsS http://127.0.0.1:8083/connectors >/dev/null"]
+      interval: 15s
+      timeout: 10s
+      retries: 30
+      start_period: 90s
     networks:
       - demo_net
+
+  # One-shot: registers all four demo connectors (Postgres Debezium + JDBC sink, Mongo Debezium + Mongo sink).
+  # Single order / Workload write to public.demo_items and demo.demo_items → CDC topics + JDBC/Mongo sinks (see kafka-connect-register/register-all.sh).
+  kafka-connect-register:
+    image: alpine:3.19
+    restart: "no"
+    volumes:
+      - .:/work:ro
+    working_dir: /work
+    networks:
+      - demo_net
+    depends_on:
+      kafka-connect:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      postgresql-primary:
+        condition: service_healthy
+      mongo-kafka-prepare:
+        condition: service_completed_successfully
+    command:
+      - /bin/sh
+      - -c
+      - apk add --no-cache bash curl && exec bash /work/kafka-connect-register/register-all.sh http://kafka-connect:8083
 
   postgres-exporter-primary:
     image: prometheuscommunity/postgres-exporter:v0.17.1
@@ -707,6 +745,8 @@ services:
       OPENSEARCH_URL: http://opensearch:9200
       OPENSEARCH_INDEX: hub-orders
       KAFKA_BOOTSTRAP: kafka:29092
+      # Sustain + large payload waves: many sequential BatchStatements; default driver timeout ~10s can fail under load.
+      CASSANDRA_WORKLOAD_REQUEST_TIMEOUT_SECONDS: "180"
     networks:
       - demo_net
     depends_on:

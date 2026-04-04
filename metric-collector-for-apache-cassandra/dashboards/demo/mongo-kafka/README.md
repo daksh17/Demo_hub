@@ -198,6 +198,7 @@ So “how it finds distribution” is: **hashed shard key → chunk boundaries i
 2. **`mongo-source-demo` cannot connect** — ensure **`mongos`** is healthy and the URI uses **`mongo-mongos1:27017`** from **inside** the Connect container (not `localhost`).
 3. **No topics or empty sink** — run **`mongo-kafka-prepare`** successfully once; confirm **`sh.status()`** shows **`demo`** enabled and **`demo_items`** sharded. Re-run **`./mongo-kafka/register-mongo-connectors.sh`** after fixing the cluster.
 4. **Connect missing `MongoSinkConnector`** — rebuild the image: **`docker compose build kafka-connect`** and recreate the **`kafka-connect`** container.
+5. **`mongo-source-demo` task `FAILED` with `OutOfMemoryError: Java heap space`** during snapshot — the Debezium Connect image defaults to about **2 GiB** heap; Mongo’s initial snapshot (and Postgres CDC on the same worker) can exceed that. The demo compose sets **`KAFKA_HEAP_OPTS: -Xms512m -Xmx8192m`** on **`kafka-connect`**; raise **`Xmx`** further if needed, then **`docker compose up -d kafka-connect`** and fix the connector offset or re-register (`./reset-kafka-connect-demo.sh` or delete + **`register-mongo-connectors.sh`**).
 
 ## Files in this directory
 

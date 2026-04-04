@@ -42,11 +42,23 @@ PG_DSN = os.environ.get(
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb://mongo-mongos1:27017")
 REDIS_URL = os.environ.get("REDIS_URL", "redis://:demoredispass@redis:6379/0")
 CASSANDRA_HOSTS = os.environ.get("CASSANDRA_HOSTS", "cassandra").split(",")
+# Workload sustain + many batches can exceed the driver default (~10s) when the node is busy.
+CASSANDRA_WORKLOAD_REQUEST_TIMEOUT = float(
+    os.environ.get("CASSANDRA_WORKLOAD_REQUEST_TIMEOUT_SECONDS", "120")
+)
 OPENSEARCH_URL = os.environ.get("OPENSEARCH_URL", "http://opensearch:9200").rstrip("/")
 HUB_KEYSPACE = os.environ.get("CASSANDRA_KEYSPACE", "demo_hub")
 OS_INDEX = os.environ.get("OPENSEARCH_INDEX", "hub-orders")
 WORKLOAD_REDIS_PREFIX = os.environ.get("WORKLOAD_REDIS_PREFIX", "hub:wl:")
 OS_WORKLOAD_INDEX = os.environ.get("OPENSEARCH_WORKLOAD_INDEX", "hub-workload")
+# OpenSearch default http.max_content_length is often 100 MiB; stay under to avoid HTTP 413 on /_bulk.
+OPENSEARCH_BULK_MAX_BYTES = int(
+    os.environ.get("OPENSEARCH_BULK_MAX_BYTES", str(48 * 1024 * 1024))
+)
+# Debezium Postgres snapshot loads full TEXT per row into heap; multi‑MiB names OOM Connect (default ~2–4G).
+POSTGRES_WORKLOAD_NAME_MAX_CHARS = int(
+    os.environ.get("POSTGRES_WORKLOAD_NAME_MAX_CHARS", str(16 * 1024))
+)
 
 _cassandra_session = None
 _cassandra_insert_prep = None
@@ -83,6 +95,22 @@ def _cassandra_rows_per_batch(pad: str, requested_batch_cap: int) -> int:
     budget = 35_000
     max_by_server = max(1, budget // est_row_bytes)
     return max(1, min(requested_batch_cap, 50, max_by_server))
+
+
+def _opensearch_bulk_chunk_size(pad: str, requested_bs: int) -> int:
+    """How many workload docs per ``/_bulk`` request.
+
+    Large ``pad`` (payload_kb) makes each NDJSON line huge; sending ``batch_size`` docs at
+    once can exceed ``http.max_content_length`` and yield **413 Request Entity Too Large**.
+    """
+    if requested_bs <= 1:
+        return 1
+    # Per doc: index directive line + JSON body (pad dominates; json.dumps uses UTF-8).
+    index_line_est = 96
+    body_overhead = 160  # run_id, seq, created_at, JSON structure
+    est_doc_bytes = index_line_est + body_overhead + max(8, len(pad.encode("utf-8")) * 2)
+    cap = max(1, OPENSEARCH_BULK_MAX_BYTES // est_doc_bytes)
+    return max(1, min(requested_bs, cap))
 
 
 def _ensure_cassandra_schema(session):
@@ -202,8 +230,11 @@ PAGE = f"""<!DOCTYPE html>
   <h1>Hub demo — write one order everywhere</h1>
   <p>Pushes the same event to <strong>Postgres</strong> (<code>demo_items</code>), <strong>Mongo</strong>
     (<code>demo.demo_items</code>), <strong>Redis</strong>, <strong>Cassandra</strong> (<code>demo_hub.orders</code>),
-    and <strong>OpenSearch</strong> (<code>hub-orders</code>). Postgres &amp; Mongo rows are also visible
-    to Kafka Connect if connectors run (CDC).</p>
+    and <strong>OpenSearch</strong> (<code>hub-orders</code>). With the full stack, Compose runs <strong>kafka-connect-register</strong>
+    so <strong>Kafka Connect</strong> loads four connectors: Postgres Debezium + JDBC sink, Mongo Debezium + Mongo sink
+    (topics like <code>demopg.public.demo_items</code>, <code>demomongo.demo.demo_items</code>; sinks
+    <code>demo_items_from_kafka</code> on Postgres and <code>demo.demo_items_from_kafka</code> in Mongo). Re-register:
+    <code>./kafka-connect-register/register-all.sh</code> from <code>dashboards/demo</code>.</p>
   <button type="button" id="go">Create demo order</button>
   <p id="status"></p>
   <pre id="out">Click the button to see JSON verification.</pre>
@@ -276,7 +307,7 @@ WORKLOAD_PAGE = f"""<!DOCTYPE html>
   {NAV}
   <h1>Workload generator</h1>
   <p>Writes synthetic rows in <strong>batches</strong>. <strong>Payload block size (KB)</strong> repeats filler bytes per record (larger = heavier writes).
-    <strong>Cassandra</strong> puts the pad in <code>label</code>; each batch row count is <strong>capped automatically</strong> so size stays under Cassandra&apos;s limit (prevents <code>Batch too large</code>).
+    <strong>Postgres</strong> stores the pad inside <code>demo_items.name</code> with a <strong>CDC‑safe max length</strong> (default 16&nbsp;KiB; override <code>POSTGRES_WORKLOAD_NAME_MAX_CHARS</code>) so Debezium snapshot does not OOM Kafka Connect on huge pads. <strong>Cassandra</strong> puts the pad in <code>label</code> (truncated); each batch row count is <strong>capped automatically</strong> so size stays under Cassandra&apos;s limit (prevents <code>Batch too large</code>). Sustained runs with Cassandra enabled can hit driver timeouts on a busy node—increase <code>CASSANDRA_WORKLOAD_REQUEST_TIMEOUT_SECONDS</code> on the service if needed.
     OpenSearch uses index <code>hub-workload</code>. REST: <code>http://localhost:9200</code>, Dashboards: <code>http://localhost:5601</code>. Grafana: separate dashboards per subsystem (Mongo, Redis, Kafka, Cassandra, …).</p>
   <form id="f">
     <label>Total records (1–100000)</label>
@@ -814,6 +845,7 @@ def _execute_workload_wave(
     bs: int,
     c_batches: int,
     cassandra_prep,
+    redis_client: redis.Redis | None = None,
 ) -> tuple[dict[str, int], dict[str, str]]:
     """One pass writing total_records rows per target (indices seq_base .. seq_base+total_records-1)."""
     counts: dict[str, int] = {k: 0 for k in targets}
@@ -828,7 +860,8 @@ def _execute_workload_wave(
                         chunk = []
                         for j in range(start, min(start + bs, total_records)):
                             i = seq_base + j
-                            name = (f"wl-{run_id}-{i}|{pad}")[:1048576]
+                            lim = max(64, POSTGRES_WORKLOAD_NAME_MAX_CHARS)
+                            name = (f"wl-{run_id}-{i}|{pad}")[:lim]
                             chunk.append((name,))
                             n += 1
                         cur.executemany("INSERT INTO demo_items (name) VALUES (%s)", chunk)
@@ -865,20 +898,33 @@ def _execute_workload_wave(
 
     if "redis" in targets:
         try:
-            r = redis.from_url(REDIS_URL, decode_responses=False)
+            own_redis = False
+            r = redis_client
+            if r is None:
+                r = redis.from_url(REDIS_URL, decode_responses=False)
+                own_redis = True
             n = 0
-            for start in range(0, total_records, bs):
-                pipe = r.pipeline(transaction=False)
-                for j in range(start, min(start + bs, total_records)):
-                    i = seq_base + j
-                    key = f"{WORKLOAD_REDIS_PREFIX}{run_id}:{i}"
-                    payload = json.dumps(
-                        {"run_id": run_id, "seq": i, "pad": pad}, separators=(",", ":")
-                    ).encode()
-                    pipe.setex(key, 86400, payload)
-                    n += 1
-                pipe.execute()
-            counts["redis"] = n
+            try:
+                for start in range(0, total_records, bs):
+                    pipe = r.pipeline(transaction=False)
+                    for j in range(start, min(start + bs, total_records)):
+                        i = seq_base + j
+                        key = f"{WORKLOAD_REDIS_PREFIX}{run_id}:{i}"
+                        payload = json.dumps(
+                            {
+                                "run_id": run_id,
+                                "seq": i,
+                                "pad": pad,
+                            },
+                            separators=(",", ":"),
+                        ).encode()
+                        pipe.setex(key, 86400, payload)
+                        n += 1
+                    pipe.execute()
+                counts["redis"] = n
+            finally:
+                if own_redis:
+                    r.close()
         except Exception as e:
             errors["redis"] = str(e)
 
@@ -896,7 +942,7 @@ def _execute_workload_wave(
                     lab = (f"wl-{run_id}-{i}|{pad}")[:cass_label_max]
                     batch.add(cassandra_prep, (oid, lab, now))
                     n += 1
-                sess.execute(batch)
+                sess.execute(batch, timeout=CASSANDRA_WORKLOAD_REQUEST_TIMEOUT)
             counts["cassandra"] = n
         except Exception as e:
             errors["cassandra"] = str(e)
@@ -904,10 +950,11 @@ def _execute_workload_wave(
     if "opensearch" in targets:
         try:
             n = 0
+            os_chunk = _opensearch_bulk_chunk_size(pad, bs)
             with httpx.Client(timeout=120.0) as hc:
-                for start in range(0, total_records, bs):
+                for start in range(0, total_records, os_chunk):
                     lines: list[str] = []
-                    for j in range(start, min(start + bs, total_records)):
+                    for j in range(start, min(start + os_chunk, total_records)):
                         i = seq_base + j
                         doc_id = f"{run_id}-{i}"
                         lines.append(
@@ -1046,13 +1093,13 @@ def _workload_read_sample(req: WorkloadReadRequest) -> dict:
         try:
             sess = _cassandra_session
             # Same key convention as workload writes: order_id = wl-{run_id}-{seq} (partition key lookup, no LIKE).
-            order_ids = tuple(f"wl-{req.run_id}-{i}" for i in range(lim))
+            order_ids = [f"wl-{req.run_id}-{i}" for i in range(lim)]
+            # Bind one placeholder per IN value; a single tuple bound to IN %s can yield invalid CQL on some stacks.
+            ph = ", ".join(["%s"] * len(order_ids))
             rows = sess.execute(
-                (
-                    f"SELECT order_id, label, created_at FROM {HUB_KEYSPACE}.orders "
-                    "WHERE order_id IN %s"
-                ),
-                (order_ids,),
+                f"SELECT order_id, label, created_at FROM {HUB_KEYSPACE}.orders "
+                f"WHERE order_id IN ({ph})",
+                tuple(order_ids),
             )
             cass_rows = []
             for row in rows:
@@ -1199,31 +1246,50 @@ async def api_workload(req: WorkloadRequest):
     counts: dict[str, int] = {k: 0 for k in req.targets}
     errors: dict[str, str] = {}
 
-    while True:
-        w_counts, w_err = _execute_workload_wave(
-            total_records=req.total_records,
-            batch_size_req=req.batch_size,
-            targets=targets,
-            run_id=run_id,
-            pad=pad,
-            now=now,
-            seq_base=seq_base,
-            bs=bs,
-            c_batches=c_batches,
-            cassandra_prep=prep,
-        )
-        waves += 1
-        for k, v in w_counts.items():
-            counts[k] = counts.get(k, 0) + v
-        errors.update(w_err)
-        seq_base += req.total_records
+    wl_redis: redis.Redis | None = None
+    try:
+        if "redis" in targets:
+            # One connection for all sustain waves: opening a new TCP client every wave
+            # can overwhelm Redis / hit connection limits ("Connection reset by peer").
+            wl_redis = redis.from_url(
+                REDIS_URL,
+                decode_responses=False,
+                socket_keepalive=True,
+                health_check_interval=30,
+                retry_on_timeout=True,
+            )
+        while True:
+            w_counts, w_err = _execute_workload_wave(
+                total_records=req.total_records,
+                batch_size_req=req.batch_size,
+                targets=targets,
+                run_id=run_id,
+                pad=pad,
+                now=now,
+                seq_base=seq_base,
+                bs=bs,
+                c_batches=c_batches,
+                cassandra_prep=prep,
+                redis_client=wl_redis,
+            )
+            waves += 1
+            for k, v in w_counts.items():
+                counts[k] = counts.get(k, 0) + v
+            errors.update(w_err)
+            seq_base += req.total_records
 
-        if errors:
-            break
-        if not req.sustain:
-            break
-        if sustain_deadline is not None and time.perf_counter() >= sustain_deadline:
-            break
+            if errors:
+                break
+            if not req.sustain:
+                break
+            if sustain_deadline is not None and time.perf_counter() >= sustain_deadline:
+                break
+    finally:
+        if wl_redis is not None:
+            try:
+                wl_redis.close()
+            except Exception:
+                pass
 
     elapsed = time.perf_counter() - t0
     ok = not errors

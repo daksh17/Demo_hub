@@ -6,6 +6,9 @@
 set -euo pipefail
 CONNECT="${1:-http://localhost:8083}"
 CONNECT="${CONNECT%/}"
+CURL_CONNECT_TIMEOUT="${CURL_CONNECT_TIMEOUT:-5}"
+CURL_MAX_TIME="${CURL_MAX_TIME:-30}"
+curl_connect_opts=(--connect-timeout "${CURL_CONNECT_TIMEOUT}" --max-time "${CURL_MAX_TIME}" -sS)
 
 wait_for() {
   echo "Waiting for Kafka Connect..."
@@ -20,11 +23,37 @@ wait_for() {
   return 1
 }
 
+remove_connector() {
+  local name="$1" code i
+  code="$(curl "${curl_connect_opts[@]}" -o /dev/null -w '%{http_code}' "$CONNECT/connectors/$name" 2>/dev/null || echo 000)"
+  if [[ "$code" == "404" ]]; then
+    echo "  ${name}: not registered, skip." >&2
+    return 0
+  fi
+  echo "  ${name}: pausing, then DELETE; waiting for Connect (up to ~120s)..." >&2
+  curl "${curl_connect_opts[@]}" -o /dev/null -X PUT "$CONNECT/connectors/$name/pause" 2>/dev/null || true
+  sleep 2
+  curl "${curl_connect_opts[@]}" -o /dev/null -X DELETE "$CONNECT/connectors/$name" 2>/dev/null || true
+  for i in $(seq 1 120); do
+    code="$(curl "${curl_connect_opts[@]}" -o /dev/null -w '%{http_code}' "$CONNECT/connectors/$name" 2>/dev/null || echo 000)"
+    if [[ "$code" == "404" ]]; then
+      echo "  ${name}: removed." >&2
+      return 0
+    fi
+    if (( i % 15 == 0 )); then
+      echo "  ${name}: still present after ${i}s (HTTP ${code})." >&2
+    fi
+    sleep 1
+  done
+  echo "Timeout: connector ${name} still present after DELETE (last HTTP ${code})" >&2
+  return 1
+}
+
 wait_for
 
-curl -s -X DELETE "$CONNECT/connectors/mongo-sink-demo" >/dev/null 2>&1 || true
-curl -s -X DELETE "$CONNECT/connectors/mongo-source-demo" >/dev/null 2>&1 || true
-sleep 2
+echo "Removing existing mongo-sink-demo / mongo-source-demo if present..."
+remove_connector "mongo-sink-demo"
+remove_connector "mongo-source-demo"
 
 post_connector() {
   local label="$1"
@@ -32,7 +61,7 @@ post_connector() {
   tmp="$(mktemp)"
   cat >"$tmp"
   resp="$(mktemp)"
-  code="$(curl -sS -o "$resp" -w '%{http_code}' -X POST \
+  code="$(curl "${curl_connect_opts[@]}" -o "$resp" -w '%{http_code}' -X POST \
     -H 'Content-Type: application/json' \
     --data-binary @"$tmp" \
     "$CONNECT/connectors")"
@@ -64,7 +93,9 @@ post_connector "mongo-source-demo" <<'JSON'
     "key.converter": "org.apache.kafka.connect.json.JsonConverter",
     "value.converter": "org.apache.kafka.connect.json.JsonConverter",
     "key.converter.schemas.enable": "true",
-    "value.converter.schemas.enable": "true"
+    "value.converter.schemas.enable": "true",
+    "producer.override.max.request.size": "33554432",
+    "producer.override.buffer.memory": "67108864"
   }
 }
 JSON
@@ -93,7 +124,9 @@ post_connector "mongo-sink-demo" <<'JSON'
     "transforms.extractDoc.delete.tombstone.handling.mode": "drop",
     "document.id.strategy": "com.mongodb.kafka.connect.sink.processor.id.strategy.PartialValueStrategy",
     "document.id.strategy.partial.value.projection.type": "AllowList",
-    "document.id.strategy.partial.value.projection.list": "_id"
+    "document.id.strategy.partial.value.projection.list": "_id",
+    "consumer.override.fetch.max.bytes": "33554432",
+    "consumer.override.max.partition.fetch.bytes": "33554432"
   }
 }
 JSON

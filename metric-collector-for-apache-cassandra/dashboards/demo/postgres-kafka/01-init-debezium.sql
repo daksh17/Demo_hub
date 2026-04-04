@@ -1,11 +1,10 @@
 -- Runs on first boot of the Bitnami primary (database "demo").
--- CDC uses the existing replication user `replicator` (Bitnami) + pgoutput publication.
--- Avoids a separate `debezium` login that init cannot fix on old volumes.
+-- CDC uses replication user `replicator` (Bitnami) + pgoutput publication.
+-- IMPORTANT: `GRANT SELECT ON ALL TABLES` must run *after* `demo_items` exists, otherwise
+-- Debezium snapshot fails with: permission denied for table demo_items.
 
 GRANT CONNECT ON DATABASE demo TO replicator;
 GRANT USAGE ON SCHEMA public TO replicator;
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO replicator;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO replicator;
 
 CREATE TABLE IF NOT EXISTS demo_items (
   id         SERIAL PRIMARY KEY,
@@ -15,6 +14,12 @@ CREATE TABLE IF NOT EXISTS demo_items (
 
 ALTER TABLE public.demo_items OWNER TO demo;
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.demo_items TO demo;
+
+-- Debezium snapshot + streaming read table data as `replicator`
+GRANT SELECT ON TABLE public.demo_items TO replicator;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO replicator;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO replicator;
+ALTER DEFAULT PRIVILEGES FOR ROLE demo IN SCHEMA public GRANT SELECT ON TABLES TO replicator;
 
 CREATE PUBLICATION dbz_publication FOR TABLE public.demo_items;
 
