@@ -1,10 +1,16 @@
 -- Runs on first boot of the Bitnami primary (database "demo").
+-- Bitnami admin: `postgres` / `postgres`. Application user: `demo` / `demopass` (this script creates `demo`).
 -- CDC uses replication user `replicator` (Bitnami) + pgoutput publication.
 -- IMPORTANT: `GRANT SELECT ON ALL TABLES` must run *after* `demo_items` exists, otherwise
 -- Debezium snapshot fails with: permission denied for table demo_items.
 
 GRANT CONNECT ON DATABASE demo TO replicator;
 GRANT USAGE ON SCHEMA public TO replicator;
+
+CREATE USER demo WITH PASSWORD 'demopass';
+GRANT CONNECT ON DATABASE demo TO demo;
+GRANT USAGE, CREATE ON SCHEMA public TO demo;
+GRANT pg_monitor TO demo;
 
 CREATE TABLE IF NOT EXISTS demo_items (
   id         SERIAL PRIMARY KEY,
@@ -19,6 +25,7 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.demo_items TO demo;
 GRANT SELECT ON TABLE public.demo_items TO replicator;
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO replicator;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO replicator;
+ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public GRANT SELECT ON TABLES TO replicator;
 ALTER DEFAULT PRIVILEGES FOR ROLE demo IN SCHEMA public GRANT SELECT ON TABLES TO replicator;
 
 CREATE PUBLICATION dbz_publication FOR TABLE public.demo_items;

@@ -4,14 +4,39 @@ Part of **`dashboards/demo`**: Postgres, Kafka, Connect, and exporters are defin
 
 This folder documents the **PostgreSQL primary + two streaming replicas**, **Apache Kafka** with **ZooKeeper**, **Debezium Kafka Connect** (CDC in both directions via source + JDBC sink), and **observability** wired into the same Prometheus and Grafana used by the MCAC demo.
 
+**Debezium concepts (official-doc summary):** see **[`DEBEZIUM.md`](DEBEZIUM.md)** — PostgreSQL source vs JDBC sink, permissions, snapshots, and links to [debezium.io](https://debezium.io/documentation/reference/stable/index.html).
+
 ## Architecture
 
 - **PostgreSQL (Bitnami, `docker.io/bitnami/postgresql:latest` in compose):** one writable **primary** and two **read replicas** (physical streaming replication). Logical decoding (`wal_level=logical`) is enabled on the primary for Debezium. Bitnami often drops old revision pins; for production pin an image **digest** instead of `:latest`.
+- **`pg_stat_statements`:** Bitnami loads extensions via **`POSTGRESQL_SHARED_PRELOAD_LIBRARIES: pgaudit,pg_stat_statements`** (keep **`pgaudit`** — it is the image default). Tune **`pg_stat_statements.*`** via **`POSTGRESQL_EXTRA_FLAGS`**. On **first** primary init, **[`03-pg-stat-statements.sh`](03-pg-stat-statements.sh)** runs **`CREATE EXTENSION IF NOT EXISTS pg_stat_statements`** in database **`postgres`** only. If you see **`pg_stat_statements must be loaded via shared_preload_libraries`**, restart the container after pulling compose changes and run `SHOW shared_preload_libraries;` — it must include **`pg_stat_statements`**. **Existing volume:** env vars apply when the data dir is (re)initialized; otherwise set `shared_preload_libraries` to include both libraries in server config and **restart** (not reload), then **[`ensure-pg-stat-statements.sql`](ensure-pg-stat-statements.sql)** on **`postgres`**.
 - **Kafka:** single broker (Confluent 7.6.1) for demo simplicity; clients inside Docker use `kafka:29092`, clients on the host often use `localhost:9092`.
 - **Kafka Connect (Debezium 2.7):** REST API on **8083**.
   - **PostgreSQL → Kafka:** `PostgresConnector` captures changes from `public.demo_items` into topics prefixed with `demopg`.
   - **Kafka → PostgreSQL:** `JdbcSinkConnector` writes to table `demo_items_from_kafka` (avoids feeding the sink back into the same CDC table).
 - **Monitoring:** `postgres_exporter` (one per Postgres instance) and `danielqsj/kafka-exporter` expose metrics to **Prometheus**; **Grafana** loads a bundled dashboard that charts connections, throughput, DB size, replication lag, offsets, and consumer lag.
+
+### Physical replication slots (HA standbys, not Debezium)
+
+The two read replicas use **physical** replication slots on the **primary** so PostgreSQL does not recycle WAL until each standby has read it (on top of `wal_keep_size` behaviour). This is **separate** from **logical** slots used by Debezium.
+
+| Item | Value |
+|------|--------|
+| Slot for `postgresql-replica-1` | `pgdemo_phys_replica_1` |
+| Slot for `postgresql-replica-2` | `pgdemo_phys_replica_2` |
+| Primary (new volume) | [`02-physical-replication-slots.sh`](02-physical-replication-slots.sh) runs in `docker-entrypoint-initdb.d` as **`replicator`** (needs `REPLICATION` for `pg_create_physical_replication_slot`). |
+| Primary (existing volume) | From `dashboards/demo`: `chmod +x postgres-kafka/apply-physical-replication-slots.sh && ./postgres-kafka/apply-physical-replication-slots.sh` |
+| Replicas | `POSTGRESQL_EXTRA_FLAGS` sets `-c primary_slot_name=…` per service in **`docker-compose.yml`**. |
+
+After enabling slots on an **old** primary, **recreate** the replica containers (or remove their Docker volumes and let them re-sync) so they connect with `primary_slot_name`.
+
+Check on the primary:
+
+```sql
+SELECT slot_name, slot_type, active, restart_lsn
+FROM pg_replication_slots
+WHERE slot_name LIKE 'pgdemo_phys_%';
+```
 
 ## How the workflow works
 
@@ -102,10 +127,13 @@ After connectors are running, an insert on the primary flows like this: **`INSER
 
 | Purpose | User | Password |
 |--------|------|----------|
-| Application / JDBC sink | `demo` | `demopass` |
+| Superuser (Bitnami bootstrap admin) | `postgres` | `postgres` |
+| Application, hub UI, exporters, JDBC sink | `demo` | `demopass` |
 | Physical replication + Debezium PostgresConnector (CDC) | `replicator` | `replicatorpass` |
 
 Database name: **`demo`**. Demo table: **`demo_items`**; sink table (created by the sink connector): **`demo_items_from_kafka`**.
+
+**Existing primary volume** from before `demo` existed: as `postgres`, run **[`ensure-demo-app-user.sql`](ensure-demo-app-user.sql)** (see file header), then **`./kafka-connect-register/register-all.sh`** so the JDBC sink uses `demo` again.
 
 ## Start the stack
 
@@ -259,8 +287,11 @@ Adjust volume names if your Compose project name is not `demo` (`docker volume l
 | `01-init-debezium.sql` | Creates `demo_items`, `replicator` grants, publication `dbz_publication`, and **10 seed rows** on first primary boot. |
 | `ensure-debezium-cdc.sql` | Grants + publication for existing volumes (see `apply-ensure-debezium.sh`). |
 | `apply-ensure-debezium.sh` | Applies `ensure-debezium-cdc.sql` as `demo` (fixes old DBs missing publication/`replicator` **SELECT**). |
+| `02-physical-replication-slots.sh` | On first primary boot, runs `ensure-…sql` as **`replicator`** (required for slot DDL). |
+| `ensure-physical-replication-slots.sql` / `apply-physical-replication-slots.sh` | Same on existing primary volumes. |
 | `seed-dummy-data.sql` | Inserts **30** extra `demo_items` rows (run anytime on an existing DB). |
 | `register-connectors.sh` | Registers Debezium PostgreSQL source and JDBC sink via Connect REST API. |
+| `DEBEZIUM.md` | Debezium PostgreSQL source + JDBC sink concepts, permissions, snapshots, official doc links. |
 | `diagrams/workflow-components.mmd` / `.svg` | Postgres + Kafka component diagram. |
 | `diagrams/cdc-sequence.mmd` / `.svg` | Postgres CDC sequence diagram. |
 | `README.md` | This document. |

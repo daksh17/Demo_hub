@@ -1,5 +1,5 @@
 -- Extra dummy rows for demo_items. Safe to run multiple times (new id each time).
--- From host: psql "postgresql://demo:demopass@127.0.0.1:15432/demo" -f seed-dummy-data.sql
+-- From host (app user): psql "postgresql://demo:demopass@127.0.0.1:15432/demo" -f seed-dummy-data.sql
 -- From Docker (docker compose cwd = dashboards/demo):
 --   docker compose exec -T postgresql-primary bash -lc 'PGPASSWORD=demopass psql -U demo -d demo' < postgres-kafka/seed-dummy-data.sql
 

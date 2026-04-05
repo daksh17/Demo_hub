@@ -14,7 +14,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
 echo "Dropping Postgres public.demo_items_from_kafka (if present) so JDBC sink can recreate schema …"
-docker compose exec -T postgresql-primary psql -U demo -d demo -v ON_ERROR_STOP=1 <<'SQL'
+docker compose exec -T postgresql-primary env PGPASSWORD=demopass psql -U demo -d demo -v ON_ERROR_STOP=1 <<'SQL'
 DROP TABLE IF EXISTS public.demo_items_from_kafka CASCADE;
 SQL
 

@@ -177,8 +177,9 @@ services:
         condition: service_healthy
 
   # --- PostgreSQL 1 primary + 2 replicas (Bitnami), Kafka + ZooKeeper, Debezium Connect ---
-  # CQL/users: DB demo, app user demo/demopass, replication replicator/replicatorpass, CDC debezium/debezium
+  # Postgres: DB demo; superuser postgres/postgres; app demo/demopass; replication replicator/replicatorpass
   # Host CQL: 15432 primary, 15433 replica-1, 15434 replica-2 | Kafka localhost:9092 | Connect REST localhost:8083
+  # Physical HA: primary creates slots pgdemo_phys_replica_{1,2} (init + ensure script); each replica sets primary_slot_name.
   # kafka-connect image: build ./mongo-kafka (Debezium 2.7 + Mongo sink). Postgres: postgres-kafka/register-connectors.sh | Mongo: mongo-kafka/register-mongo-connectors.sh
   zookeeper:
     image: confluentinc/cp-zookeeper:7.6.1
@@ -233,13 +234,23 @@ services:
       POSTGRESQL_REPLICATION_MODE: master
       POSTGRESQL_REPLICATION_USER: replicator
       POSTGRESQL_REPLICATION_PASSWORD: replicatorpass
-      POSTGRESQL_USERNAME: demo
-      POSTGRESQL_PASSWORD: demopass
+      POSTGRESQL_USERNAME: postgres
+      POSTGRESQL_PASSWORD: postgres
       POSTGRESQL_DATABASE: demo
-      POSTGRESQL_EXTRA_FLAGS: "-c wal_level=logical -c max_replication_slots=8 -c max_wal_senders=8"
+      # Bitnami defaults to pgaudit; add pg_stat_statements via this env (more reliable than -c shared_preload_libraries alone).
+      POSTGRESQL_SHARED_PRELOAD_LIBRARIES: pgaudit,pg_stat_statements
+      POSTGRESQL_EXTRA_FLAGS: >-
+        -c wal_level=logical
+        -c max_replication_slots=8
+        -c max_wal_senders=8
+        -c pg_stat_statements.max=10000
+        -c pg_stat_statements.track=all
     volumes:
       - postgres_primary_data:/bitnami/postgresql
       - "./postgres-kafka/01-init-debezium.sql:/docker-entrypoint-initdb.d/01-init-debezium.sql:ro"
+      - "./postgres-kafka/ensure-physical-replication-slots.sql:/tmp/ensure-physical-replication-slots.sql:ro"
+      - "./postgres-kafka/02-physical-replication-slots.sh:/docker-entrypoint-initdb.d/02-physical-replication-slots.sh:ro"
+      - "./postgres-kafka/03-pg-stat-statements.sh:/docker-entrypoint-initdb.d/03-pg-stat-statements.sh:ro"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U demo -d demo -h 127.0.0.1 -p 5432"]
       interval: 5s
@@ -260,8 +271,14 @@ services:
       POSTGRESQL_REPLICATION_PASSWORD: replicatorpass
       POSTGRESQL_MASTER_HOST: postgresql-primary
       POSTGRESQL_MASTER_PORT_NUMBER: "5432"
-      POSTGRESQL_USERNAME: demo
-      POSTGRESQL_PASSWORD: demopass
+      POSTGRESQL_USERNAME: postgres
+      POSTGRESQL_PASSWORD: postgres
+      # Physical replication slot on primary (must exist before standby connects; see 02-physical-replication-slots.sh).
+      POSTGRESQL_SHARED_PRELOAD_LIBRARIES: pgaudit,pg_stat_statements
+      POSTGRESQL_EXTRA_FLAGS: >-
+        -c primary_slot_name=pgdemo_phys_replica_1
+        -c pg_stat_statements.max=10000
+        -c pg_stat_statements.track=all
     volumes:
       - postgres_replica1_data:/bitnami/postgresql
     depends_on:
@@ -287,8 +304,13 @@ services:
       POSTGRESQL_REPLICATION_PASSWORD: replicatorpass
       POSTGRESQL_MASTER_HOST: postgresql-primary
       POSTGRESQL_MASTER_PORT_NUMBER: "5432"
-      POSTGRESQL_USERNAME: demo
-      POSTGRESQL_PASSWORD: demopass
+      POSTGRESQL_USERNAME: postgres
+      POSTGRESQL_PASSWORD: postgres
+      POSTGRESQL_SHARED_PRELOAD_LIBRARIES: pgaudit,pg_stat_statements
+      POSTGRESQL_EXTRA_FLAGS: >-
+        -c primary_slot_name=pgdemo_phys_replica_2
+        -c pg_stat_statements.max=10000
+        -c pg_stat_statements.track=all
     volumes:
       - postgres_replica2_data:/bitnami/postgresql
     depends_on:
