@@ -24,6 +24,67 @@ Topic-specific guides live in subfolders:
 | **[`mongo-sharded/`](mongo-sharded/README.md)** | Init scripts for config/shard/mongos (`tic` / `tac` / `toe`) |
 | **[`realtime-orders-search-hub/`](realtime-orders-search-hub/README.md)** | **Reference scenario**: Postgres + Mongo CDC, Kafka, Cassandra, Redis, OpenSearch, observability (workflows + Mermaid diagrams) |
 
+### Hub scenario indexes (Multi-DB reference)
+
+The **hub** path (`realtime-orders-search-hub`) creates scenario tables/collections and **indexes** meant for demos and query-shape teaching: PostgreSQL access methods (B-tree, **BRIN**, **GIN**, **GiST**, **HASH**, partial, covering), MongoDB compound/partial/**text** (ESR-oriented compounds), and a Cassandra **secondary index** on a low-cardinality column.
+
+**Where it is defined**
+
+| Store | Source of truth | One-shot / existing stack |
+|--------|-----------------|---------------------------|
+| PostgreSQL | [`realtime-orders-search-hub/demo-ui/scenario.py`](realtime-orders-search-hub/demo-ui/scenario.py) (`ensure_postgres_scenario_schema`, `_ensure_postgres_scenario_indexes`) + [`postgres-kafka/04-scenario-hub-schema-indexes.sql`](postgres-kafka/04-scenario-hub-schema-indexes.sql) (initdb + parity) | [`postgres-kafka/apply-scenario-hub-schema-indexes.sh`](postgres-kafka/apply-scenario-hub-schema-indexes.sh) |
+| MongoDB | [`mongo-kafka/demo-indexes.js`](mongo-kafka/demo-indexes.js) (run from [`mongo-kafka/prepare-demo-collections.sh`](mongo-kafka/prepare-demo-collections.sh) or apply script) | [`mongo-kafka/apply-demo-indexes.sh`](mongo-kafka/apply-demo-indexes.sh) |
+| Cassandra | [`realtime-orders-search-hub/demo-ui/scenario.py`](realtime-orders-search-hub/demo-ui/scenario.py) (`ensure_cassandra_scenario_schema`) + [`cassandra/ensure-scenario-hub.cql`](cassandra/ensure-scenario-hub.cql) | [`cassandra/apply-scenario-hub-schema.sh`](cassandra/apply-scenario-hub-schema.sh) |
+
+Requires extension **`pg_trgm`** (created in the same flow) for **GiST** (`gist_trgm_ops`) on `title`.
+
+#### PostgreSQL (`demo`)
+
+| Index name | Table | Access method | Definition / predicate |
+|------------|-------|---------------|-------------------------|
+| _(implicit)_ | `scenario_catalog_mirror` | B-tree (unique) | `UNIQUE` on `sku` (table constraint) |
+| `idx_scenario_catalog_category_price` | `scenario_catalog_mirror` | **B-tree** | `(category, unit_price_cents, sku)` — compound |
+| `idx_scenario_catalog_updated_at` | `scenario_catalog_mirror` | **B-tree** | `(updated_at DESC)` |
+| `idx_scenario_catalog_brin_updated` | `scenario_catalog_mirror` | **BRIN** | `(updated_at)` — cheap temporal summaries on large time-ordered tables |
+| `idx_scenario_catalog_in_stock` | `scenario_catalog_mirror` | **B-tree** (partial) | `(category, sku)` **`WHERE stock_units > 0`** |
+| `idx_scenario_catalog_title_trgm` | `scenario_catalog_mirror` | **GiST** | `(title gist_trgm_ops)` — fuzzy / similarity-friendly (with `pg_trgm`) |
+| `idx_scenario_catalog_kafka_key_hash` | `scenario_catalog_mirror` | **HASH** | `(kafka_msg_key)` — equality-oriented |
+| `idx_scenario_orders_stage_created` | `scenario_orders` | **B-tree** | `(pipeline_stage, created_at DESC)` |
+| `idx_scenario_orders_email` | `scenario_orders` | **B-tree** | `(customer_email)` |
+| `idx_scenario_orders_created_brin` | `scenario_orders` | **BRIN** | `(created_at)` |
+| `idx_scenario_orders_placed_partial` | `scenario_orders` | **B-tree** (partial) | `(created_at DESC)` **`WHERE pipeline_stage = 'placed'`** |
+| `idx_scenario_orders_lines_gin` | `scenario_orders` | **GIN** | `(lines jsonb_path_ops)` — containment / path-style JSONB |
+| `idx_scenario_orders_stage_cover` | `scenario_orders` | **B-tree** (covering) | `(pipeline_stage)` **`INCLUDE (order_ref, total_cents)`** |
+| `idx_scenario_fulfill_order_ref` | `scenario_fulfillment_lines` | **B-tree** | `(order_ref)` |
+| `idx_scenario_fulfill_sku` | `scenario_fulfillment_lines` | **B-tree** | `(sku)` |
+| `idx_scenario_fulfill_order_sku` | `scenario_fulfillment_lines` | **B-tree** | `(order_ref, sku)` — compound |
+| `idx_scenario_fulfill_brin_created` | `scenario_fulfillment_lines` | **BRIN** | `(created_at)` |
+
+#### MongoDB (`demo`)
+
+Compound indexes follow an **ESR** hint: **E**quality-leading keys, then **S**ort, then **R**ange (and tie-breakers such as `sku`) where it matches hub queries.
+
+| Collection | Index name | Type | Keys / options |
+|------------|------------|------|----------------|
+| `scenario_products` | `esr_sku_unique` | Unique B-tree | `{ sku: 1 }` |
+| `scenario_products` | `esr_updated_sku` | Compound B-tree | `{ updated_at: -1, sku: 1 }` |
+| `scenario_products` | `esr_category_price_sku` | Compound B-tree | `{ category: 1, unit_price_cents: 1, sku: 1 }` |
+| `scenario_products` | `partial_in_stock` | Partial compound B-tree | `{ category: 1, sku: 1 }` with `partialFilterExpression: { stock_units: { $gt: 0 } }` |
+| `scenario_products` | `esr_warehouse_sku` | Compound B-tree | `{ warehouse: 1, sku: 1 }` |
+| `scenario_products` | `text_title_desc` | **Text** | `title` + `description` (weights: title 10, description 1) |
+| `demo_items` | `esr_name_id` | Compound B-tree | `{ name: 1, _id: 1 }` (if collection exists) |
+| `demo_items` | `esr_name_qty` | Compound B-tree | `{ name: 1, qty: 1 }` (if collection exists) |
+| `demo_items_from_kafka` | `sink_name_id` | Compound B-tree | `{ name: 1, _id: 1 }` (if collection exists) |
+
+#### Cassandra (`demo_hub`)
+
+| Object | Kind | Details |
+|--------|------|---------|
+| `scenario_timeline` | Table | Partition key `order_ref`, clustering `event_ts DESC`; columns `event_type`, `detail`. |
+| `scenario_timeline_event_type` | **Secondary index** | On `event_type` — suitable only for **low-cardinality** demo filters; at scale prefer query-by-partition or a dedicated table. |
+
+**Apply scripts** assume you run them from **`dashboards/demo`** with **`docker compose`** and the matching services up (see paths in the table above).
+
 ---
 
 This docker-compose script starts a small cluster with some workloads running and the dashboards

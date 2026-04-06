@@ -1,0 +1,11 @@
+%% Companion to catalog-leftjoin-no-fulfillment.svg — Mermaid sketch of the same anti-join.
+flowchart LR
+  M["`(scenario_catalog_mirror m)\nall SKU rows`"]
+  F["`(scenario_fulfillment_lines f)\nrows per fulfilled SKU`"]
+  J["`LEFT JOIN\nON f.sku = m.sku`"]
+  W["`WHERE f.id IS NULL\n(no match)`"]
+  R["`**Result**\n sku, title for SKUs\nnever fulfilled`"]
+  M --> J
+  F --> J
+  J --> W
+  W --> R

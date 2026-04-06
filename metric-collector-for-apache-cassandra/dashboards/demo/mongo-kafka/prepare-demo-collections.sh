@@ -58,3 +58,18 @@ if (n === 0) {
 }
 print("demo collections ready for Debezium + Mongo sink");
 EOS
+
+# In Docker Compose the file is mounted at /demo-indexes.js; locally use repo dir.
+IDX=""
+if [[ -f /demo-indexes.js ]]; then
+  IDX=/demo-indexes.js
+else
+  _dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+  [[ -f "${_dir}/demo-indexes.js" ]] && IDX="${_dir}/demo-indexes.js"
+fi
+if [[ -n "${IDX}" ]]; then
+  echo "applying Mongo demo indexes (ESR-oriented compounds, partial, text)..."
+  mongosh "${MONGOS_URI}" --quiet "${IDX}"
+else
+  echo "warn: demo-indexes.js not found (mount as /demo-indexes.js in compose)" >&2
+fi

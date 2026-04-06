@@ -23,6 +23,21 @@ This guide mirrors the Postgres CDC demo: **Debezium MongoDB source** (CDC via *
 - **Prepare step:** Compose service **`mongo-kafka-prepare`** runs **`prepare-demo-collections.sh`** after **`mongo-shard-add`** completes: **`sh.enableSharding("demo")`**, **`shardCollection`** on **`demo.demo_items`** and **`demo.demo_items_from_kafka`**, seed inserts on **`demo_items`**.
 - **Loop safety:** **`collection.include.list`** is only **`demo.demo_items`**. The sink target collection is **not** captured, so **CDC → Kafka → sink** does not feed back into the source stream (same pattern as Postgres **`demo_items_from_kafka`**).
 
+### Hub scenario indexes (MongoDB)
+
+**[`demo-indexes.js`](demo-indexes.js)** creates hub and CDC-related indexes on **`demo`**: **ESR-oriented** compounds (equality-leading, then sort/range and `sku` tie-breakers), a **partial** index on in-stock products, a **text** index on **`scenario_products.title`** / **`description`**, and compounds on **`demo_items`** / **`demo_items_from_kafka`** when those collections exist.
+
+It runs at the end of **[`prepare-demo-collections.sh`](prepare-demo-collections.sh)** (Compose **`mongo-kafka-prepare`** mounts the script as **`/demo-indexes.js`**). To re-apply on a running cluster: from **`dashboards/demo`**, **`./mongo-kafka/apply-demo-indexes.sh`**.
+
+| Mongo index category | Example in this demo |
+|---------------------|----------------------|
+| Unique B-tree | **`esr_sku_unique`** on `{ sku: 1 }` |
+| Compound B-tree | **`esr_category_price_sku`**, **`esr_name_id`**, etc. |
+| Partial filter | **`partial_in_stock`** (`stock_units > 0`) |
+| Text | **`text_title_desc`** |
+
+Full table: **[`../README.md` → Hub scenario indexes](../README.md#hub-scenario-indexes-multi-db-reference)**.
+
 ## How the workflow works (short)
 
 1. Applications or **`mongosh`** issue writes to **`demo.demo_items`** through **`mongos`**; documents land on the appropriate shard (tic / tac / toe).
