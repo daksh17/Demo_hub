@@ -118,6 +118,36 @@ def ensure_postgres_scenario_schema(conn: psycopg.Connection) -> None:
         )
         """
     )
+    _ensure_postgres_scenario_indexes(conn)
+
+
+def _ensure_postgres_scenario_indexes(conn: psycopg.Connection) -> None:
+    """B-tree, GIN (JSONB), BRIN (time), HASH (equality), partial, compound — demo-friendly set."""
+    conn.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+    stmts = [
+        # --- scenario_catalog_mirror ---
+        "CREATE INDEX IF NOT EXISTS idx_scenario_catalog_category_price ON scenario_catalog_mirror (category, unit_price_cents, sku)",
+        "CREATE INDEX IF NOT EXISTS idx_scenario_catalog_updated_at ON scenario_catalog_mirror (updated_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_scenario_catalog_brin_updated ON scenario_catalog_mirror USING BRIN (updated_at)",
+        "CREATE INDEX IF NOT EXISTS idx_scenario_catalog_in_stock ON scenario_catalog_mirror (category, sku) WHERE stock_units > 0",
+        "CREATE INDEX IF NOT EXISTS idx_scenario_catalog_title_trgm ON scenario_catalog_mirror USING GIST (title gist_trgm_ops)",
+        # HASH: equality-only lookups on message key (postgres requires btree-compatible types; HASH is OK for text)
+        "CREATE INDEX IF NOT EXISTS idx_scenario_catalog_kafka_key_hash ON scenario_catalog_mirror USING HASH (kafka_msg_key)",
+        # --- scenario_orders ---
+        "CREATE INDEX IF NOT EXISTS idx_scenario_orders_stage_created ON scenario_orders (pipeline_stage, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_scenario_orders_email ON scenario_orders (customer_email)",
+        "CREATE INDEX IF NOT EXISTS idx_scenario_orders_created_brin ON scenario_orders USING BRIN (created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_scenario_orders_placed_partial ON scenario_orders (created_at DESC) WHERE pipeline_stage = 'placed'",
+        "CREATE INDEX IF NOT EXISTS idx_scenario_orders_lines_gin ON scenario_orders USING GIN (lines jsonb_path_ops)",
+        "CREATE INDEX IF NOT EXISTS idx_scenario_orders_stage_cover ON scenario_orders (pipeline_stage) INCLUDE (order_ref, total_cents)",
+        # --- scenario_fulfillment_lines ---
+        "CREATE INDEX IF NOT EXISTS idx_scenario_fulfill_order_ref ON scenario_fulfillment_lines (order_ref)",
+        "CREATE INDEX IF NOT EXISTS idx_scenario_fulfill_sku ON scenario_fulfillment_lines (sku)",
+        "CREATE INDEX IF NOT EXISTS idx_scenario_fulfill_order_sku ON scenario_fulfillment_lines (order_ref, sku)",
+        "CREATE INDEX IF NOT EXISTS idx_scenario_fulfill_brin_created ON scenario_fulfillment_lines USING BRIN (created_at)",
+    ]
+    for sql in stmts:
+        conn.execute(sql)
 
 
 def ensure_cassandra_scenario_schema(session: CassandraSession) -> None:
@@ -131,6 +161,11 @@ def ensure_cassandra_scenario_schema(session: CassandraSession) -> None:
           PRIMARY KEY (order_ref, event_ts)
         ) WITH CLUSTERING ORDER BY (event_ts DESC)
         """
+    )
+    # Secondary index: use only for low-cardinality filters in demos (ORDER_PLACED vs FULFILLMENT_READY).
+    # High-cardinality or large partitions: prefer model + query by partition key or a dedicated table.
+    session.execute(
+        f"CREATE INDEX IF NOT EXISTS scenario_timeline_event_type ON {HUB_KEYSPACE}.scenario_timeline (event_type)"
     )
 
 

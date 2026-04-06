@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Visual for:
+    SELECT m.sku, m.title
+    FROM scenario_catalog_mirror m
+    LEFT JOIN scenario_fulfillment_lines f ON f.sku = m.sku
+    WHERE f.id IS NULL;
+
+  Orange = rows returned (catalog SKUs with no matching fulfillment line).
+  Blue/green = full sets for context (mirror vs fulfillment SKUs).
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 420 260" role="img" aria-labelledby="title desc">
+  <title id="title">LEFT JOIN anti-join: catalog SKUs never fulfilled</title>
+  <desc id="desc">Two overlapping circles. The orange crescent is scenario_catalog_mirror rows where scenario_fulfillment_lines has no matching sku.</desc>
+  <defs>
+    <mask id="catalog-not-in-fulfillment">
+      <rect width="100%" height="100%" fill="white"/>
+      <!-- Punch out the fulfillment circle from the mask ’ highlight only catalog-only region -->
+      <circle cx="248" cy="128" r="78" fill="black"/>
+    </mask>
+  </defs>
+  <rect width="420" height="260" fill="#1a1d23"/>
+
+  <!-- Full catalog set (faint) -->
+  <circle cx="168" cy="128" r="78" fill="#3d6fb5" opacity="0.25" stroke="#6cb5f4" stroke-width="1.5"/>
+  <!-- Full fulfillment set (faint) -->
+  <circle cx="248" cy="128" r="78" fill="#2d8f5c" opacity="0.25" stroke="#5ce1a6" stroke-width="1.5"/>
+
+  <!-- Query result region: part of catalog disk outside fulfillment disk -->
+  <circle cx="168" cy="128" r="78" fill="#e8943c" opacity="0.92" mask="url(#catalog-not-in-fulfillment)" stroke="#f0b070" stroke-width="2"/>
+
+  <!-- Center overlap (for legend only  not the query result) -->
+  <circle cx="208" cy="128" r="24" fill="none" stroke="#8899a6" stroke-width="1" stroke-dasharray="4 3" opacity="0.7"/>
+
+  <text x="210" y="24" text-anchor="middle" fill="#e7e9ea" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14" font-weight="600">LEFT JOIN · WHERE f.id IS NULL</text>
+  <text x="210" y="44" text-anchor="middle" fill="#8899a6" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">scenario_catalog_mirror m ’ scenario_fulfillment_lines f ON f.sku = m.sku</text>
+
+  <text x="118" y="205" text-anchor="middle" fill="#8eb4f0" font-size="11" font-family="ui-sans-serif, system-ui, sans-serif">m: all SKUs</text>
+  <text x="118" y="220" text-anchor="middle" fill="#8eb4f0" font-size="10" font-family="ui-sans-serif, system-ui, sans-serif">(catalog mirror)</text>
+
+  <text x="290" y="205" text-anchor="middle" fill="#7dd9a8" font-size="11" font-family="ui-sans-serif, system-ui, sans-serif">f: SKUs that</text>
+  <text x="290" y="220" text-anchor="middle" fill="#7dd9a8" font-size="10" font-family="ui-sans-serif, system-ui, sans-serif">have fulfillment rows</text>
+
+  <text x="210" y="245" text-anchor="middle" fill="#f0b070" font-size="12" font-weight="600" font-family="ui-sans-serif, system-ui, sans-serif">Orange = query result · in catalog, never appeared in f</text>
+</svg>

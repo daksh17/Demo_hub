@@ -65,6 +65,14 @@ SELECT * FROM orders LIMIT 10;
 SELECT * FROM scenario_timeline LIMIT 10;
 ```
 
+### Hub scenario indexes (Cassandra)
+
+**`demo_hub.scenario_timeline`** is keyed by **`(order_ref, event_ts)`** (clustering **`event_ts DESC`**). The hub also creates a **secondary index** **`scenario_timeline_event_type`** on **`event_type`** for low-cardinality demo filters (`ORDER_PLACED`, etc.). Secondary indexes are **not** a general-purpose substitute for partition-key-driven queries at scale.
+
+**Apply without the UI:** from **`dashboards/demo`**, **`./cassandra/apply-scenario-hub-schema.sh`** (runs **[`ensure-scenario-hub.cql`](ensure-scenario-hub.cql)** via **`cqlsh`** on the first node). Schema is also ensured in **`../realtime-orders-search-hub/demo-ui/scenario.py`**.
+
+Full table: **[`../README.md` → Hub scenario indexes](../README.md#hub-scenario-indexes-multi-db-reference)**.
+
 ### GUI: DBeaver / Idea
 
 Use a **Cassandra** connection (native driver), **not** a generic JDBC URL. Set contact point **`127.0.0.1`**, port **19442**, no user/password for this demo. If the tool only offers JDBC, use a Cassandra-specific plugin or the **Java**/**Python** drivers below—Cassandra is not an ODBC/JDBC server like Postgres.

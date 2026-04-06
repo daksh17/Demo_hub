@@ -251,6 +251,7 @@ services:
       - "./postgres-kafka/ensure-physical-replication-slots.sql:/tmp/ensure-physical-replication-slots.sql:ro"
       - "./postgres-kafka/02-physical-replication-slots.sh:/docker-entrypoint-initdb.d/02-physical-replication-slots.sh:ro"
       - "./postgres-kafka/03-pg-stat-statements.sh:/docker-entrypoint-initdb.d/03-pg-stat-statements.sh:ro"
+      - "./postgres-kafka/04-scenario-hub-schema-indexes.sql:/docker-entrypoint-initdb.d/04-scenario-hub-schema-indexes.sql:ro"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U demo -d demo -h 127.0.0.1 -p 5432"]
       interval: 5s
@@ -651,6 +652,7 @@ services:
         condition: service_completed_successfully
     volumes:
       - "./mongo-kafka/prepare-demo-collections.sh:/prepare-demo-collections.sh:ro"
+      - "./mongo-kafka/demo-indexes.js:/demo-indexes.js:ro"
     entrypoint: ["bash", "/prepare-demo-collections.sh"]
     networks:
       - demo_net

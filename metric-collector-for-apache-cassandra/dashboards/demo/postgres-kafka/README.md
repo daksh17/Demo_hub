@@ -6,6 +6,24 @@ This folder documents the **PostgreSQL primary + two streaming replicas**, **Apa
 
 **Debezium concepts (official-doc summary):** see **[`DEBEZIUM.md`](DEBEZIUM.md)** — PostgreSQL source vs JDBC sink, permissions, snapshots, and links to [debezium.io](https://debezium.io/documentation/reference/stable/index.html).
 
+### Hub scenario indexes (PostgreSQL)
+
+The **hub** uses **`demo`** tables **`scenario_catalog_mirror`**, **`scenario_orders`**, **`scenario_fulfillment_lines`** with mixed access methods: default **B-tree** (including **compound**, **partial** `WHERE`, and **covering** `INCLUDE`), **BRIN** on timestamps, **GIN** (`jsonb_path_ops` on `lines`), **GiST** (`gist_trgm_ops` on `title`, needs **`pg_trgm`**), and **HASH** on `kafka_msg_key`.
+
+| Mechanism | When it applies in this demo |
+|-----------|------------------------------|
+| B-tree | Most filters, joins, `ORDER BY`, unique `sku` / `order_ref` |
+| BRIN | Time-ordered scans on `updated_at` / `created_at` (small-demo teaching; shines on large append-only data) |
+| GIN | JSONB containment / path-style predicates on **`scenario_orders.lines`** |
+| GiST + `pg_trgm` | Similarity / trigram-friendly **`title`** search |
+| HASH | Equality on **`kafka_msg_key`** |
+| Partial | Hot slices: in-stock catalog rows; orders in **`placed`** stage |
+| Covering | Extra columns in index-only plans for **`pipeline_stage`** lookups |
+
+**Apply:** on **first** primary boot, **[`04-scenario-hub-schema-indexes.sql`](04-scenario-hub-schema-indexes.sql)** runs under **`docker-entrypoint-initdb.d`**. On an **existing** volume, from **`dashboards/demo`**: **`./postgres-kafka/apply-scenario-hub-schema-indexes.sh`**. Implementation mirror: **`../realtime-orders-search-hub/demo-ui/scenario.py`**.
+
+Full per-index list: **[`../README.md` → Hub scenario indexes](../README.md#hub-scenario-indexes-multi-db-reference)**.
+
 ## Architecture
 
 - **PostgreSQL (Bitnami, `docker.io/bitnami/postgresql:latest` in compose):** one writable **primary** and two **read replicas** (physical streaming replication). Logical decoding (`wal_level=logical`) is enabled on the primary for Debezium. Bitnami often drops old revision pins; for production pin an image **digest** instead of `:latest`.
@@ -294,6 +312,7 @@ Adjust volume names if your Compose project name is not `demo` (`docker volume l
 | `DEBEZIUM.md` | Debezium PostgreSQL source + JDBC sink concepts, permissions, snapshots, official doc links. |
 | `diagrams/workflow-components.mmd` / `.svg` | Postgres + Kafka component diagram. |
 | `diagrams/cdc-sequence.mmd` / `.svg` | Postgres CDC sequence diagram. |
+| `diagrams/catalog-leftjoin-no-fulfillment.svg` (`.mmd`) | Venn-style: `scenario_catalog_mirror` **LEFT JOIN** `scenario_fulfillment_lines` **WHERE f.id IS NULL** (catalog SKUs never fulfilled). |
 | `README.md` | This document. |
 
 **Single** compose file: **`../docker-compose.yml`**. Other area guides: **`../cassandra/README.md`**, **`../kafka/README.md`**, **`../observability/README.md`**.
