@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mcac-dash-tui"
+version = "0.1.0"
+description = "Interactive TUI for MCAC Grafana dashboard editing"
+requires-python = ">=3.11"
+dependencies = [
+    "textual>=0.86.0",
+]
+
+[project.scripts]
+mcac-dash = "tui.app:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["tui*"]

@@ -6,3 +6,5 @@ venv
 .classpath
 target
 dependency-reduced-pom.xml
+*.egg-info/
+__pycache__/
