@@ -60,6 +60,12 @@ DASHBOARDS: list[DashboardInfo] = [
         path=DASHBOARD_DIR / "mongodb-tictactoe-detailed.json",
         relative_path="../grafana/generated-dashboards/mongodb-tictactoe-detailed.json",
     ),
+    DashboardInfo(
+        key="postgres",
+        name="Postgres Database",
+        path=DASHBOARD_DIR / "postgres-database.json",
+        relative_path="../grafana/generated-dashboards/postgres-database.json",
+    ),
 ]
 
 
