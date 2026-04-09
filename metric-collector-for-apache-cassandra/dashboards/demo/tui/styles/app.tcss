@@ -1,0 +1,44 @@
+/* MCAC Dashboard TUI — Main Stylesheet */
+
+Screen {
+    background: $background;
+}
+
+#dashboard-scroll {
+    width: 100%;
+    height: 1fr;
+}
+
+#app-header {
+    width: 100%;
+    height: 3;
+    background: $primary;
+    color: $text;
+    text-align: center;
+    text-style: bold;
+    padding: 1;
+}
+
+#add-section-row {
+    width: 100%;
+    height: 5;
+    align: center middle;
+    padding: 1;
+}
+
+#add-section-btn {
+    margin: 0 2;
+}
+
+#status-bar {
+    dock: bottom;
+    width: 100%;
+    height: 3;
+    background: $surface;
+    padding: 1 2;
+    color: $text-muted;
+}
+
+#status-text {
+    width: 1fr;
+}
