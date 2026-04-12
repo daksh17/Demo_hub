@@ -216,20 +216,35 @@ def _kafka_wait_broker() -> str:
 
 
 def _hub_wait_upstream() -> str:
-    kh, oh = fqdn_service("kafka"), fqdn_service("opensearch")
+    # Must match app.py lifespan(): Cluster(cassandra), psycopg, httpx→OpenSearch. Without these,
+    # uvicorn exits immediately → CrashLoopBackOff (init used to wait only kafka+opensearch).
+    kh = fqdn_service("kafka")
+    oh = fqdn_service("opensearch")
+    pg = fqdn_service("postgresql-primary")
+    cs = fqdn_service("cassandra")
+    rd = fqdn_service("redis")
+    mg = fqdn_service("mongo-mongos1")
     return f"""      initContainers:
-        - name: wait-kafka-opensearch
+        - name: wait-hub-deps
           image: alpine:3.19
           command:
             - /bin/sh
             - -c
             - |
               apk add --no-cache netcat-openbsd >/dev/null
-              for i in $(seq 1 150); do
-                if nc -z -w 2 {kh} 9092 2>/dev/null && nc -z -w 2 {oh} 9200 2>/dev/null; then exit 0; fi
+              for i in $(seq 1 200); do
+                if nc -z -w 2 {kh} 9092 2>/dev/null \\
+                  && nc -z -w 2 {oh} 9200 2>/dev/null \\
+                  && nc -z -w 2 {pg} 5432 2>/dev/null \\
+                  && nc -z -w 2 {cs} 9042 2>/dev/null \\
+                  && nc -z -w 2 {rd} 6379 2>/dev/null \\
+                  && nc -z -w 2 {mg} 27017 2>/dev/null; then
+                  exit 0
+                fi
                 sleep 2
               done
-              echo "timeout waiting for {kh}:9092 or {oh}:9200" >&2
+              echo "timeout waiting for kafka:9092, opensearch:9200, postgresql-primary:5432," >&2
+              echo "  cassandra:9042, redis:6379, mongo-mongos1:27017" >&2
               exit 1
 """
 
