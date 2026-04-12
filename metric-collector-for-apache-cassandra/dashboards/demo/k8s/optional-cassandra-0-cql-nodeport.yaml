@@ -1,0 +1,26 @@
+# Optional (dev / local clusters only): expose CQL for cassandra-0 on a NodePort when
+# kubectl port-forward to :9042 fails (e.g. OrbStack socat + native protocol "Connection reset").
+#
+# From dashboards/demo (repo: metric-collector-for-apache-cassandra/dashboards/demo):
+#   kubectl apply -f k8s/optional-cassandra-0-cql-nodeport.yaml
+#
+# Then point cqlsh / DBeaver at <node-ip>:30942 (see: kubectl get nodes -o wide).
+# OrbStack / Docker Desktop: often localhost or the node INTERNAL-IP from kubectl.
+# Delete when done: kubectl delete -f k8s/optional-cassandra-0-cql-nodeport.yaml
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cassandra-0-cql-nodeport
+  namespace: demo-hub
+  labels:
+    demo-hub.io/group: cassandra-ring
+spec:
+  type: NodePort
+  selector:
+    statefulset.kubernetes.io/pod-name: cassandra-0
+  ports:
+    - name: cql
+      port: 9042
+      targetPort: 9042
+      nodePort: 30942

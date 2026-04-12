@@ -17,6 +17,7 @@
 #   WITH_PORT_FORWARD=1      — after start/restart bootstrap (or apply if SKIP_BOOTSTRAP): wait-ready + port-forward (blocks)
 #   WAIT_READY_TIMEOUT=900s  — kubectl wait timeout (default 900s)
 #   SKIP_PROMETHEUS=1        — passed through to port-forward-demo-hub.sh when using port-forward / WITH_PORT_FORWARD
+#   APPLY_CASSANDRA_CQL_NODEPORT=1 — after apply + bootstrap: kubectl apply optional-cassandra-0-cql-nodeport.yaml (local DBeaver/CQL)
 #
 set -euo pipefail
 
@@ -48,6 +49,7 @@ Environment:
   WITH_PORT_FORWARD=1      after start/restart: wait-ready, then port-forward (blocks; Ctrl+C stops)
   WAIT_READY_TIMEOUT=900s  timeout for wait-ready / port-forward pre-check
   SKIP_PROMETHEUS=1        omit Prometheus forward if its pod is down
+  APPLY_CASSANDRA_CQL_NODEPORT=1  apply k8s/optional-cassandra-0-cql-nodeport.yaml after stack is up (stop-start-all-k8s.sh sets this by default)
 EOF
   exit "${1:-0}"
 }
@@ -85,6 +87,17 @@ cmd_wait_ready() {
   echo "=== Ready: core Deployments + cassandra ring ==="
 }
 
+maybe_apply_cassandra_cql_nodeport() {
+  [[ "${APPLY_CASSANDRA_CQL_NODEPORT:-}" == "1" ]] || return 0
+  local f="$ROOT/optional-cassandra-0-cql-nodeport.yaml"
+  if [[ ! -f "$f" ]]; then
+    echo "WARN: $f not found — skip optional Cassandra NodePort" >&2
+    return 0
+  fi
+  echo "=== Optional: Cassandra CQL NodePort (DBeaver / local CQL on node :30942) ==="
+  kubectl apply -f "$f"
+}
+
 cmd_port_forward() {
   cmd_wait_ready
   echo "=== Port-forward (localhost) — Ctrl+C to stop ==="
@@ -116,6 +129,7 @@ cmd_start() {
   if [[ "${SKIP_BOOTSTRAP:-}" == "1" ]]; then
     echo "SKIP_BOOTSTRAP=1 — skipping apply-data-bootstrap.sh"
     echo "Run later: $ROOT/scripts/apply-data-bootstrap.sh"
+    maybe_apply_cassandra_cql_nodeport
     if [[ "${WITH_PORT_FORWARD:-}" == "1" ]]; then
       cmd_wait_ready
       exec "$ROOT/scripts/port-forward-demo-hub.sh"
@@ -124,12 +138,12 @@ cmd_start() {
   fi
 
   echo "=== Data bootstrap (Postgres / Cassandra / Mongo Jobs) ==="
+  "$ROOT/scripts/apply-data-bootstrap.sh"
+  maybe_apply_cassandra_cql_nodeport
+
   if [[ "${WITH_PORT_FORWARD:-}" == "1" ]]; then
-    "$ROOT/scripts/apply-data-bootstrap.sh"
     cmd_wait_ready
     exec "$ROOT/scripts/port-forward-demo-hub.sh"
-  else
-    exec "$ROOT/scripts/apply-data-bootstrap.sh"
   fi
 }
 

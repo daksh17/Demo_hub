@@ -211,10 +211,19 @@ Then open or connect locally:
 | **Postgres** | `psql "postgresql://demo:demopass@127.0.0.1:5432/demo"` |
 | **Cassandra** | `cqlsh 127.0.0.1 9042` |
 | **MongoDB (mongos)** | `mongosh "mongodb://127.0.0.1:27017/"` |
+| **Redis** | `redis-cli -h 127.0.0.1 -p 6379 -a demoredispass` (or URI `redis://:demoredispass@127.0.0.1:6379/0`) |
 
-If a port is already in use locally, override before running the script, e.g. `LOCAL_PROM_PORT=19090 LOCAL_GRAFANA_PORT=13000 ./k8s/scripts/port-forward-demo-hub.sh`. For OpenSearch use `LOCAL_OPENSEARCH_PORT` / `LOCAL_OS_DASHBOARDS_PORT` (defaults **9200** / **5601**).
+If a port is already in use locally, override before running the script, e.g. `LOCAL_PROM_PORT=19090 LOCAL_GRAFANA_PORT=13000 LOCAL_REDIS_PORT=16379 ./k8s/scripts/port-forward-demo-hub.sh`. For OpenSearch use `LOCAL_OPENSEARCH_PORT` / `LOCAL_OS_DASHBOARDS_PORT` (defaults **9200** / **5601**).
 
 If **`kubectl port-forward`** prints **Connection refused** on **:9090** (often with **socat** in the message), the **Prometheus container is not listening** — usually **CrashLoopBackOff** or not **Ready**. Fix the pod (`kubectl logs deploy/prometheus -n demo-hub`), or temporarily skip that forward so other ports still work: **`SKIP_PROMETHEUS=1 ./k8s/scripts/port-forward-demo-hub.sh`**.
+
+**Cassandra / `cqlsh` / DBeaver:** [`port-forward-demo-hub.sh`](scripts/port-forward-demo-hub.sh) forwards **`pod/cassandra-0:9042`**, not **`svc/cassandra`** (the Service can bounce between replicas and confuse CQL). If **`kubectl port-forward`** still shows **socat “Connection reset by peer”** / **lost connection to pod** even for **`pod/cassandra-0`**, your runtime (often **OrbStack** / **Docker Desktop** Kubernetes) may not relay Cassandra’s native protocol reliably. **Workaround — run `cqlsh` inside the ring pod** (no port-forward):
+
+```bash
+kubectl exec -it -n demo-hub cassandra-0 -c cassandra -- cqlsh localhost 9042
+```
+
+Check the cluster from inside: **`kubectl exec -n demo-hub cassandra-0 -c cassandra -- nodetool status`**. For **DBeaver on your Mac** when port-forward keeps failing, from **`dashboards/demo`** run **`kubectl apply -f k8s/optional-cassandra-0-cql-nodeport.yaml`** (see **[`optional-cassandra-0-cql-nodeport.yaml`](optional-cassandra-0-cql-nodeport.yaml)** — targets **only `cassandra-0`**, NodePort **30942**). Connect DBeaver to **`<node-ip>:30942`** (`kubectl get nodes -o wide` — your node **INTERNAL-IP** was **192.168.139.2** in one OrbStack run; try that or **localhost**). Remove when finished: **`kubectl delete -f k8s/optional-cassandra-0-cql-nodeport.yaml`**.
 
 **Lifecycle — one script (`start` / `stop` / `restart` / `status` / `wait-ready` / `port-forward`):**
 
@@ -243,7 +252,7 @@ WITH_PORT_FORWARD=1 ./k8s/scripts/demo-hub.sh start
 # If Prometheus is down but you want other ports: SKIP_PROMETHEUS=1 ./k8s/scripts/demo-hub.sh port-forward
 ```
 
-**`wait-ready`** / **`port-forward`** use `kubectl wait` on **Deployments** labeled **`app.kubernetes.io/part-of=demo-hub`** and **`kubectl rollout status`** on **`statefulset/cassandra`**. Override wait duration with **`WAIT_READY_TIMEOUT`** (default **`900s`**). Legacy alias: **`./k8s/scripts/stop-start-all-k8s.sh`** → **`demo-hub.sh restart`** (honours **`REGEN`**, **`SKIP_BOOTSTRAP`**).
+**`wait-ready`** / **`port-forward`** use `kubectl wait` on **Deployments** labeled **`app.kubernetes.io/part-of=demo-hub`** and **`kubectl rollout status`** on **`statefulset/cassandra`**. Override wait duration with **`WAIT_READY_TIMEOUT`** (default **`900s`**). Legacy alias **`./k8s/scripts/stop-start-all-k8s.sh`** runs **`demo-hub.sh restart`** and, by default, sets **`APPLY_CASSANDRA_CQL_NODEPORT=1`** so **[`optional-cassandra-0-cql-nodeport.yaml`](optional-cassandra-0-cql-nodeport.yaml)** is applied after bootstrap (DBeaver / local CQL on NodePort **30942**). Use **`APPLY_CASSANDRA_CQL_NODEPORT=0`** to skip. **`demo-hub.sh restart`** alone does not set that unless you **`export APPLY_CASSANDRA_CQL_NODEPORT=1`**. Other env: **`REGEN`**, **`SKIP_BOOTSTRAP`**, **`WITH_PORT_FORWARD`**.
 
 **Docker Compose** (not Kubernetes): from `dashboards/demo` run `docker compose down` then `./start-full-stack.sh` or `docker compose up -d`.
 
@@ -285,6 +294,8 @@ Or: `docker compose build nodetool-exporter` from `dashboards/demo`, then `kind 
 
 **Storage:** Data directories use **`emptyDir`** for portability. For persistence, replace with **PersistentVolumeClaim** templates.
 
+**Grafana — imported “OpenSearch Prometheus” dashboards (e.g. [ID 15178](https://grafana.com/grafana/dashboards/15178)) show “No data”:** Panels filter on Prometheus **`job`** and often **`cluster`**. In this repo, [`dashboards/prometheus/prometheus.yaml`](../../prometheus/prometheus.yaml) uses **`job_name: "opensearch_demo"`** (targets **`opensearch-exporter:9114`**). Many community dashboards default the **`job`** variable to **`open_search_demo`** (extra underscore) — **that does not match** and every panel is empty. **Fix:** open the dashboard **Variables** (gear → **Variables**), set **`job`** default / options to **`opensearch_demo`**, or pick **`opensearch_demo`** from the top dropdown. For **`cluster`**, generated OpenSearch config sets **`cluster.name: demo-hub`** — use **`demo-hub`** if the variable lists it (it should match exporter metrics). **Verify in Prometheus** (port-forward **9090**): **Status → Targets** → **`opensearch_demo`** should be **UP**; **Graph** → `up{job="opensearch_demo"}` → **1**. If **DOWN**, check **`kubectl logs -n demo-hub deploy/opensearch-exporter`** and that OpenSearch is reachable at **`http://opensearch:9200`** from the exporter pod.
+
 ---
 
 ## Legacy Pod skeletons (`pods/`, `services/`)
@@ -311,6 +322,7 @@ python3 scripts/gen_demo_hub_pods.py
 | **hub-demo-ui CrashLoop** (after image pulls OK) | The app **connects to Postgres, Cassandra, Redis, Mongo (mongos), Kafka, and OpenSearch** during FastAPI startup (`lifespan`). The **initContainer** waits for all of those TCP ports before the main container runs. If you still see **BackOff**, confirm dependencies are **Ready** (`kubectl get pods -n demo-hub`) and check **`kubectl logs deploy/hub-demo-ui -n demo-hub -c hub-demo-ui --previous`**. Regenerate/apply **`95-hub-demo-ui.yaml`** if your manifest only waited for Kafka + OpenSearch. |
 | **kafka-connect ImagePullBackOff** | Image **`mcac-demo/kafka-connect:2.7.3-mongo-sink`** is built from `mongo-kafka/Dockerfile.connect` — use **`build-all-custom-images.sh`**, then restart `deploy/kafka-connect`. |
 | **Prometheus CrashLoopBackOff** | Check logs: `kubectl logs deploy/prometheus -n demo-hub --tail=80`. If you see **`scrape timeout greater than scrape interval`** for job **`mcac`**, regenerate (`python3 k8s/scripts/gen_demo_hub_k8s.py`) and re-apply **`10-observability-prometheus-grafana.yaml`** — the generator keeps **`scrape_timeout` ≤ `scrape_interval`** for that job. Other causes: YAML errors, OOM. |
+| **Grafana dashboard 15178 / OpenSearch — all “No data”** | **`job`** must be **`opensearch_demo`** (see [`prometheus.yaml`](../../prometheus/prometheus.yaml)), not **`open_search_demo`**. Edit dashboard variables. Confirm **`up{job="opensearch_demo"}==1`** in Prometheus. |
 | **stress RunContainerError** | **tlp-stress** must use the image **ENTRYPOINT** — generator uses `args` only (not `command`). Re-apply `98-nodetool-stress.yaml`. |
 | **OOMKilled** | Raise limits or node RAM (see kafka-connect `limits.memory`). |
 | **Mongo / PG not usable** | Init Jobs not run — replica sets and SQL not applied. |
