@@ -216,7 +216,7 @@ If a port is already in use locally, override before running the script, e.g. `L
 
 If **`kubectl port-forward`** prints **Connection refused** on **:9090** (often with **socat** in the message), the **Prometheus container is not listening** — usually **CrashLoopBackOff** or not **Ready**. Fix the pod (`kubectl logs deploy/prometheus -n demo-hub`), or temporarily skip that forward so other ports still work: **`SKIP_PROMETHEUS=1 ./k8s/scripts/port-forward-demo-hub.sh`**.
 
-**Lifecycle — one script (`start` / `stop` / `restart` / `status`):**
+**Lifecycle — one script (`start` / `stop` / `restart` / `status` / `wait-ready` / `port-forward`):**
 
 From `dashboards/demo`, use **[`k8s/scripts/demo-hub.sh`](scripts/demo-hub.sh)** as the single entry point. **Order matters:** `stop` deletes the **`demo-hub`** namespace (full teardown); `start` applies **`generated/all.yaml` once** then runs **`apply-data-bootstrap.sh`** (waits for Postgres/Cassandra, then Jobs). **`restart`** is `stop` then `start` (same as the old **`stop-start-all-k8s.sh`**).
 
@@ -232,9 +232,18 @@ REGEN=1 ./k8s/scripts/demo-hub.sh restart
 
 # Workloads only (skip Postgres/Cassandra/Mongo Jobs — e.g. data already initialized):
 SKIP_BOOTSTRAP=1 ./k8s/scripts/demo-hub.sh start
+
+# After stack + bootstrap: wait until all part-of=demo-hub Deployments + Cassandra STS are Ready, then port-forward (blocks — Ctrl+C stops):
+./k8s/scripts/demo-hub.sh port-forward
+
+# One shot: bootstrap, wait for workloads Ready, then port-forward (same forwards as port-forward-demo-hub.sh):
+WITH_PORT_FORWARD=1 ./k8s/scripts/demo-hub.sh start
+# or: WITH_PORT_FORWARD=1 REGEN=1 ./k8s/scripts/demo-hub.sh restart
+
+# If Prometheus is down but you want other ports: SKIP_PROMETHEUS=1 ./k8s/scripts/demo-hub.sh port-forward
 ```
 
-Legacy alias: **`./k8s/scripts/stop-start-all-k8s.sh`** → **`demo-hub.sh restart`** (honours **`REGEN`**, **`SKIP_BOOTSTRAP`**).
+**`wait-ready`** / **`port-forward`** use `kubectl wait` on **Deployments** labeled **`app.kubernetes.io/part-of=demo-hub`** and **`kubectl rollout status`** on **`statefulset/cassandra`**. Override wait duration with **`WAIT_READY_TIMEOUT`** (default **`900s`**). Legacy alias: **`./k8s/scripts/stop-start-all-k8s.sh`** → **`demo-hub.sh restart`** (honours **`REGEN`**, **`SKIP_BOOTSTRAP`**).
 
 **Docker Compose** (not Kubernetes): from `dashboards/demo` run `docker compose down` then `./start-full-stack.sh` or `docker compose up -d`.
 
@@ -299,7 +308,7 @@ python3 scripts/gen_demo_hub_pods.py
 | **ErrImagePull** / **ImagePullBackOff** (nodetool-exporter) | Not on a public registry — build and load: **`./k8s/scripts/build-load-nodetool-exporter.sh`** (or `docker compose build nodetool-exporter` then `kind load docker-image demo-hub/nodetool-exporter:latest`). |
 | **Kafka / kafka-exporter CrashLoop** | Stack uses **Bitnami Legacy** Kafka + ZooKeeper (`docker.io/bitnamilegacy/kafka`, `bitnamilegacy/zookeeper`) — same **`kafka:9092`** bootstrap as before. Re-apply `generated/20-zookeeper-kafka.yaml`, then **`kubectl delete pod -n demo-hub -l app.kubernetes.io/name=kafka`** (stuck rollouts can leave two Kafka ReplicaSets). Ensure nodes can **pull** `docker.io/bitnamilegacy/*`. |
 | **hub-demo-ui ErrImagePull** / **ImagePullBackOff** | Image **`mcac-demo/hub-demo-ui:latest`** is local-only — run **`./k8s/scripts/build-all-custom-images.sh`** (or build that Dockerfile under `realtime-orders-search-hub/demo-ui`), then `kubectl rollout restart deploy/hub-demo-ui -n demo-hub`. |
-| **hub-demo-ui CrashLoop** (after image pulls OK) | Waits for **Kafka + OpenSearch** in an initContainer; if Kafka was down, redeploy after Kafka is healthy. Check logs: `kubectl logs deploy/hub-demo-ui -n demo-hub`. |
+| **hub-demo-ui CrashLoop** (after image pulls OK) | The app **connects to Postgres, Cassandra, Redis, Mongo (mongos), Kafka, and OpenSearch** during FastAPI startup (`lifespan`). The **initContainer** waits for all of those TCP ports before the main container runs. If you still see **BackOff**, confirm dependencies are **Ready** (`kubectl get pods -n demo-hub`) and check **`kubectl logs deploy/hub-demo-ui -n demo-hub -c hub-demo-ui --previous`**. Regenerate/apply **`95-hub-demo-ui.yaml`** if your manifest only waited for Kafka + OpenSearch. |
 | **kafka-connect ImagePullBackOff** | Image **`mcac-demo/kafka-connect:2.7.3-mongo-sink`** is built from `mongo-kafka/Dockerfile.connect` — use **`build-all-custom-images.sh`**, then restart `deploy/kafka-connect`. |
 | **Prometheus CrashLoopBackOff** | Check logs: `kubectl logs deploy/prometheus -n demo-hub --tail=80`. If you see **`scrape timeout greater than scrape interval`** for job **`mcac`**, regenerate (`python3 k8s/scripts/gen_demo_hub_k8s.py`) and re-apply **`10-observability-prometheus-grafana.yaml`** — the generator keeps **`scrape_timeout` ≤ `scrape_interval`** for that job. Other causes: YAML errors, OOM. |
 | **stress RunContainerError** | **tlp-stress** must use the image **ENTRYPOINT** — generator uses `args` only (not `command`). Re-apply `98-nodetool-stress.yaml`. |

@@ -17082,18 +17082,26 @@ spec:
         demo-hub.io/group: hub-demo-ui
     spec:
       initContainers:
-        - name: wait-kafka-opensearch
+        - name: wait-hub-deps
           image: alpine:3.19
           command:
             - /bin/sh
             - -c
             - |
               apk add --no-cache netcat-openbsd >/dev/null
-              for i in $(seq 1 150); do
-                if nc -z -w 2 kafka.demo-hub.svc.cluster.local 9092 2>/dev/null && nc -z -w 2 opensearch.demo-hub.svc.cluster.local 9200 2>/dev/null; then exit 0; fi
+              for i in $(seq 1 200); do
+                if nc -z -w 2 kafka.demo-hub.svc.cluster.local 9092 2>/dev/null \
+                  && nc -z -w 2 opensearch.demo-hub.svc.cluster.local 9200 2>/dev/null \
+                  && nc -z -w 2 postgresql-primary.demo-hub.svc.cluster.local 5432 2>/dev/null \
+                  && nc -z -w 2 cassandra.demo-hub.svc.cluster.local 9042 2>/dev/null \
+                  && nc -z -w 2 redis.demo-hub.svc.cluster.local 6379 2>/dev/null \
+                  && nc -z -w 2 mongo-mongos1.demo-hub.svc.cluster.local 27017 2>/dev/null; then
+                  exit 0
+                fi
                 sleep 2
               done
-              echo "timeout waiting for kafka.demo-hub.svc.cluster.local:9092 or opensearch.demo-hub.svc.cluster.local:9200" >&2
+              echo "timeout waiting for kafka:9092, opensearch:9200, postgresql-primary:5432," >&2
+              echo "  cassandra:9042, redis:6379, mongo-mongos1:27017" >&2
               exit 1
       containers:
         - name: hub-demo-ui
