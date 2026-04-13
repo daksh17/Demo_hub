@@ -20,7 +20,7 @@ spec:
         - name: REDIS_URL
           value: "redis://:demoredispass@redis:6379/0"
         - name: CASSANDRA_HOSTS
-          value: "cassandra"
+          value: "cassandra-0.cassandra-headless.demo-hub.svc.cluster.local,cassandra-1.cassandra-headless.demo-hub.svc.cluster.local,cassandra-2.cassandra-headless.demo-hub.svc.cluster.local"
         - name: CASSANDRA_KEYSPACE
           value: "demo_hub"
         - name: OPENSEARCH_URL

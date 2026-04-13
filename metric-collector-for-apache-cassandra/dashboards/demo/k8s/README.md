@@ -37,9 +37,37 @@ Kubernetes (**K8s**) runs **workloads** on one or more **nodes** (machines or VM
 | **Service (headless)** | **`cassandra-headless`** — DNS for **`cassandra-0.cassandra-headless.demo-hub.svc.cluster.local`** etc., for gossip/seeds and MCAC scrape targets. |
 | **ConfigMap** | Injects **Prometheus `prometheus.yaml`**, **`tg_mcac.json`** (MCAC scrape list), Grafana provisioning, OpenSearch config, MCAC agent YAML beside Cassandra. |
 | **Job** | One-shot bootstrap: schema, replication setup, Mongo sharding steps (see `README-jobs.md`). |
-| **emptyDir volume** | Ephemeral disk for container data in the generated manifests (lost when the pod is deleted). Not persistent across node loss. |
+| **emptyDir volume** | Ephemeral disk for most Deployments (ZooKeeper, Kafka, Postgres, Redis, Mongo, etc.). **Cassandra** uses **PersistentVolumeClaims** (`10Gi` per replica) via [`30-cassandra-ring.yaml`](generated/30-cassandra-ring.yaml); your cluster needs a default **StorageClass** (or set `CASSANDRA_DATA_STORAGE_CLASS` / `CASSANDRA_DATA_STORAGE_SIZE` in [`scripts/gen_demo_hub_k8s.py`](scripts/gen_demo_hub_k8s.py) and regenerate). |
+| **Secret** | [`01-demo-hub-credentials.yaml`](generated/01-demo-hub-credentials.yaml) holds demo passwords; Postgres, Redis, hub UI, and postgres-exporter read them via **`valueFrom.secretKeyRef`**. |
+| **Ingress / PDB / HPA / CronJob / NetworkPolicy** | [`96-kubernetes-ops.yaml`](generated/96-kubernetes-ops.yaml): multi-host **Ingress** (`demo-hub.local`, `grafana.demo-hub.local`, `prometheus.demo-hub.local` — add `/etc/hosts` and an Ingress controller), **PodDisruptionBudgets**, **HorizontalPodAutoscaler** for hub UI (needs **metrics-server**), a **CronJob** smoke check, and a **NetworkPolicy** (in-cluster + `ingress-nginx` namespace). |
+| **ServiceMonitor (Prometheus Operator)** | Not used by the bundled static Prometheus. See [`optional-prometheus-operator-servicemonitors.example.yaml`](optional-prometheus-operator-servicemonitors.example.yaml) if you scrape with the Operator instead. |
 
-**How traffic flows:** A pod calls another **by Service DNS**, e.g. `http://prometheus:9090` from Grafana. Your laptop does **not** see ClusterIP services until you run **`kubectl port-forward`** (see [`scripts/port-forward-demo-hub.sh`](scripts/port-forward-demo-hub.sh)).
+**How traffic flows:** A pod calls another **by Service DNS**, e.g. `http://prometheus:9090` from Grafana. Your laptop does **not** see ClusterIP services until you run **`kubectl port-forward`** (see [`scripts/port-forward-demo-hub.sh`](scripts/port-forward-demo-hub.sh)), or you install an **Ingress controller** and use the hosts in `96-kubernetes-ops.yaml`.
+
+### New / extended resources (what was added vs earlier manifests)
+
+The generator ([`scripts/gen_demo_hub_k8s.py`](scripts/gen_demo_hub_k8s.py)) was extended beyond “Deployments + Services + ConfigMaps + Jobs” so the cluster manifest set is closer to a small production layout. **Behavioral summary:**
+
+| Resource | Where | Before (typical older demo YAML) | After (current generated stack) |
+|----------|--------|-----------------------------------|----------------------------------|
+| **Secret** | [`01-demo-hub-credentials.yaml`](generated/01-demo-hub-credentials.yaml) | Passwords often inlined in Deployment `env` or ConfigMap `data` | **`demo-hub-credentials`** (`Opaque`, `stringData`) — Postgres (primary + replicas), Redis + redis-exporter, hub **`POSTGRES_DSN`** / **`REDIS_URL`**, postgres-exporters use **`valueFrom.secretKeyRef`**. Bootstrap Jobs still embed the same demo passwords in scripts for idempotency; rotate the Secret and scripts together if you change passwords. |
+| **Cassandra data disk** | [`30-cassandra-ring.yaml`](generated/30-cassandra-ring.yaml) | **`emptyDir`** under `/var/lib/cassandra` (ephemeral) | **`volumeClaimTemplates`** — **10Gi** `ReadWriteOnce` PVC per ordinal (`data-*`); uses cluster **default StorageClass** unless you set `CASSANDRA_DATA_STORAGE_CLASS` / size in the generator. Requires a **default StorageClass** (or a named class you set). |
+| **Hub → Cassandra contact points** | [`95-hub-demo-ui.yaml`](generated/95-hub-demo-ui.yaml) | **`CASSANDRA_HOSTS=cassandra`** (ClusterIP Service) | **Headless FQDNs** for `cassandra-0..2.cassandra-headless...` — avoids **`NoHostAvailable`** when the driver discovers a peer not yet listening on **9042**. App code also **retries** connect (env: `CASSANDRA_CONNECT_MAX_ATTEMPTS`, `CASSANDRA_CONNECT_RETRY_DELAY_SEC`). |
+| **Ingress** | [`96-kubernetes-ops.yaml`](generated/96-kubernetes-ops.yaml) | Not present; only ClusterIP + port-forward | **`demo-hub-ingress`** — hosts **`demo-hub.local`** (hub UI), **`grafana.demo-hub.local`**, **`prometheus.demo-hub.local`**. **Does nothing** until an **Ingress controller** is installed and DNS/hosts point to it. **Does not replace** port-forward by default. |
+| **PodDisruptionBudget** | same | Not present | **`cassandra-pdb`** (`minAvailable: 2`), **`postgresql-primary-pdb`**, **`hub-demo-ui-pdb`** — limits voluntary disruption during drains/upgrades (when the scheduler respects PDBs). |
+| **HorizontalPodAutoscaler** | same | Not present | **`hub-demo-ui`** — CPU **70%**, replicas **1–3**. **Needs [metrics-server](https://github.com/kubernetes-sigs/metrics-server)** in the cluster; without it, the HPA object exists but scaling metrics stay unknown. |
+| **NetworkPolicy** | same | Not present | **`demo-hub-namespace-isolation`** — selects pods with **`app.kubernetes.io/part-of: demo-hub`**; **ingress** from namespace **`demo-hub`** and from **`ingress-nginx`** (so the Ingress controller can reach Services); **egress** allowed broadly (`egress: - {}`) so DNS and pulls still work. Adjust if your Ingress runs in another namespace. |
+| **CronJob** | same | Not present | **`demo-hub-smoke-curl`** — every **30** minutes, curls **`http://hub-demo-ui:8888/docs`** (in-cluster smoke; not a substitute for monitoring). |
+| **ServiceMonitor** | [`optional-prometheus-operator-servicemonitors.example.yaml`](optional-prometheus-operator-servicemonitors.example.yaml) | N/A | **Example only** — for **Prometheus Operator** users. The bundled stack uses a **static Prometheus Deployment** + `scrape_configs`, not the Operator. |
+
+**Optional (not in `all.yaml` by composition logic, separate files):**
+
+| File | Purpose |
+|------|---------|
+| [`optional-cassandra-0-cql-nodeport.yaml`](optional-cassandra-0-cql-nodeport.yaml) | NodePort **30942** → **`cassandra-0:9042`** for host tools when port-forward is unreliable. **`stop-start-all-k8s.sh`** applies it by default (`APPLY_CASSANDRA_CQL_NODEPORT=1`). |
+| [`optional-prometheus-operator-servicemonitors.example.yaml`](optional-prometheus-operator-servicemonitors.example.yaml) | Example **ServiceMonitor** CRs — apply only if you use kube-prometheus-stack / Prometheus Operator. |
+
+**Laptop access:** **Ingress** and **port-forward** are **alternatives** for reaching UIs from your machine; most local clusters still use **[`port-forward-demo-hub.sh`](scripts/port-forward-demo-hub.sh)** unless you install Ingress and configure hosts. See **[`scripts/stop-start-all-k8s.sh`](scripts/stop-start-all-k8s.sh)** — defaults **`WITH_PORT_FORWARD=0`** so restart does not block on forwards.
 
 ---
 
@@ -149,19 +177,24 @@ See **[Troubleshooting](#troubleshooting)** for stack-specific issues.
 | File | Contents |
 |------|----------|
 | `00-namespace.yaml` | Copy of [`namespace.yaml`](namespace.yaml) |
+| `01-demo-hub-credentials.yaml` | **Secret** `demo-hub-credentials` (demo passwords; workloads use `secretKeyRef`) |
 | `10-observability-prometheus-grafana.yaml` | Prometheus + Grafana **Deployments**, **Services**, **ConfigMaps** — embeds [`dashboards/prometheus/prometheus.yaml`](../../prometheus/prometheus.yaml), [`demo/tg_mcac.json`](../tg_mcac.json), [`dashboards/grafana/prometheus-datasource.yaml`](../../grafana/prometheus-datasource.yaml), [`dashboards/grafana/dashboards.yaml`](../../grafana/dashboards.yaml), and all [`dashboards/grafana/generated-dashboards/*.json`](../../grafana/generated-dashboards/) at generate time (same layout as Compose). |
 | `20-zookeeper-kafka.yaml` | ZooKeeper + Kafka |
-| `30-cassandra-ring.yaml` | Cassandra **StatefulSet** (3 replicas) + headless + client **Service** |
-| `40-postgresql-ha.yaml` | Bitnami Postgres primary + 2 replicas |
-| `50-redis.yaml` | Redis + redis-exporter |
+| `30-cassandra-ring.yaml` | Cassandra **StatefulSet** (3 replicas) + **PVCs** (`volumeClaimTemplates`) + headless + client **Service** |
+| `35-cassandra-schema-job.yaml` | Job: RF=3 keyspace / placeholder table |
+| `40-postgresql-ha.yaml` | Bitnami Postgres primary + 2 replicas (passwords from Secret) |
+| `45-postgres-bootstrap-job.yaml` | Job: Debezium + slots + scenario SQL |
+| `50-redis.yaml` | Redis + redis-exporter (Redis password from Secret) |
 | `60-mongo-sharded.yaml` | Config servers, shard `mongod`s, mongos (same DNS names as Compose) |
+| `61-mongo-bootstrap-job.yaml` | Job: sharded cluster init + collections |
 | `70-kafka-connect.yaml` | Kafka Connect |
 | `80-exporters.yaml` | Postgres exporters, kafka-exporter, mongodb-exporter |
 | `90-opensearch.yaml` | OpenSearch (+ ConfigMap for `opensearch.yml`), Dashboards, elasticsearch-exporter |
-| `95-hub-demo-ui.yaml` | Hub demo UI |
+| `95-hub-demo-ui.yaml` | Hub demo UI (headless **CASSANDRA_HOSTS**, DSN/Redis from Secret) |
+| `96-kubernetes-ops.yaml` | **Ingress**, **PDB**, **HPA**, **NetworkPolicy**, **CronJob** |
 | `98-nodetool-stress.yaml` | Nodetool-exporter + tlp-stress |
-| `all.yaml` | Concatenation of the above (68 documents) |
-| `README-jobs.md` | Notes on one-shot **Jobs** (MCAC init, connector registration, mongo RS init) not fully generated |
+| `all.yaml` | Single concatenation of all of the above (apply once) |
+| `README-jobs.md` | Notes on one-shot **Jobs** |
 
 Labels:
 
@@ -252,7 +285,7 @@ WITH_PORT_FORWARD=1 ./k8s/scripts/demo-hub.sh start
 # If Prometheus is down but you want other ports: SKIP_PROMETHEUS=1 ./k8s/scripts/demo-hub.sh port-forward
 ```
 
-**`wait-ready`** / **`port-forward`** use `kubectl wait` on **Deployments** labeled **`app.kubernetes.io/part-of=demo-hub`** and **`kubectl rollout status`** on **`statefulset/cassandra`**. Override wait duration with **`WAIT_READY_TIMEOUT`** (default **`900s`**). Legacy alias **`./k8s/scripts/stop-start-all-k8s.sh`** runs **`demo-hub.sh restart`** and, by default, sets **`APPLY_CASSANDRA_CQL_NODEPORT=1`** so **[`optional-cassandra-0-cql-nodeport.yaml`](optional-cassandra-0-cql-nodeport.yaml)** is applied after bootstrap (DBeaver / local CQL on NodePort **30942**). Use **`APPLY_CASSANDRA_CQL_NODEPORT=0`** to skip. **`demo-hub.sh restart`** alone does not set that unless you **`export APPLY_CASSANDRA_CQL_NODEPORT=1`**. Other env: **`REGEN`**, **`SKIP_BOOTSTRAP`**, **`WITH_PORT_FORWARD`**.
+**`wait-ready`** / **`port-forward`** use `kubectl wait` on **Deployments** labeled **`app.kubernetes.io/part-of=demo-hub`** and **`kubectl rollout status`** on **`statefulset/cassandra`**. Override wait duration with **`WAIT_READY_TIMEOUT`** (default **`900s`**). Legacy alias **`./k8s/scripts/stop-start-all-k8s.sh`** runs **`demo-hub.sh restart`** with defaults: **`APPLY_CASSANDRA_CQL_NODEPORT=1`** (applies **[`optional-cassandra-0-cql-nodeport.yaml`](optional-cassandra-0-cql-nodeport.yaml)** after bootstrap — DBeaver on **30942**) and **`WITH_PORT_FORWARD=0`** so the script **does not** block on **`kubectl port-forward`** (use Ingress, NodePort, or run **[`port-forward-demo-hub.sh`](scripts/port-forward-demo-hub.sh)** separately when you need localhost ports). Use **`WITH_PORT_FORWARD=1 ./k8s/scripts/stop-start-all-k8s.sh`** to forward after restart. **`demo-hub.sh restart`** alone does not set **`APPLY_CASSANDRA_CQL_NODEPORT`** unless you export it. Other env: **`REGEN`**, **`SKIP_BOOTSTRAP`**, **`SKIP_PROMETHEUS`**.
 
 **Docker Compose** (not Kubernetes): from `dashboards/demo` run `docker compose down` then `./start-full-stack.sh` or `docker compose up -d`.
 
@@ -292,7 +325,7 @@ Or: `docker compose build nodetool-exporter` from `dashboards/demo`, then `kind 
 
 **Mongo / Postgres parity:** Compose runs **init scripts** (replica sets, shards, Debezium SQL). The generated manifests **start the processes only** — add **Jobs** with repo scripts (see `README-jobs.md` and [`../mongo-sharded/`](../mongo-sharded/), [`../postgres-kafka/`](../postgres-kafka/)).
 
-**Storage:** Data directories use **`emptyDir`** for portability. For persistence, replace with **PersistentVolumeClaim** templates.
+**Storage:** Most Deployments still use **`emptyDir`** for portability. **Cassandra** data is **persistent** via **`volumeClaimTemplates`** in **`30-cassandra-ring.yaml`** (see [New / extended resources](#new--extended-resources-what-was-added-vs-earlier-manifests)). Other databases on K8s remain ephemeral unless you extend the generator with PVCs.
 
 **Grafana — imported “OpenSearch Prometheus” dashboards (e.g. [ID 15178](https://grafana.com/grafana/dashboards/15178)) show “No data”:** Panels filter on Prometheus **`job`** and often **`cluster`**. In this repo, [`dashboards/prometheus/prometheus.yaml`](../../prometheus/prometheus.yaml) uses **`job_name: "opensearch_demo"`** (targets **`opensearch-exporter:9114`**). Many community dashboards default the **`job`** variable to **`open_search_demo`** (extra underscore) — **that does not match** and every panel is empty. **Fix:** open the dashboard **Variables** (gear → **Variables**), set **`job`** default / options to **`opensearch_demo`**, or pick **`opensearch_demo`** from the top dropdown. For **`cluster`**, generated OpenSearch config sets **`cluster.name: demo-hub`** — use **`demo-hub`** if the variable lists it (it should match exporter metrics). **Verify in Prometheus** (port-forward **9090**): **Status → Targets** → **`opensearch_demo`** should be **UP**; **Graph** → `up{job="opensearch_demo"}` → **1**. If **DOWN**, check **`kubectl logs -n demo-hub deploy/opensearch-exporter`** and that OpenSearch is reachable at **`http://opensearch:9200`** from the exporter pod.
 
@@ -322,6 +355,7 @@ python3 scripts/gen_demo_hub_pods.py
 | **hub-demo-ui CrashLoop** (after image pulls OK) | The app **connects to Postgres, Cassandra, Redis, Mongo (mongos), Kafka, and OpenSearch** during FastAPI startup (`lifespan`). The **initContainer** waits for all of those TCP ports before the main container runs. If you still see **BackOff**, confirm dependencies are **Ready** (`kubectl get pods -n demo-hub`) and check **`kubectl logs deploy/hub-demo-ui -n demo-hub -c hub-demo-ui --previous`**. Regenerate/apply **`95-hub-demo-ui.yaml`** if your manifest only waited for Kafka + OpenSearch. |
 | **kafka-connect ImagePullBackOff** | Image **`mcac-demo/kafka-connect:2.7.3-mongo-sink`** is built from `mongo-kafka/Dockerfile.connect` — use **`build-all-custom-images.sh`**, then restart `deploy/kafka-connect`. |
 | **Prometheus CrashLoopBackOff** | Check logs: `kubectl logs deploy/prometheus -n demo-hub --tail=80`. If you see **`scrape timeout greater than scrape interval`** for job **`mcac`**, regenerate (`python3 k8s/scripts/gen_demo_hub_k8s.py`) and re-apply **`10-observability-prometheus-grafana.yaml`** — the generator keeps **`scrape_timeout` ≤ `scrape_interval`** for that job. Other causes: YAML errors, OOM. |
+| **Grafana Postgres dashboard — replication slots / lag show 0** | Panels need **`release`** + **`kubernetes_namespace`** (Grafana variables) and metrics from the **primary**. [`prometheus.yaml`](../../prometheus/prometheus.yaml) adds **`release: demo-hub`** and **`kubernetes_namespace: demo-hub`** on **`postgres_pgdemo`** scrapes. **`postgres-exporter-primary`** uses DB user **`postgres`** so **physical** replication slots are visible (role **`demo`** cannot see physical slots in `pg_replication_slots`). Re-apply **`generated/80-exporters.yaml`** + **`10-observability-prometheus-grafana.yaml`**, restart **`deploy/postgres-exporter-primary`** and **`deploy/prometheus`**, pick **Instance** = **`postgres-exporter-primary:9187`** and **Release** = **`demo-hub`**. |
 | **Grafana dashboard 15178 / OpenSearch — all “No data”** | **`job`** must be **`opensearch_demo`** (see [`prometheus.yaml`](../../prometheus/prometheus.yaml)), not **`open_search_demo`**. Edit dashboard variables. Confirm **`up{job="opensearch_demo"}==1`** in Prometheus. |
 | **stress RunContainerError** | **tlp-stress** must use the image **ENTRYPOINT** — generator uses `args` only (not `command`). Re-apply `98-nodetool-stress.yaml`. |
 | **OOMKilled** | Raise limits or node RAM (see kafka-connect `limits.memory`). |

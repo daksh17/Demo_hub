@@ -48,6 +48,8 @@ Service **`hub-demo-ui`** in **`../docker-compose.yml`** serves a small page on 
 
 Source: **[`demo-ui/`](demo-ui/)** (FastAPI + Dockerfile).
 
+**Kubernetes:** the **`hub-demo-ui`** Deployment is generated in **[`../k8s/generated/95-hub-demo-ui.yaml`](../k8s/generated/95-hub-demo-ui.yaml)**. Reach the UI from your machine with **`kubectl port-forward`** (see **[`../k8s/scripts/port-forward-demo-hub.sh`](../k8s/scripts/port-forward-demo-hub.sh)**) unless you use **Ingress** — see **[`../k8s/README.md`](../k8s/README.md)**. **`CASSANDRA_HOSTS`** is set to **headless** pod DNS (`cassandra-0..2.cassandra-headless...`) so startup does not rely on the **`cassandra`** Service alone; the app **retries** CQL connect during startup.
+
 ---
 
 ## Entire workflow (diagrams)

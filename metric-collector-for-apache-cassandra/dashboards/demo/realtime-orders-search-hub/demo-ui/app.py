@@ -41,7 +41,34 @@ PG_DSN = os.environ.get(
 )
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb://mongo-mongos1:27017")
 REDIS_URL = os.environ.get("REDIS_URL", "redis://:demoredispass@redis:6379/0")
-CASSANDRA_HOSTS = os.environ.get("CASSANDRA_HOSTS", "cassandra").split(",")
+def _cassandra_contact_points() -> list[str]:
+    return [
+        h.strip()
+        for h in os.environ.get("CASSANDRA_HOSTS", "cassandra").split(",")
+        if h.strip()
+    ]
+
+
+def _connect_cassandra_cluster():
+    """Create Cluster + Session; retry while the ring is still opening CQL (common on K8s)."""
+    hosts = _cassandra_contact_points()
+    max_attempts = int(os.environ.get("CASSANDRA_CONNECT_MAX_ATTEMPTS", "45"))
+    delay_sec = float(os.environ.get("CASSANDRA_CONNECT_RETRY_DELAY_SEC", "2"))
+    last_err: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        cluster = Cluster(hosts, connect_timeout=15)
+        try:
+            return cluster, cluster.connect()
+        except Exception as e:
+            last_err = e
+            try:
+                cluster.shutdown()
+            except Exception:
+                pass
+            if attempt < max_attempts:
+                time.sleep(delay_sec)
+    assert last_err is not None
+    raise last_err
 # Workload sustain + many batches can exceed the driver default (~10s) when the node is busy.
 CASSANDRA_WORKLOAD_REQUEST_TIMEOUT = float(
     os.environ.get("CASSANDRA_WORKLOAD_REQUEST_TIMEOUT_SECONDS", "120")
@@ -180,21 +207,22 @@ def _ensure_opensearch_index(client: httpx.Client) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _cassandra_session, _cassandra_insert_prep
-    cluster = Cluster(CASSANDRA_HOSTS)
-    _cassandra_session = cluster.connect()
-    _ensure_cassandra_schema(_cassandra_session)
-    _cassandra_insert_prep = _cassandra_session.prepare(
-        f"INSERT INTO {HUB_KEYSPACE}.orders (order_id, label, created_at) VALUES (?, ?, ?)"
-    )
-    scenario.ensure_cassandra_scenario_schema(_cassandra_session)
-    with psycopg.connect(PG_DSN) as conn:
-        scenario.ensure_postgres_scenario_schema(conn)
-        conn.commit()
-    with httpx.Client(timeout=120.0) as hc:
-        _ensure_opensearch_index(hc)
-        scenario.ensure_scenario_os_index(hc)
-    yield
-    cluster.shutdown()
+    cluster, _cassandra_session = _connect_cassandra_cluster()
+    try:
+        _ensure_cassandra_schema(_cassandra_session)
+        _cassandra_insert_prep = _cassandra_session.prepare(
+            f"INSERT INTO {HUB_KEYSPACE}.orders (order_id, label, created_at) VALUES (?, ?, ?)"
+        )
+        scenario.ensure_cassandra_scenario_schema(_cassandra_session)
+        with psycopg.connect(PG_DSN) as conn:
+            scenario.ensure_postgres_scenario_schema(conn)
+            conn.commit()
+        with httpx.Client(timeout=120.0) as hc:
+            _ensure_opensearch_index(hc)
+            scenario.ensure_scenario_os_index(hc)
+        yield
+    finally:
+        cluster.shutdown()
 
 
 app = FastAPI(title="Realtime hub demo UI", lifespan=lifespan)

@@ -10,6 +10,7 @@ This folder documents the **Apache Cassandra** side of the single-stack compose 
 | **nodetool-exporter** image build context | `../nodetool-exporter/` (`Dockerfile`, `exporter.py`) |
 | MCAC agent / collector config | Repo `../../config/`, agent JAR from `../../pom.xml` **`PROJECT_VERSION`** |
 | Prometheus file SD for MCAC | `../tg_mcac.json` (mounted into Prometheus) |
+| **Kubernetes** (same ring, different wiring) | **[`../k8s/README.md`](../k8s/README.md)** — StatefulSet **`cassandra`** with **PVCs**, headless **`cassandra-headless`**, optional **NodePort** [`../k8s/optional-cassandra-0-cql-nodeport.yaml`](../k8s/optional-cassandra-0-cql-nodeport.yaml); hub UI uses **headless FQDNs** for **`CASSANDRA_HOSTS`** (not the **`cassandra`** ClusterIP service name). |
 
 ## Services (names to use in `docker compose`)
 

@@ -1,0 +1,37 @@
+# Example only — not applied by demo-hub generator.
+# Use when you run Prometheus Operator (kube-prometheus-stack) instead of the static
+# Prometheus Deployment in 10-observability-prometheus-grafana.yaml.
+#
+#   kubectl apply -f optional-prometheus-operator-servicemonitors.example.yaml
+#
+# Adjust namespace, labels, and port names to match your Operator install.
+
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: demo-hub-grafana
+  namespace: demo-hub
+  labels:
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: grafana
+  endpoints:
+    - port: http
+      interval: 30s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: demo-hub-prometheus
+  namespace: demo-hub
+  labels:
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: prometheus
+  endpoints:
+    - port: http
+      interval: 30s

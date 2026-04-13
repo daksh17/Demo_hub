@@ -1,0 +1,170 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: demo-hub-namespace-isolation
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: kubernetes-ops
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: demo-hub
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: demo-hub
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+  egress:
+    - {}
+---
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: demo-hub-ingress
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: kubernetes-ops
+spec:
+  rules:
+    - host: demo-hub.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: hub-demo-ui
+                port:
+                  number: 8888
+    - host: grafana.demo-hub.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: grafana
+                port:
+                  number: 3000
+    - host: prometheus.demo-hub.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: prometheus
+                port:
+                  number: 9090
+---
+
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: cassandra-pdb
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: kubernetes-ops
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cassandra
+      demo-hub.io/cassandra-workload: statefulset
+---
+
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: postgresql-primary-pdb
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: kubernetes-ops
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgresql-primary
+---
+
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: hub-demo-ui-pdb
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: kubernetes-ops
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hub-demo-ui
+---
+
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: hub-demo-ui
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: kubernetes-ops
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: hub-demo-ui
+  minReplicas: 1
+  maxReplicas: 3
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+---
+
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: demo-hub-smoke-curl
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: kubernetes-ops
+spec:
+  schedule: "*/30 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      ttlSecondsAfterFinished: 600
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/part-of: demo-hub
+            demo-hub.io/group: kubernetes-ops
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: curl
+              image: curlimages/curl:8.5.0
+              imagePullPolicy: IfNotPresent
+              args:
+                - -sf
+                - http://hub-demo-ui:8888/docs

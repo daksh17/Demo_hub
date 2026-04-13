@@ -12,6 +12,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "pods"
 OUT_SVC = ROOT / "services"
+# Align with gen_demo_hub_k8s.hub_demo_ui (headless per-pod DNS for the driver).
+HUB_CASSANDRA_HOSTS_K8S = ",".join(
+    f"cassandra-{i}.cassandra-headless.demo-hub.svc.cluster.local" for i in range(3)
+)
 
 # (compose_service_name, image, container_ports, optional_command, optional_args)
 SPECS: list[tuple[str, str, list[int], list[str] | None, list[str] | None]] = [
@@ -123,7 +127,7 @@ ENV_BY_SERVICE: dict[str, list[tuple[str, str]]] = {
         ("POSTGRES_DSN", "postgresql://demo:demopass@postgresql-primary:5432/demo"),
         ("MONGO_URI", "mongodb://mongo-mongos1:27017"),
         ("REDIS_URL", "redis://:demoredispass@redis:6379/0"),
-        ("CASSANDRA_HOSTS", "cassandra"),
+        ("CASSANDRA_HOSTS", HUB_CASSANDRA_HOSTS_K8S),
         ("CASSANDRA_KEYSPACE", "demo_hub"),
         ("OPENSEARCH_URL", "http://opensearch:9200"),
         ("OPENSEARCH_INDEX", "hub-orders"),

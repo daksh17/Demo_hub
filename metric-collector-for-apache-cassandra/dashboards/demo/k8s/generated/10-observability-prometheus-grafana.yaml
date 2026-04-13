@@ -309,6 +309,7 @@ data:
            action: labeldrop
 
       # PostgreSQL (Bitnami demo: primary + replicas) via postgres_exporter
+      # Labels release + kubernetes_namespace match Grafana postgres-database.json template variables.
       - job_name: "postgres_pgdemo"
         scrape_interval: 15s
         scrape_timeout: 10s
@@ -320,16 +321,22 @@ data:
             labels:
               pg_cluster: pgdemo
               pg_role: primary
+              release: demo-hub
+              kubernetes_namespace: demo-hub
           - targets:
               - postgres-exporter-replica-1:9187
             labels:
               pg_cluster: pgdemo
               pg_role: replica_1
+              release: demo-hub
+              kubernetes_namespace: demo-hub
           - targets:
               - postgres-exporter-replica-2:9187
             labels:
               pg_cluster: pgdemo
               pg_role: replica_2
+              release: demo-hub
+              kubernetes_namespace: demo-hub
 
       # Kafka (danielqsj/kafka-exporter; broker PLAINTEXT kafka:29092). Hostname = compose service kafka-exporter-mcac.
       - job_name: "kafka_pgdemo"

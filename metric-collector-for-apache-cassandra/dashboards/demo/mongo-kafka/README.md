@@ -6,6 +6,7 @@ Part of **`dashboards/demo`**: Mongo services, **`mongo-kafka-prepare`**, **`kaf
 - **Cluster bring-up** (config/shard/mongos init): **[Sharded cluster scripts → `../mongo-sharded/README.md`](../mongo-sharded/README.md)**
 - **Shared broker:** **[`../kafka/README.md`](../kafka/README.md)**
 - **Prometheus / Grafana:** **[`../observability/README.md`](../observability/README.md)**
+- **Kubernetes:** sharded Mongo + bootstrap Job: **`../k8s/generated/60-mongo-sharded.yaml`**, **`61-mongo-bootstrap-job.yaml`** — see **[`../k8s/README.md`](../k8s/README.md)**.
 
 This guide mirrors the Postgres CDC demo: **Debezium MongoDB source** (CDC via **`mongos`**) → Kafka → **MongoDB Kafka sink** into a separate collection (**no CDC loop**).
 

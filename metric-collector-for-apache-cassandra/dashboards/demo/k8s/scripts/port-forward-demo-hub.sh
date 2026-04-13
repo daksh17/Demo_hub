@@ -2,6 +2,9 @@
 # Expose demo-hub ClusterIP services on localhost (kubectl port-forward).
 # Run from anywhere; default namespace demo-hub. Leave this terminal open while you use the UIs/clients.
 #
+# You do not need this if you already reach the stack via Ingress (see generated/96-kubernetes-ops.yaml)
+# or only use in-cluster clients / NodePort (e.g. optional-cassandra-0-cql-nodeport.yaml).
+#
 # If you see "Connection refused" / socat errors on :9090 (or :3000, …), nothing is listening
 # inside that pod yet — usually CrashLoopBackOff or not Ready. Check: kubectl get pods -n demo-hub;
 # kubectl logs deploy/prometheus -n demo-hub --tail=50. To forward everything except Prometheus

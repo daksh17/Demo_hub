@@ -27,9 +27,12 @@ spec:
             - name: DATA_SOURCE_URI
               value: "postgresql-primary:5432/demo?sslmode=disable"
             - name: DATA_SOURCE_USER
-              value: "demo"
+              value: "postgres"
             - name: DATA_SOURCE_PASS
-              value: "demopass"
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: postgresql-password
           ports:
             - containerPort: 9187
               name: metrics
@@ -85,7 +88,10 @@ spec:
             - name: DATA_SOURCE_USER
               value: "demo"
             - name: DATA_SOURCE_PASS
-              value: "demopass"
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: demo-user-password
           ports:
             - containerPort: 9187
               name: metrics
@@ -141,7 +147,10 @@ spec:
             - name: DATA_SOURCE_USER
               value: "demo"
             - name: DATA_SOURCE_PASS
-              value: "demopass"
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: demo-user-password
           ports:
             - containerPort: 9187
               name: metrics

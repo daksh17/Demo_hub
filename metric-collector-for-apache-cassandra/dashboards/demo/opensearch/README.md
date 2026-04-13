@@ -4,6 +4,8 @@
 
 This demo runs a **single-node** cluster with the **security plugin disabled** so you can use plain HTTP on port **9200** (suitable for local work only).
 
+**Kubernetes:** OpenSearch, Dashboards, and the exporter are **`../k8s/generated/90-opensearch.yaml`**; Grafana/Prometheus **Ingress** host rules (with an Ingress controller) live in **`../k8s/generated/96-kubernetes-ops.yaml`**. Details: **[`../k8s/README.md`](../k8s/README.md)**.
+
 ## Host ports
 
 | Service | Port | URL (host) |

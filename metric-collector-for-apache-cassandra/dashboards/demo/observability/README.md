@@ -24,6 +24,8 @@ Defined in **`../../prometheus/prometheus.yaml`** (path inside the repo: `dashbo
 | `redis_demo` | `redis-exporter:9121` | Redis 7 via [oliver006/redis_exporter](https://github.com/oliver006/redis_exporter); provisioned **Redis (demo broker)** (`redis-demo-overview.json`, UID **`demo-redis`**). Community IDs **763** / **11835** often need K8s variable fixes — see **`../redis/README.md`** |
 | `opensearch_demo` | `opensearch-exporter:9114` | OpenSearch via [prometheuscommunity/elasticsearch-exporter](https://github.com/prometheus-community/elasticsearch-exporter); Grafana IDs **14191**, **2322** — see **`../opensearch/README.md`** |
 
+**Kubernetes:** Prometheus and Grafana are generated into **`../k8s/generated/10-observability-prometheus-grafana.yaml`** (static Prometheus **Deployment**, not the Prometheus Operator). Optional **ServiceMonitor** examples for Operator-based installs: **[`../k8s/optional-prometheus-operator-servicemonitors.example.yaml`](../k8s/optional-prometheus-operator-servicemonitors.example.yaml)**. **Ingress** for Grafana/Prometheus hostnames (requires an Ingress controller): **`../k8s/generated/96-kubernetes-ops.yaml`**. Full list of K8s resources: **[`../k8s/README.md`](../k8s/README.md)**.
+
 After editing **`prometheus.yaml`** or **`tg_mcac.json`**, reload the stack or restart Prometheus:
 
 ```bash
