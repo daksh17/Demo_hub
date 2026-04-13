@@ -10,6 +10,8 @@
 
 There is no separate username; only **`AUTH password`** (Redis ACL default user).
 
+**Kubernetes:** Redis and the exporter are in **`../k8s/generated/50-redis.yaml`**; the password is in **`demo-hub-credentials`** (**Secret**). See **[`../k8s/README.md`](../k8s/README.md)** for how this differs from inlined env vars.
+
 ## Host ports (from laptop)
 
 | Port | Role |

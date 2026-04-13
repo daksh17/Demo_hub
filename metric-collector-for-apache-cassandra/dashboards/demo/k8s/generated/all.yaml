@@ -7,6 +7,24 @@ metadata:
 ---
 
 apiVersion: v1
+kind: Secret
+metadata:
+  name: demo-hub-credentials
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: credentials
+type: Opaque
+stringData:
+  postgresql-password: postgres
+  postgresql-replication-password: replicatorpass
+  redis-password: demoredispass
+  demo-user-password: demopass
+  hub-postgres-dsn: postgresql://demo:demopass@postgresql-primary:5432/demo
+  hub-redis-url: redis://:demoredispass@redis:6379/0
+---
+
+apiVersion: v1
 kind: ConfigMap
 metadata:
   name: prometheus-config
@@ -317,6 +335,7 @@ data:
            action: labeldrop
 
       # PostgreSQL (Bitnami demo: primary + replicas) via postgres_exporter
+      # Labels release + kubernetes_namespace match Grafana postgres-database.json template variables.
       - job_name: "postgres_pgdemo"
         scrape_interval: 15s
         scrape_timeout: 10s
@@ -328,16 +347,22 @@ data:
             labels:
               pg_cluster: pgdemo
               pg_role: primary
+              release: demo-hub
+              kubernetes_namespace: demo-hub
           - targets:
               - postgres-exporter-replica-1:9187
             labels:
               pg_cluster: pgdemo
               pg_role: replica_1
+              release: demo-hub
+              kubernetes_namespace: demo-hub
           - targets:
               - postgres-exporter-replica-2:9187
             labels:
               pg_cluster: pgdemo
               pg_role: replica_2
+              release: demo-hub
+              kubernetes_namespace: demo-hub
 
       # Kafka (danielqsj/kafka-exporter; broker PLAINTEXT kafka:29092). Hostname = compose service kafka-exporter-mcac.
       - job_name: "kafka_pgdemo"
@@ -14886,6 +14911,7 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: cassandra
+        app.kubernetes.io/part-of: demo-hub
         demo-hub.io/group: cassandra-ring
         demo-hub.io/cassandra-workload: statefulset
     spec:
@@ -14940,13 +14966,22 @@ spec:
               mountPath: /mcac/config
               readOnly: true
       volumes:
-        - name: data
-          emptyDir: {}
         - name: mcac-agent
           emptyDir: {}
         - name: mcac-config
           configMap:
             name: mcac-agent-config
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/name: cassandra
+          demo-hub.io/group: cassandra-ring
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: "10Gi"
 ---
 
 apiVersion: v1
@@ -15048,11 +15083,7 @@ spec:
               value: "master"
             - name: POSTGRESQL_REPLICATION_USER
               value: "replicator"
-            - name: POSTGRESQL_REPLICATION_PASSWORD
-              value: "replicatorpass"
             - name: POSTGRESQL_USERNAME
-              value: "postgres"
-            - name: POSTGRESQL_PASSWORD
               value: "postgres"
             - name: POSTGRESQL_DATABASE
               value: "demo"
@@ -15060,6 +15091,16 @@ spec:
               value: "pgaudit,pg_stat_statements"
             - name: POSTGRESQL_EXTRA_FLAGS
               value: "-c wal_level=logical -c max_replication_slots=8 -c max_wal_senders=8 -c pg_stat_statements.max=10000 -c pg_stat_statements.track=all"
+            - name: POSTGRESQL_REPLICATION_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: postgresql-replication-password
+            - name: POSTGRESQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: postgresql-password
           volumeMounts:
             - name: data
               mountPath: /bitnami/postgresql
@@ -15120,12 +15161,6 @@ spec:
               value: "slave"
             - name: POSTGRESQL_REPLICATION_USER
               value: "replicator"
-            - name: POSTGRESQL_REPLICATION_PASSWORD
-              value: "replicatorpass"
-            - name: POSTGRESQL_USERNAME
-              value: "postgres"
-            - name: POSTGRESQL_PASSWORD
-              value: "postgres"
             - name: POSTGRESQL_MASTER_HOST
               value: "postgresql-primary"
             - name: POSTGRESQL_MASTER_PORT_NUMBER
@@ -15134,6 +15169,16 @@ spec:
               value: "pgaudit,pg_stat_statements"
             - name: POSTGRESQL_EXTRA_FLAGS
               value: "-c primary_slot_name=pgdemo_phys_replica_1 -c pg_stat_statements.max=10000 -c pg_stat_statements.track=all"
+            - name: POSTGRESQL_REPLICATION_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: postgresql-replication-password
+            - name: POSTGRESQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: postgresql-password
           volumeMounts:
             - name: data
               mountPath: /bitnami/postgresql
@@ -15194,12 +15239,6 @@ spec:
               value: "slave"
             - name: POSTGRESQL_REPLICATION_USER
               value: "replicator"
-            - name: POSTGRESQL_REPLICATION_PASSWORD
-              value: "replicatorpass"
-            - name: POSTGRESQL_USERNAME
-              value: "postgres"
-            - name: POSTGRESQL_PASSWORD
-              value: "postgres"
             - name: POSTGRESQL_MASTER_HOST
               value: "postgresql-primary"
             - name: POSTGRESQL_MASTER_PORT_NUMBER
@@ -15208,6 +15247,16 @@ spec:
               value: "pgaudit,pg_stat_statements"
             - name: POSTGRESQL_EXTRA_FLAGS
               value: "-c primary_slot_name=pgdemo_phys_replica_2 -c pg_stat_statements.max=10000 -c pg_stat_statements.track=all"
+            - name: POSTGRESQL_REPLICATION_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: postgresql-replication-password
+            - name: POSTGRESQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: postgresql-password
           volumeMounts:
             - name: data
               mountPath: /bitnami/postgresql
@@ -15456,11 +15505,15 @@ spec:
           image: redis:7.4-alpine
           imagePullPolicy: IfNotPresent
           command:
-            - "redis-server"
-            - "--appendonly"
-            - "yes"
-            - "--requirepass"
-            - "demoredispass"
+            - "sh"
+            - "-c"
+            - "exec redis-server --appendonly yes --requirepass \"$REDIS_PASSWORD\""
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: redis-password
           volumeMounts:
             - name: data
               mountPath: /data
@@ -15520,7 +15573,10 @@ spec:
             - name: REDIS_ADDR
               value: "redis:6379"
             - name: REDIS_PASSWORD
-              value: "demoredispass"
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: redis-password
           ports:
             - containerPort: 9121
               name: metrics
@@ -16603,9 +16659,12 @@ spec:
             - name: DATA_SOURCE_URI
               value: "postgresql-primary:5432/demo?sslmode=disable"
             - name: DATA_SOURCE_USER
-              value: "demo"
+              value: "postgres"
             - name: DATA_SOURCE_PASS
-              value: "demopass"
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: postgresql-password
           ports:
             - containerPort: 9187
               name: metrics
@@ -16661,7 +16720,10 @@ spec:
             - name: DATA_SOURCE_USER
               value: "demo"
             - name: DATA_SOURCE_PASS
-              value: "demopass"
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: demo-user-password
           ports:
             - containerPort: 9187
               name: metrics
@@ -16717,7 +16779,10 @@ spec:
             - name: DATA_SOURCE_USER
               value: "demo"
             - name: DATA_SOURCE_PASS
-              value: "demopass"
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: demo-user-password
           ports:
             - containerPort: 9187
               name: metrics
@@ -17108,14 +17173,10 @@ spec:
           image: mcac-demo/hub-demo-ui:latest
           imagePullPolicy: IfNotPresent
           env:
-            - name: POSTGRES_DSN
-              value: "postgresql://demo:demopass@postgresql-primary:5432/demo"
             - name: MONGO_URI
               value: "mongodb://mongo-mongos1:27017"
-            - name: REDIS_URL
-              value: "redis://:demoredispass@redis:6379/0"
             - name: CASSANDRA_HOSTS
-              value: "cassandra"
+              value: "cassandra-0.cassandra-headless.demo-hub.svc.cluster.local,cassandra-1.cassandra-headless.demo-hub.svc.cluster.local,cassandra-2.cassandra-headless.demo-hub.svc.cluster.local"
             - name: CASSANDRA_KEYSPACE
               value: "demo_hub"
             - name: OPENSEARCH_URL
@@ -17130,6 +17191,16 @@ spec:
               value: "25"
             - name: CASSANDRA_WORKLOAD_WRITE_RETRIES
               value: "3"
+            - name: POSTGRES_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: hub-postgres-dsn
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: hub-redis-url
           ports:
             - containerPort: 8888
               name: http
@@ -17152,6 +17223,178 @@ spec:
     - port: 8888
       targetPort: 8888
       name: http
+---
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: demo-hub-namespace-isolation
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: kubernetes-ops
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: demo-hub
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: demo-hub
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+  egress:
+    - {}
+---
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: demo-hub-ingress
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: kubernetes-ops
+spec:
+  rules:
+    - host: demo-hub.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: hub-demo-ui
+                port:
+                  number: 8888
+    - host: grafana.demo-hub.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: grafana
+                port:
+                  number: 3000
+    - host: prometheus.demo-hub.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: prometheus
+                port:
+                  number: 9090
+---
+
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: cassandra-pdb
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: kubernetes-ops
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cassandra
+      demo-hub.io/cassandra-workload: statefulset
+---
+
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: postgresql-primary-pdb
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: kubernetes-ops
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgresql-primary
+---
+
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: hub-demo-ui-pdb
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: kubernetes-ops
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hub-demo-ui
+---
+
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: hub-demo-ui
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: kubernetes-ops
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: hub-demo-ui
+  minReplicas: 1
+  maxReplicas: 3
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+---
+
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: demo-hub-smoke-curl
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: kubernetes-ops
+spec:
+  schedule: "*/30 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      ttlSecondsAfterFinished: 600
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/part-of: demo-hub
+            demo-hub.io/group: kubernetes-ops
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: curl
+              image: curlimages/curl:8.5.0
+              imagePullPolicy: IfNotPresent
+              args:
+                - -sf
+                - http://hub-demo-ui:8888/docs
 ---
 
 apiVersion: apps/v1

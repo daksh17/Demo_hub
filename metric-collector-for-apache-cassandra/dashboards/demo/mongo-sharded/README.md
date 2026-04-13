@@ -6,6 +6,8 @@ Shell scripts used by **`../docker-compose.yml`** to turn up a **nine-container*
 - **3× shards** — replica sets **`tic`**, **`tac`**, **`toe`** (one data node each in this demo)
 - **3× `mongos`** — routers; Debezium and apps should use **`mongo-mongos1`** (or host port **27025** on the first router)
 
+**Kubernetes:** the same topology is generated as Deployments in **`../k8s/generated/60-mongo-sharded.yaml`**; init is the **`61-mongo-bootstrap-job.yaml`** Job. **[`../k8s/README.md`](../k8s/README.md)** describes PDB/NetworkPolicy and other cluster-wide resources.
+
 ## Scripts (mounted into one-shot containers)
 
 | File | Runs when | Purpose |

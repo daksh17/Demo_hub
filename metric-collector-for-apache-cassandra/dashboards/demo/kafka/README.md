@@ -12,6 +12,8 @@ This folder documents the **Apache Kafka** and **Apache ZooKeeper** (and how **K
 
 Host port **9092** is the usual PLAINTEXT listener for tools on your machine.
 
+**Kubernetes:** ZooKeeper + Kafka + Connect are generated as **`../k8s/generated/20-zookeeper-kafka.yaml`**, **`70-kafka-connect.yaml`** (in-cluster bootstrap **`kafka:9092`**). Ops extras (Ingress, etc.): **[`../k8s/README.md`](../k8s/README.md)**.
+
 ## Who uses this broker
 
 - **PostgreSQL CDC** — Debezium Postgres source + JDBC sink: **[`../postgres-kafka/README.md`](../postgres-kafka/README.md)** (`register-connectors.sh`).

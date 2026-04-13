@@ -4,6 +4,8 @@ Part of **`dashboards/demo`**: Postgres, Kafka, Connect, and exporters are defin
 
 This folder documents the **PostgreSQL primary + two streaming replicas**, **Apache Kafka** with **ZooKeeper**, **Debezium Kafka Connect** (CDC in both directions via source + JDBC sink), and **observability** wired into the same Prometheus and Grafana used by the MCAC demo.
 
+**Kubernetes:** Bitnami Postgres HA + bootstrap Job are **`../k8s/generated/40-postgresql-ha.yaml`**, **`45-postgres-bootstrap-job.yaml`**; superuser/replicator passwords come from **`01-demo-hub-credentials.yaml`**. See **[`../k8s/README.md`](../k8s/README.md)** (*New / extended resources*).
+
 **Debezium concepts (official-doc summary):** see **[`DEBEZIUM.md`](DEBEZIUM.md)** — PostgreSQL source vs JDBC sink, permissions, snapshots, and links to [debezium.io](https://debezium.io/documentation/reference/stable/index.html).
 
 ### Hub scenario indexes (PostgreSQL)

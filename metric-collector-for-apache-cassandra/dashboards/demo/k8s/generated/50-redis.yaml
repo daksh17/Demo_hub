@@ -24,11 +24,15 @@ spec:
           image: redis:7.4-alpine
           imagePullPolicy: IfNotPresent
           command:
-            - "redis-server"
-            - "--appendonly"
-            - "yes"
-            - "--requirepass"
-            - "demoredispass"
+            - "sh"
+            - "-c"
+            - "exec redis-server --appendonly yes --requirepass \"$REDIS_PASSWORD\""
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: redis-password
           volumeMounts:
             - name: data
               mountPath: /data
@@ -88,7 +92,10 @@ spec:
             - name: REDIS_ADDR
               value: "redis:6379"
             - name: REDIS_PASSWORD
-              value: "demoredispass"
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: redis-password
           ports:
             - containerPort: 9121
               name: metrics

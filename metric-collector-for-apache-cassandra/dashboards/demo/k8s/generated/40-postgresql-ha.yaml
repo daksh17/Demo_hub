@@ -28,11 +28,7 @@ spec:
               value: "master"
             - name: POSTGRESQL_REPLICATION_USER
               value: "replicator"
-            - name: POSTGRESQL_REPLICATION_PASSWORD
-              value: "replicatorpass"
             - name: POSTGRESQL_USERNAME
-              value: "postgres"
-            - name: POSTGRESQL_PASSWORD
               value: "postgres"
             - name: POSTGRESQL_DATABASE
               value: "demo"
@@ -40,6 +36,16 @@ spec:
               value: "pgaudit,pg_stat_statements"
             - name: POSTGRESQL_EXTRA_FLAGS
               value: "-c wal_level=logical -c max_replication_slots=8 -c max_wal_senders=8 -c pg_stat_statements.max=10000 -c pg_stat_statements.track=all"
+            - name: POSTGRESQL_REPLICATION_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: postgresql-replication-password
+            - name: POSTGRESQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: postgresql-password
           volumeMounts:
             - name: data
               mountPath: /bitnami/postgresql
@@ -100,12 +106,6 @@ spec:
               value: "slave"
             - name: POSTGRESQL_REPLICATION_USER
               value: "replicator"
-            - name: POSTGRESQL_REPLICATION_PASSWORD
-              value: "replicatorpass"
-            - name: POSTGRESQL_USERNAME
-              value: "postgres"
-            - name: POSTGRESQL_PASSWORD
-              value: "postgres"
             - name: POSTGRESQL_MASTER_HOST
               value: "postgresql-primary"
             - name: POSTGRESQL_MASTER_PORT_NUMBER
@@ -114,6 +114,16 @@ spec:
               value: "pgaudit,pg_stat_statements"
             - name: POSTGRESQL_EXTRA_FLAGS
               value: "-c primary_slot_name=pgdemo_phys_replica_1 -c pg_stat_statements.max=10000 -c pg_stat_statements.track=all"
+            - name: POSTGRESQL_REPLICATION_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: postgresql-replication-password
+            - name: POSTGRESQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: postgresql-password
           volumeMounts:
             - name: data
               mountPath: /bitnami/postgresql
@@ -174,12 +184,6 @@ spec:
               value: "slave"
             - name: POSTGRESQL_REPLICATION_USER
               value: "replicator"
-            - name: POSTGRESQL_REPLICATION_PASSWORD
-              value: "replicatorpass"
-            - name: POSTGRESQL_USERNAME
-              value: "postgres"
-            - name: POSTGRESQL_PASSWORD
-              value: "postgres"
             - name: POSTGRESQL_MASTER_HOST
               value: "postgresql-primary"
             - name: POSTGRESQL_MASTER_PORT_NUMBER
@@ -188,6 +192,16 @@ spec:
               value: "pgaudit,pg_stat_statements"
             - name: POSTGRESQL_EXTRA_FLAGS
               value: "-c primary_slot_name=pgdemo_phys_replica_2 -c pg_stat_statements.max=10000 -c pg_stat_statements.track=all"
+            - name: POSTGRESQL_REPLICATION_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: postgresql-replication-password
+            - name: POSTGRESQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: postgresql-password
           volumeMounts:
             - name: data
               mountPath: /bitnami/postgresql

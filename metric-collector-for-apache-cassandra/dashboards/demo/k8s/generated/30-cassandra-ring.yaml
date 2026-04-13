@@ -300,6 +300,7 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: cassandra
+        app.kubernetes.io/part-of: demo-hub
         demo-hub.io/group: cassandra-ring
         demo-hub.io/cassandra-workload: statefulset
     spec:
@@ -354,10 +355,19 @@ spec:
               mountPath: /mcac/config
               readOnly: true
       volumes:
-        - name: data
-          emptyDir: {}
         - name: mcac-agent
           emptyDir: {}
         - name: mcac-config
           configMap:
             name: mcac-agent-config
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/name: cassandra
+          demo-hub.io/group: cassandra-ring
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: "10Gi"

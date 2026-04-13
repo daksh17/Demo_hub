@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Generate Kubernetes manifests from dashboards/demo/docker-compose.yml (demo-hub stack).
 
-Outputs under k8s/generated/: Deployments, StatefulSets, Services, ConfigMaps, and bootstrap **Jobs**
-(Postgres/Cassandra/Mongo — same scripts as Compose). Run **scripts/apply-data-bootstrap.sh** after workloads are up.
+Outputs under k8s/generated/: Deployments, StatefulSets, Services, ConfigMaps, bootstrap **Jobs**
+(Postgres/Cassandra/Mongo — same scripts as Compose), **Secret** (`demo-hub-credentials`), and ops extras
+(Ingress, PDB, NetworkPolicy, HPA, CronJob). Run **scripts/apply-data-bootstrap.sh** after workloads are up.
 
 Usage:
   python3 k8s/scripts/gen_demo_hub_k8s.py
@@ -26,6 +27,17 @@ DASHBOARDS = DEMO.parent
 REPO_ROOT = DASHBOARDS.parent
 OUT = K8S_ROOT / "generated"
 NS = "demo-hub"
+# Opaque Secret with demo passwords (same values as Compose); workloads use valueFrom.secretKeyRef.
+SECRET_NAME = "demo-hub-credentials"
+SK_POSTGRESQL_PASSWORD = "postgresql-password"
+SK_POSTGRESQL_REPLICATION_PASSWORD = "postgresql-replication-password"
+SK_REDIS_PASSWORD = "redis-password"
+SK_DEMO_USER_PASSWORD = "demo-user-password"
+SK_HUB_POSTGRES_DSN = "hub-postgres-dsn"
+SK_HUB_REDIS_URL = "hub-redis-url"
+# Cassandra data disk: use default StorageClass when set to "" (cluster must provide one).
+CASSANDRA_DATA_STORAGE_CLASS = ""
+CASSANDRA_DATA_STORAGE_SIZE = "10Gi"
 # Local-only image (not on Docker Hub). Tag is NOT :latest so the kubelet does not always try to pull.
 # Build: `docker build -t mcac-demo/mcac-init:local <repo-root>` (see k8s/scripts/build-mcac-init-image.sh).
 MCAC_INIT_IMAGE = "mcac-demo/mcac-init:local"
@@ -36,6 +48,18 @@ POSTGRESQL_IMAGE = "docker.io/bitnamilegacy/postgresql:16.6.0-debian-12-r2"
 def fqdn_service(svc: str) -> str:
     """Kubernetes DNS name for in-cluster clients (avoids ambiguous short-name resolution)."""
     return f"{svc}.{NS}.svc.cluster.local"
+
+
+def cassandra_headless_contact_points() -> str:
+    """Per-pod headless DNS for the Python driver's contact points.
+
+    Using the ClusterIP Service name alone can yield NoHostAvailable: the driver discovers
+    peer IPs from gossip; a replica may not yet accept CQL on 9042 during startup. Headless
+    FQDNs match nodetool-exporter / stable CQL patterns for this StatefulSet.
+    """
+    return ",".join(
+        f"cassandra-{i}.cassandra-headless.{NS}.svc.cluster.local" for i in range(3)
+    )
 
 
 def tcp_readiness_probe(
@@ -167,11 +191,21 @@ def lbl(group: str, name: str, extra: dict[str, str] | None = None) -> tuple[str
     return ml, pl
 
 
-def env_lines(pairs: list[tuple[str, str]], indent: str = "            ") -> str:
+def env_lines(
+    pairs: list[tuple[str, str]],
+    secret_refs: list[tuple[str, str, str]] | None = None,
+    indent: str = "            ",
+) -> str:
     lines = ["          env:"]
     for k, v in pairs:
         lines.append(f"{indent}- name: {k}")
         lines.append(f"{indent}  value: {jdump(v)}")
+    for env_name, sec_name, key in secret_refs or ():
+        lines.append(f"{indent}- name: {env_name}")
+        lines.append(f"{indent}  valueFrom:")
+        lines.append(f"{indent}    secretKeyRef:")
+        lines.append(f"{indent}      name: {sec_name}")
+        lines.append(f"{indent}      key: {key}")
     return "\n".join(lines) + "\n"
 
 
@@ -265,6 +299,7 @@ def deployment(
     fs_group: int | None = None,
     strategy_recreate: bool = False,
     readiness_probe: str | None = None,
+    env_secret_refs: list[tuple[str, str, str]] | None = None,
 ) -> str:
     ml, pl = lbl(group, name, extra_labels)
     port_block = "\n".join(
@@ -279,7 +314,9 @@ def deployment(
     arg = ""
     if args:
         arg = "          args:\n" + "\n".join(f"            - {jdump(a)}" for a in args) + "\n"
-    ev = env_lines(env) if env else ""
+    ev = ""
+    if env or env_secret_refs:
+        ev = env_lines(env, env_secret_refs)
     vol_mount = ""
     vol = ""
     if data_mount:
@@ -344,6 +381,196 @@ spec:
 {svc_ports}
 """
     return join_docs(dep, svc)
+
+
+def demo_hub_credentials_secret() -> str:
+    return f"""apiVersion: v1
+kind: Secret
+metadata:
+  name: {SECRET_NAME}
+  namespace: {NS}
+  labels:
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: credentials
+type: Opaque
+stringData:
+  {SK_POSTGRESQL_PASSWORD}: postgres
+  {SK_POSTGRESQL_REPLICATION_PASSWORD}: replicatorpass
+  {SK_REDIS_PASSWORD}: demoredispass
+  {SK_DEMO_USER_PASSWORD}: demopass
+  {SK_HUB_POSTGRES_DSN}: postgresql://demo:demopass@postgresql-primary:5432/demo
+  {SK_HUB_REDIS_URL}: redis://:demoredispass@redis:6379/0
+"""
+
+
+def kubernetes_ops_extras() -> str:
+    """Ingress, PDB, NetworkPolicy, HPA, CronJob — production-style ops (demo values)."""
+    np = f"""apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: demo-hub-namespace-isolation
+  namespace: {NS}
+  labels:
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: kubernetes-ops
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: demo-hub
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {NS}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+  egress:
+    - {{}}
+"""
+    ing = f"""apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: demo-hub-ingress
+  namespace: {NS}
+  labels:
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: kubernetes-ops
+spec:
+  rules:
+    - host: demo-hub.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: hub-demo-ui
+                port:
+                  number: 8888
+    - host: grafana.demo-hub.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: grafana
+                port:
+                  number: 3000
+    - host: prometheus.demo-hub.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: prometheus
+                port:
+                  number: 9090
+"""
+    pdb_c = f"""apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: cassandra-pdb
+  namespace: {NS}
+  labels:
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: kubernetes-ops
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cassandra
+      demo-hub.io/cassandra-workload: statefulset
+"""
+    pdb_pg = f"""apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: postgresql-primary-pdb
+  namespace: {NS}
+  labels:
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: kubernetes-ops
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgresql-primary
+"""
+    pdb_hub = f"""apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: hub-demo-ui-pdb
+  namespace: {NS}
+  labels:
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: kubernetes-ops
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hub-demo-ui
+"""
+    hpa = f"""apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: hub-demo-ui
+  namespace: {NS}
+  labels:
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: kubernetes-ops
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: hub-demo-ui
+  minReplicas: 1
+  maxReplicas: 3
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+"""
+    cron = f"""apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: demo-hub-smoke-curl
+  namespace: {NS}
+  labels:
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: kubernetes-ops
+spec:
+  schedule: "*/30 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      ttlSecondsAfterFinished: 600
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/part-of: demo-hub
+            demo-hub.io/group: kubernetes-ops
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: curl
+              image: curlimages/curl:8.5.0
+              imagePullPolicy: IfNotPresent
+              args:
+                - -sf
+                - http://hub-demo-ui:8888/docs
+"""
+    return join_docs(np, ing, pdb_c, pdb_pg, pdb_hub, hpa, cron)
 
 
 def read_mcac_revision() -> str:
@@ -441,6 +668,10 @@ spec:
       name: cql
       targetPort: 9042
 """
+    sc = CASSANDRA_DATA_STORAGE_CLASS.strip()
+    sc_yaml = ""
+    if sc:
+        sc_yaml = f"\n        storageClassName: {jdump(sc)}"
     sts = f"""apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -461,6 +692,7 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: cassandra
+        app.kubernetes.io/part-of: demo-hub
         demo-hub.io/group: cassandra-ring
         demo-hub.io/cassandra-workload: statefulset
     spec:
@@ -503,13 +735,22 @@ spec:
               mountPath: /mcac/config
               readOnly: true
       volumes:
-        - name: data
-          emptyDir: {{}}
         - name: mcac-agent
           emptyDir: {{}}
         - name: mcac-config
           configMap:
             name: mcac-agent-config
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/name: cassandra
+          demo-hub.io/group: cassandra-ring
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: {jdump(CASSANDRA_DATA_STORAGE_SIZE)}{sc_yaml}
 """
     return join_docs(mcac_agent_configmap(), headless, client, sts)
 
@@ -976,12 +1217,14 @@ def zookeeper_kafka() -> str:
 
 
 def postgres_ha() -> str:
+    pg_secret = [
+        ("POSTGRESQL_REPLICATION_PASSWORD", SECRET_NAME, SK_POSTGRESQL_REPLICATION_PASSWORD),
+        ("POSTGRESQL_PASSWORD", SECRET_NAME, SK_POSTGRESQL_PASSWORD),
+    ]
     primary = [
         ("POSTGRESQL_REPLICATION_MODE", "master"),
         ("POSTGRESQL_REPLICATION_USER", "replicator"),
-        ("POSTGRESQL_REPLICATION_PASSWORD", "replicatorpass"),
         ("POSTGRESQL_USERNAME", "postgres"),
-        ("POSTGRESQL_PASSWORD", "postgres"),
         ("POSTGRESQL_DATABASE", "demo"),
         ("POSTGRESQL_SHARED_PRELOAD_LIBRARIES", "pgaudit,pg_stat_statements"),
         (
@@ -999,14 +1242,12 @@ def postgres_ha() -> str:
             [(5432, "pg")],
             primary,
             data_mount="/bitnami/postgresql",
+            env_secret_refs=pg_secret,
         )
     ]
     rep_base = [
         ("POSTGRESQL_REPLICATION_MODE", "slave"),
         ("POSTGRESQL_REPLICATION_USER", "replicator"),
-        ("POSTGRESQL_REPLICATION_PASSWORD", "replicatorpass"),
-        ("POSTGRESQL_USERNAME", "postgres"),
-        ("POSTGRESQL_PASSWORD", "postgres"),
         ("POSTGRESQL_MASTER_HOST", "postgresql-primary"),
         ("POSTGRESQL_MASTER_PORT_NUMBER", "5432"),
         ("POSTGRESQL_SHARED_PRELOAD_LIBRARIES", "pgaudit,pg_stat_statements"),
@@ -1028,6 +1269,7 @@ def postgres_ha() -> str:
                 [(5432, "pg")],
                 env,
                 data_mount="/bitnami/postgresql",
+                env_secret_refs=pg_secret,
             )
         )
     return join_docs(*docs)
@@ -1041,8 +1283,9 @@ def redis_stack() -> str:
         1,
         [(6379, "redis")],
         [],
-        command=["redis-server", "--appendonly", "yes", "--requirepass", "demoredispass"],
+        command=["sh", "-c", 'exec redis-server --appendonly yes --requirepass "$REDIS_PASSWORD"'],
         data_mount="/data",
+        env_secret_refs=[("REDIS_PASSWORD", SECRET_NAME, SK_REDIS_PASSWORD)],
     )
     rx = deployment(
         "redis-exporter",
@@ -1050,7 +1293,8 @@ def redis_stack() -> str:
         "oliver006/redis_exporter:v1.62.0",
         1,
         [(9121, "metrics")],
-        [("REDIS_ADDR", "redis:6379"), ("REDIS_PASSWORD", "demoredispass")],
+        [("REDIS_ADDR", "redis:6379")],
+        env_secret_refs=[("REDIS_PASSWORD", SECRET_NAME, SK_REDIS_PASSWORD)],
     )
     return join_docs(r, rx)
 
@@ -1285,22 +1529,26 @@ def kafka_connect() -> str:
 
 
 def exporters() -> str:
-    pe = lambda host, name: deployment(
-        name,
-        "exporters",
-        "prometheuscommunity/postgres-exporter:v0.17.1",
-        1,
-        [(9187, "metrics")],
-        [
-            ("DATA_SOURCE_URI", f"{host}:5432/demo?sslmode=disable"),
-            ("DATA_SOURCE_USER", "demo"),
-            ("DATA_SOURCE_PASS", "demopass"),
-        ],
-    )
+    # Primary: use Bitnami superuser so pg_replication_slots / physical slots appear in exporter
+    # (role "demo" cannot read physical slots per PostgreSQL visibility rules).
+    def pe(host: str, name: str, *, user: str, pwd_key: str) -> str:
+        return deployment(
+            name,
+            "exporters",
+            "prometheuscommunity/postgres-exporter:v0.17.1",
+            1,
+            [(9187, "metrics")],
+            [
+                ("DATA_SOURCE_URI", f"{host}:5432/demo?sslmode=disable"),
+                ("DATA_SOURCE_USER", user),
+            ],
+            env_secret_refs=[("DATA_SOURCE_PASS", SECRET_NAME, pwd_key)],
+        )
+
     parts = [
-        pe("postgresql-primary", "postgres-exporter-primary"),
-        pe("postgresql-replica-1", "postgres-exporter-replica-1"),
-        pe("postgresql-replica-2", "postgres-exporter-replica-2"),
+        pe("postgresql-primary", "postgres-exporter-primary", user="postgres", pwd_key=SK_POSTGRESQL_PASSWORD),
+        pe("postgresql-replica-1", "postgres-exporter-replica-1", user="demo", pwd_key=SK_DEMO_USER_PASSWORD),
+        pe("postgresql-replica-2", "postgres-exporter-replica-2", user="demo", pwd_key=SK_DEMO_USER_PASSWORD),
         deployment(
             "kafka-exporter-mcac",
             "exporters",
@@ -1355,10 +1603,8 @@ def hub_demo_ui() -> str:
         1,
         [(8888, "http")],
         [
-            ("POSTGRES_DSN", "postgresql://demo:demopass@postgresql-primary:5432/demo"),
             ("MONGO_URI", "mongodb://mongo-mongos1:27017"),
-            ("REDIS_URL", "redis://:demoredispass@redis:6379/0"),
-            ("CASSANDRA_HOSTS", "cassandra"),
+            ("CASSANDRA_HOSTS", cassandra_headless_contact_points()),
             ("CASSANDRA_KEYSPACE", "demo_hub"),
             ("OPENSEARCH_URL", "http://opensearch:9200"),
             ("OPENSEARCH_INDEX", "hub-orders"),
@@ -1369,6 +1615,10 @@ def hub_demo_ui() -> str:
         ],
         init_before_containers=_hub_wait_upstream(),
         strategy_recreate=True,
+        env_secret_refs=[
+            ("POSTGRES_DSN", SECRET_NAME, SK_HUB_POSTGRES_DSN),
+            ("REDIS_URL", SECRET_NAME, SK_HUB_REDIS_URL),
+        ],
     )
 
 
@@ -1400,6 +1650,7 @@ def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     bundles: list[tuple[str, str]] = [
         ("00-namespace.yaml", copy_namespace()),
+        ("01-demo-hub-credentials.yaml", demo_hub_credentials_secret()),
         ("10-observability-prometheus-grafana.yaml", join_docs(prometheus_stack(), grafana_stack())),
         ("20-zookeeper-kafka.yaml", zookeeper_kafka()),
         ("30-cassandra-ring.yaml", cassandra_statefulset()),
@@ -1413,6 +1664,7 @@ def main() -> None:
         ("80-exporters.yaml", exporters()),
         ("90-opensearch.yaml", opensearch_stack()),
         ("95-hub-demo-ui.yaml", hub_demo_ui()),
+        ("96-kubernetes-ops.yaml", kubernetes_ops_extras()),
         ("98-nodetool-stress.yaml", nodetool_stress()),
     ]
     all_parts: list[str] = []

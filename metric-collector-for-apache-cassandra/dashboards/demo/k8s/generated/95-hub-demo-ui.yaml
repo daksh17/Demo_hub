@@ -48,14 +48,10 @@ spec:
           image: mcac-demo/hub-demo-ui:latest
           imagePullPolicy: IfNotPresent
           env:
-            - name: POSTGRES_DSN
-              value: "postgresql://demo:demopass@postgresql-primary:5432/demo"
             - name: MONGO_URI
               value: "mongodb://mongo-mongos1:27017"
-            - name: REDIS_URL
-              value: "redis://:demoredispass@redis:6379/0"
             - name: CASSANDRA_HOSTS
-              value: "cassandra"
+              value: "cassandra-0.cassandra-headless.demo-hub.svc.cluster.local,cassandra-1.cassandra-headless.demo-hub.svc.cluster.local,cassandra-2.cassandra-headless.demo-hub.svc.cluster.local"
             - name: CASSANDRA_KEYSPACE
               value: "demo_hub"
             - name: OPENSEARCH_URL
@@ -70,6 +66,16 @@ spec:
               value: "25"
             - name: CASSANDRA_WORKLOAD_WRITE_RETRIES
               value: "3"
+            - name: POSTGRES_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: hub-postgres-dsn
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: hub-redis-url
           ports:
             - containerPort: 8888
               name: http
