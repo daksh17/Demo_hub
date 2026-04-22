@@ -107,6 +107,15 @@ def ensure_postgres_scenario_schema(conn: psycopg.Connection) -> None:
         """
     )
     conn.execute(
+        "ALTER TABLE scenario_orders ADD COLUMN IF NOT EXISTS ship_lat DOUBLE PRECISION"
+    )
+    conn.execute(
+        "ALTER TABLE scenario_orders ADD COLUMN IF NOT EXISTS ship_lon DOUBLE PRECISION"
+    )
+    conn.execute(
+        "ALTER TABLE scenario_orders ADD COLUMN IF NOT EXISTS ship_label TEXT"
+    )
+    conn.execute(
         """
         CREATE TABLE IF NOT EXISTS scenario_fulfillment_lines (
           id SERIAL PRIMARY KEY,
@@ -241,27 +250,40 @@ def _redis_refresh_summary(r: redis.Redis) -> None:
 
 def op_seed_catalog(count: int = 10) -> dict[str, Any]:
     """Service A: product catalog documents in Mongo (rich semi-realistic attributes)."""
-    mc = MongoClient(MONGO_URI, serverSelectionTimeoutMS=30_000)
-    coll = mc["demo"][MONGO_COLL]
-    inserted = []
-    cats = ["electronics", "home", "apparel", "grocery", "sports"]
-    for _ in range(count):
-        sku = f"SKU-{uuid.uuid4().hex[:8].upper()}"
-        doc = {
-            "sku": sku,
-            "title": fake.catch_phrase(),
-            "category": fake.random_element(cats),
-            "unit_price_cents": fake.random_int(499, 49999),
-            "stock_units": fake.random_int(0, 500),
-            "warehouse": fake.random_element(["east-1", "west-2", "eu-1"]),
-            "description": fake.text(max_nb_chars=200),
-            "source": "scenario-seed",
-            "updated_at": datetime.now(timezone.utc),
+    mc: MongoClient | None = None
+    try:
+        mc = MongoClient(MONGO_URI, serverSelectionTimeoutMS=30_000)
+        coll = mc["demo"][MONGO_COLL]
+        inserted = []
+        cats = ["electronics", "home", "apparel", "grocery", "sports"]
+        for _ in range(count):
+            sku = f"SKU-{uuid.uuid4().hex[:8].upper()}"
+            doc = {
+                "sku": sku,
+                "title": fake.catch_phrase(),
+                "category": fake.random_element(cats),
+                "unit_price_cents": fake.random_int(499, 49999),
+                "stock_units": fake.random_int(0, 500),
+                "warehouse": fake.random_element(["east-1", "west-2", "eu-1"]),
+                "description": fake.text(max_nb_chars=200),
+                "source": "scenario-seed",
+                "updated_at": datetime.now(timezone.utc),
+            }
+            coll.insert_one(doc)
+            inserted.append({"sku": sku, "title": doc["title"][:60]})
+        return {"ok": True, "mongo_inserted": len(inserted), "samples": inserted[:5]}
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "mongo_uri": MONGO_URI,
+            "hint": "K8s: ensure Job mongo-demo-bootstrap is Complete (sharding + demo DB). "
+            "Check: kubectl logs -n demo-hub job/mongo-demo-bootstrap --tail=80 ; "
+            "kubectl logs -n demo-hub deploy/mongo-mongos1 --tail=50",
         }
-        coll.insert_one(doc)
-        inserted.append({"sku": sku, "title": doc["title"][:60]})
-    mc.close()
-    return {"ok": True, "mongo_inserted": len(inserted), "samples": inserted[:5]}
+    finally:
+        if mc is not None:
+            mc.close()
 
 
 def op_pipeline_mongo_to_postgres_and_kafka() -> dict[str, Any]:
@@ -342,8 +364,26 @@ def op_pipeline_mongo_to_postgres_and_kafka() -> dict[str, Any]:
     }
 
 
+def build_faker_customer_bundle() -> dict[str, Any]:
+    """Random identity + coordinates for the guided-order UI."""
+    return {
+        "customer_name": fake.name(),
+        "customer_email": fake.email(),
+        "ship_lat": float(fake.latitude()),
+        "ship_lon": float(fake.longitude()),
+        "ship_label": fake.address().replace("\n", ", ")[:500],
+    }
+
+
 def op_place_order(
-    lines_count: int = 3, cassandra_session: CassandraSession | None = None
+    lines_count: int = 3,
+    cassandra_session: CassandraSession | None = None,
+    *,
+    customer_email: str | None = None,
+    customer_name: str | None = None,
+    ship_lat: float | None = None,
+    ship_lon: float | None = None,
+    ship_label: str | None = None,
 ) -> dict[str, Any]:
     """OLTP: order in Postgres + timeline in Cassandra + events (Kafka + OS) + Redis."""
     mc = MongoClient(MONGO_URI, serverSelectionTimeoutMS=30_000)
@@ -370,36 +410,55 @@ def op_place_order(
                 lines.append({"sku": sku, "qty": qty, "unit_price_cents": price})
                 total += price * qty
     order_ref = f"ORD-{uuid.uuid4().hex[:10].upper()}"
-    customer_email = fake.email()
-    customer_name = fake.name()
+    ce = (customer_email or fake.email()).strip()
+    cn = (customer_name or fake.name()).strip() or fake.name()
+    slat = ship_lat
+    slon = ship_lon
+    slab = (ship_label or "").strip()[:500] or None
 
     with psycopg.connect(PG_DSN) as conn:
         ensure_postgres_scenario_schema(conn)
         conn.execute(
             """
             INSERT INTO scenario_orders
-              (order_ref, customer_email, customer_name, lines, total_cents, pipeline_stage)
-            VALUES (%s,%s,%s,%s::jsonb,%s,%s)
+              (order_ref, customer_email, customer_name, lines, total_cents, pipeline_stage,
+               ship_lat, ship_lon, ship_label)
+            VALUES (%s,%s,%s,%s::jsonb,%s,%s,%s,%s,%s)
             """,
             (
                 order_ref,
-                customer_email,
-                customer_name,
+                ce,
+                cn,
                 json.dumps(lines),
                 total,
                 "placed",
+                slat,
+                slon,
+                slab,
             ),
         )
         conn.commit()
 
-    detail = json.dumps({"lines": lines, "total_cents": total})
+    detail = json.dumps(
+        {
+            "lines": lines,
+            "total_cents": total,
+            "ship_lat": slat,
+            "ship_lon": slon,
+            "ship_label": slab,
+        }
+    )
     # Cassandra timeline (requires session from caller — use cluster in app)
     payload = {
         "action": "order.placed",
         "order_ref": order_ref,
-        "customer": customer_email,
+        "customer": ce,
+        "customer_name": cn,
         "total_cents": total,
         "lines": lines,
+        "ship_lat": slat,
+        "ship_lon": slon,
+        "ship_label": slab,
     }
     sent = _producer_send(TOPIC_ORDERS, order_ref, payload)
     with httpx.Client(timeout=30.0) as hc:
@@ -422,10 +481,13 @@ def op_place_order(
         json.dumps(
             {
                 "order_ref": order_ref,
-                "customer_email": customer_email,
-                "customer_name": customer_name,
+                "customer_email": ce,
+                "customer_name": cn,
                 "total_cents": total,
                 "lines": lines,
+                "ship_lat": slat,
+                "ship_lon": slon,
+                "ship_label": slab,
             }
         ),
     )
@@ -438,7 +500,11 @@ def op_place_order(
     return {
         "ok": True,
         "order_ref": order_ref,
-        "customer_email": customer_email,
+        "customer_email": ce,
+        "customer_name": cn,
+        "ship_lat": slat,
+        "ship_lon": slon,
+        "ship_label": slab,
         "total_cents": total,
         "lines": lines,
         "kafka_sent": sent,

@@ -165,6 +165,9 @@ spec:
             - name: curl
               image: curlimages/curl:8.5.0
               imagePullPolicy: IfNotPresent
+              command: ["/bin/sh", "-c"]
               args:
-                - -sf
-                - http://hub-demo-ui:8888/docs
+                - |
+                  set -e
+                  curl -sf http://hub-demo-ui:8888/docs >/dev/null
+                  curl -sf http://hub-demo-ui:8888/api/scenario/faker-profile >/dev/null

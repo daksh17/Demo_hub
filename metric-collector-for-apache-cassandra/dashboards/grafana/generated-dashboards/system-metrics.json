@@ -4,7 +4,7 @@
    "annotations": {
       "list": [ ]
    },
-   "description": "Operating System Metrics and Apache Cassandra Node Information",
+   "description": "OS + collectd metrics from Cassandra MCAC (:9103). Host must be a Cassandra MCAC target (job=mcac), not OpenSearch/redis exporters.",
    "editable": false,
    "gnetId": null,
    "graphTooltip": 0,
@@ -3509,7 +3509,7 @@
             "multi": false,
             "name": "host",
             "options": [ ],
-            "query": "label_values(collectd_collectd_queue_length{}, instance)",
+            "query": "label_values(collectd_cpu_total{job=\"mcac\"}, instance)",
             "refresh": 2,
             "regex": "",
             "sort": 0,

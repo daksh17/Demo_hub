@@ -27,7 +27,11 @@ Topic-specific guides live in subfolders:
 
 ### Kubernetes (same stack on a cluster)
 
-The **`dashboards/demo/k8s/`** tree mirrors Compose: one **`kubectl apply -f k8s/generated/all.yaml`** brings up namespace **`demo-hub`**, then **`scripts/apply-data-bootstrap.sh`** runs the Postgres/Cassandra/Mongo Jobs. **What is different from “plain” demo YAML:** credentials live in a **Secret**; Cassandra uses **PersistentVolumeClaims**; **`96-kubernetes-ops.yaml`** adds **Ingress**, **PodDisruptionBudget**, **HPA**, **NetworkPolicy**, and a **CronJob**; the hub UI uses **headless Cassandra DNS** for CQL contact points. **From your laptop**, ClusterIP services are still reached via **`kubectl port-forward`** unless you install an **Ingress controller** and use the hosts in the Ingress manifest — see **[`k8s/README.md`](k8s/README.md)** (section *New / extended resources*) for a full before/after table and script defaults (**`stop-start-all-k8s.sh`** sets **`WITH_PORT_FORWARD=0`** by default).
+The **`dashboards/demo/k8s/`** tree mirrors Compose: **`k8s/scripts/demo-hub.sh start`** applies **`k8s/generated/all.yaml`** (namespace **`demo-hub`**) and runs **`k8s/scripts/apply-data-bootstrap.sh`** (Postgres / Cassandra / Mongo Jobs). **What is different from “plain” demo YAML:** credentials live in a **Secret**; Cassandra uses **PersistentVolumeClaims**; **`96-kubernetes-ops.yaml`** adds **Ingress**, **PodDisruptionBudget**, **HPA**, **NetworkPolicy**, and a **CronJob**; the hub UI uses **headless Cassandra DNS** for CQL contact points.
+
+**Step-by-step** (build local images → start pods → port-forward → optional NodePort / Connect registration): **[`k8s/README.md` — Quick start (step by step)](k8s/README.md#quick-start-step-by-step)**.
+
+**From your laptop**, ClusterIP services are reached via **`k8s/scripts/port-forward-demo-hub.sh`** (or Ingress if you install a controller). See **[`k8s/README.md`](k8s/README.md)** for **`LOCAL_*`** port overrides (**`LOCAL_CQL_PORT`** for Cassandra on localhost), Cassandra workarounds, and **`stop-start-all-k8s.sh`** defaults (**`WITH_PORT_FORWARD=0`**).
 
 ### Hub scenario indexes (Multi-DB reference)
 

@@ -7,9 +7,15 @@
 #   ./register-connectors.sh [kafka-connect-url]           # replace source + sink
 #   ./register-connectors.sh [url] jdbc-only               # refresh jdbc-sink-demo only (leave pg-source-demo running)
 #   JDBC_SINK_ONLY=1 ./register-connectors.sh [url]      # same as jdbc-only
+#
+# Kubernetes (demo-hub): broker PLAINTEXT is kafka:9092 only — set
+#   SCHEMA_HISTORY_KAFKA_BOOTSTRAP=kafka:9092
+# so Debezium schema history can reach Kafka (Compose defaults to kafka:29092).
 set -euo pipefail
 CONNECT="${1:-http://localhost:8083}"
 CONNECT="${CONNECT%/}"
+# Debezium schema.history.internal.kafka.bootstrap.servers (Compose: 29092, K8s demo-hub: 9092).
+SCHEMA_HISTORY_KAFKA_BOOTSTRAP="${SCHEMA_HISTORY_KAFKA_BOOTSTRAP:-kafka:29092}"
 if [[ "$CONNECT" == "jdbc-only" ]]; then
   CONNECT="http://127.0.0.1:8083"
   JDBC_SINK_ONLY=1
@@ -98,7 +104,7 @@ post_connector() {
 }
 
 if [[ "$JDBC_SINK_ONLY" != "1" ]]; then
-  post_connector "pg-source-demo" <<'JSON'
+  post_connector "pg-source-demo" <<JSON
 {
   "name": "pg-source-demo",
   "config": {
@@ -115,7 +121,7 @@ if [[ "$JDBC_SINK_ONLY" != "1" ]]; then
     "plugin.name": "pgoutput",
     "publication.name": "dbz_publication",
     "slot.name": "debezium_demopg",
-    "schema.history.internal.kafka.bootstrap.servers": "kafka:29092",
+    "schema.history.internal.kafka.bootstrap.servers": "${SCHEMA_HISTORY_KAFKA_BOOTSTRAP}",
     "schema.history.internal.kafka.topic": "demopg.schema-changes.internal",
     "key.converter": "org.apache.kafka.connect.json.JsonConverter",
     "value.converter": "org.apache.kafka.connect.json.JsonConverter",

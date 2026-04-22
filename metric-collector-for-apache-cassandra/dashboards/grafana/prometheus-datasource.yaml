@@ -1,5 +1,7 @@
 apiVersion: 1
 
+# Demo-hub: Prometheus (metrics) + OpenSearch (logs / index exploration in Grafana).
+# Compose/K8s: OpenSearch URL is the in-network service http://opensearch:9200 (security off).
 datasources:
   - name: prometheus
     uid: prometheus
@@ -8,3 +10,18 @@ datasources:
     access: proxy
     editable: true
     isDefault: true
+
+  - name: OpenSearch
+    uid: opensearch
+    type: grafana-opensearch-datasource
+    access: proxy
+    url: http://opensearch:9200
+    editable: true
+    isDefault: false
+    jsonData:
+      flavor: opensearch
+      version: "2.11.0"
+      timeField: "@timestamp"
+      # Index pattern for Explore / logs; use hub-* for hub-orders + hub-workload, or * for all
+      database: "*"
+      maxConcurrentShardRequests: 5
