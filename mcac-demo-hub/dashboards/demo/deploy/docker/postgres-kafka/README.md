@@ -30,13 +30,88 @@ Full per-index list: **[`../../README.md` → Hub scenario indexes](../../README
 
 ## Architecture
 
-- **PostgreSQL (Bitnami, `docker.io/bitnami/postgresql:latest` in compose):** one writable **primary** and two **read replicas** (physical streaming replication). Logical decoding (`wal_level=logical`) is enabled on the primary for Debezium. Bitnami often drops old revision pins; for production pin an image **digest** instead of `:latest`.
-- **`pg_stat_statements`:** Bitnami loads extensions via **`POSTGRESQL_SHARED_PRELOAD_LIBRARIES: pgaudit,pg_stat_statements`** (keep **`pgaudit`** — it is the image default). Tune **`pg_stat_statements.*`** via **`POSTGRESQL_EXTRA_FLAGS`**. On **first** primary init, **[`03-pg-stat-statements.sh`](03-pg-stat-statements.sh)** runs **`CREATE EXTENSION IF NOT EXISTS pg_stat_statements`** in database **`postgres`** only. If you see **`pg_stat_statements must be loaded via shared_preload_libraries`**, restart the container after pulling compose changes and run `SHOW shared_preload_libraries;` — it must include **`pg_stat_statements`**. **Existing volume:** env vars apply when the data dir is (re)initialized; otherwise set `shared_preload_libraries` to include both libraries in server config and **restart** (not reload), then **[`ensure-pg-stat-statements.sql`](ensure-pg-stat-statements.sql)** on **`postgres`**.
+- **PostgreSQL (Bitnami 16, custom image `mcac-demo/postgresql-repmgr:16.6.0`):** one writable **primary** and two **read replicas** (physical streaming replication). The image is built from **[`Dockerfile.repmgr`](Dockerfile.repmgr)** on top of **`docker.io/bitnamilegacy/postgresql:16.6.0-debian-12-r2`** (same pin as Kubernetes manifests). It adds the **[repmgr](https://repmgr.org/)** CLI and **`repmgr` PostgreSQL extension** while keeping Bitnami streaming replication for this demo. Logical decoding (`wal_level=logical`) is enabled on the primary for Debezium. For production, pin an image **digest** instead of a floating tag.
+- **`pg_stat_statements`:** Compose and Kubernetes set **`POSTGRESQL_SHARED_PRELOAD_LIBRARIES`** to **`repmgr,pgaudit,pg_stat_statements`** (repmgr first; keep **`pgaudit`** — Bitnami default). Tune **`pg_stat_statements.*`** via **`POSTGRESQL_EXTRA_FLAGS`**. On **first** primary init, **[`03-pg-stat-statements.sh`](03-pg-stat-statements.sh)** runs **`CREATE EXTENSION IF NOT EXISTS pg_stat_statements`** in database **`postgres`** only. If you see **`pg_stat_statements must be loaded via shared_preload_libraries`**, restart the container after pulling compose changes and run `SHOW shared_preload_libraries;` — it must include **`pg_stat_statements`**. **Existing volume:** env vars apply when the data dir is (re)initialized; otherwise set `shared_preload_libraries` to include **`repmgr`**, **`pgaudit`**, and **`pg_stat_statements`** in server config and **restart** (not reload), then **[`ensure-pg-stat-statements.sql`](ensure-pg-stat-statements.sql)** on **`postgres`**.
 - **Kafka:** single broker (Confluent 7.6.1) for demo simplicity; clients inside Docker use `kafka:29092`, clients on the host often use `localhost:9092`.
 - **Kafka Connect (Debezium 2.7):** REST API on **8083**.
   - **PostgreSQL → Kafka:** `PostgresConnector` captures changes from `public.demo_items` into topics prefixed with `demopg`.
   - **Kafka → PostgreSQL:** `JdbcSinkConnector` writes to table `demo_items_from_kafka` (avoids feeding the sink back into the same CDC table).
 - **Monitoring:** `postgres_exporter` (one per Postgres instance) and `danielqsj/kafka-exporter` expose metrics to **Prometheus**; **Grafana** loads a bundled dashboard that charts connections, throughput, DB size, replication lag, offsets, and consumer lag.
+
+## repmgr (custom image: CLI + extension)
+
+This demo ships **repmgr** so you can use the **client tools** and load the **`repmgr` extension** in PostgreSQL. **Failover orchestration** (`repmgrd`, `repmgr standby promote`, full cluster registration) is **not** wired end-to-end here—the stack still relies on **Bitnami’s streaming replication** (same as before). Use repmgr for **version checks**, **extension-backed metadata**, and as a **starting point** if you later add `repmgr.conf` and node registration.
+
+### What is in the image
+
+| Piece | Location / behavior |
+|--------|-------------------|
+| Dockerfile | **[`Dockerfile.repmgr`](Dockerfile.repmgr)** — compiles repmgr from source against the Bitnami-bundled `pg_config`, installs `repmgr` / `repmgrd` under **`/opt/bitnami/postgresql/bin`**, installs extension files under **`/opt/bitnami/postgresql/share/extension`**. |
+| Image tag | **`mcac-demo/postgresql-repmgr:16.6.0`** (Compose anchor **`x-postgresql-repmgr`** in **`docker-compose.yml`**; Kubernetes **`POSTGRESQL_IMAGE`** in **`deploy/k8s/scripts/gen_demo_hub_k8s.py`** / **`40-postgresql-ha.yaml`**). |
+| `PATH` + symlinks | **`/usr/local/bin/repmgr`** (and `repmgrd`) so minimal shells see the binaries. |
+| NSS / `getpwuid` | repmgr calls **`getpwuid(geteuid())`** on startup. Some runtimes (e.g. **OrbStack**, user namespaces) expose a **minimal `/etc/passwd`** without uid **1001** while the process still runs as **1001**. The image sets **`LD_PRELOAD`** to Bitnami’s **`libnss_wrapper.so`** and ships static **`/opt/bitnami/mcac-nss/passwd`** + **`group`** so lookups succeed. It also normalizes **`/etc/passwd`** / **`nsswitch.conf`** where applicable. |
+| Extension in the server | **`POSTGRESQL_SHARED_PRELOAD_LIBRARIES`** includes **`repmgr`** first, then Bitnami defaults (**`pgaudit`**, **`pg_stat_statements`**). |
+
+### Docker Compose
+
+- **Build / image:** `x-postgresql-repmgr` points **`build`** at this directory with **`Dockerfile.repmgr`** and **`image: mcac-demo/postgresql-repmgr:16.6.0`**.
+- **Primary only — first init:** **[`05-repmgr-extension.sh`](05-repmgr-extension.sh)** is mounted into **`docker-entrypoint-initdb.d`** on **`postgresql-primary`** only. It creates database **`repmgr`** and runs **`CREATE EXTENSION IF NOT EXISTS repmgr;`**.
+- **Replicas:** same image and **`shared_preload_libraries`**; they do **not** mount the init script (extension lives in the cluster via replication; avoid double-running DDL on replicas).
+
+Rebuild after changing the Dockerfile:
+
+```bash
+cd /path/to/dashboards/demo
+docker compose build postgresql-primary
+docker compose up -d --force-recreate postgresql-primary postgresql-replica-1 postgresql-replica-2
+```
+
+### Kubernetes (`demo-hub`)
+
+- Workloads use **`mcac-demo/postgresql-repmgr:16.6.0`** with an **initContainer** that fails fast if **`repmgr.control`** is missing from the image (see **`deploy/k8s/generated/40-postgresql-ha.yaml`**).
+- Bootstrap **`postgres-demo-bootstrap`** / ConfigMap SQL ensures **`repmgr`** database + **`CREATE EXTENSION repmgr`** (see **`45-postgres-bootstrap-job.yaml`**).
+- After rebuilding the image locally (OrbStack / Docker Desktop usually **share** the Docker image store with the cluster):
+
+  ```bash
+  ./deploy/k8s/scripts/rollout-postgresql-ha.sh
+  ```
+
+  Full stack lifecycle: **[`deploy/k8s/README.md`](../../k8s/README.md)** (`demo-hub.sh`, `apply-data-bootstrap.sh`).
+
+- **`imagePullPolicy: IfNotPresent`**: after **`docker build -t mcac-demo/postgresql-repmgr:16.6.0 ...`**, restart rollouts (or **`demo-hub.sh restart`**) so new pods pick up the updated tag **on the same node image store**.
+
+### Build the image (from `dashboards/demo`)
+
+```bash
+docker build --no-cache \
+  -f deploy/docker/postgres-kafka/Dockerfile.repmgr \
+  -t mcac-demo/postgresql-repmgr:16.6.0 \
+  deploy/docker/postgres-kafka
+```
+
+Or step **5/5** of **`./deploy/k8s/scripts/build-all-custom-images.sh`**.
+
+### Smoke tests (local Docker)
+
+```bash
+docker run --rm --entrypoint cat mcac-demo/postgresql-repmgr:16.6.0 /opt/bitnami/mcac-nss/passwd
+docker run --rm --entrypoint repmgr mcac-demo/postgresql-repmgr:16.6.0 --version
+```
+
+In Kubernetes (replace container name if yours differs):
+
+```bash
+kubectl exec -n demo-hub deploy/postgresql-primary -c postgresql-primary -- repmgr --version
+```
+
+### Troubleshooting
+
+| Symptom | Likely cause | What to do |
+|--------|----------------|------------|
+| **`could not get current user name: Success`** when running **`repmgr`** | **`getpwuid`** failed (minimal passwd / nss). | Use an image built from the current **`Dockerfile.repmgr`** (nss_wrapper + **`/opt/bitnami/mcac-nss`**). Do not rely on **`docker run --entrypoint repmgr`** on an image that never completed that Dockerfile. |
+| **`repmgr: not found`** | **`PATH`** without **`/opt/bitnami/postgresql/bin`**. | Use **`/usr/local/bin/repmgr`** or rebuild (symlinks in Dockerfile). |
+| **Docker build fails** with **`find: paths must precede expression: 'else'`** | Broken **`find -exec … \;`** across Dockerfile line continuations. | Fixed in **`Dockerfile.repmgr`** by using a **`for`** loop instead of **`find -exec`**. |
+| **Kubernetes initContainer errors** on **`repmgr.control`** | Custom image not deployed or wrong tag. | Rebuild **`mcac-demo/postgresql-repmgr:16.6.0`**, rollout Postgres HA deployments. |
 
 ### Physical replication slots (HA standbys, not Debezium)
 
@@ -306,6 +381,8 @@ Adjust volume names if your Compose project name is not `demo-hub` (`docker volu
 
 | File | Role |
 |------|------|
+| `Dockerfile.repmgr` | **Bitnami PostgreSQL 16.6.0 + repmgr** CLI/extension build; nss_wrapper passwd files under **`/opt/bitnami/mcac-nss`**. |
+| `05-repmgr-extension.sh` | **Primary first init only:** `CREATE DATABASE repmgr` + **`CREATE EXTENSION repmgr`** (Compose `docker-entrypoint-initdb.d`). |
 | `01-init-debezium.sql` | Creates `demo_items`, `replicator` grants, publication `dbz_publication`, and **10 seed rows** on first primary boot. |
 | `ensure-debezium-cdc.sql` | Grants + publication for existing volumes (see `apply-ensure-debezium.sh`). |
 | `apply-ensure-debezium.sh` | Applies `ensure-debezium-cdc.sql` as `demo` (fixes old DBs missing publication/`replicator` **SELECT**). |
