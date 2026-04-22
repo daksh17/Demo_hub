@@ -18,7 +18,7 @@ local graphSpan = 6;
 
 dashboard.new(
   'System & Node Metrics',
-  description='Operating System Metrics and Apache Cassandra Node Information',
+  description='OS + collectd metrics from Cassandra MCAC (:9103). Pick Host from the mcac scrape job only — not OpenSearch/redis/postgres exporters.',
   schemaVersion=14,
   time_from='now-30m',
   refresh='1m',
@@ -45,7 +45,7 @@ dashboard.new(
   template.new(
     'host',
     '$PROMETHEUS_DS',
-    'label_values(collectd_collectd_queue_length{}, instance)',
+    'label_values(collectd_cpu_total{job="mcac"}, instance)',
     label='Host',
     refresh='time',
   )

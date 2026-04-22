@@ -1,0 +1,25 @@
+# Grafana provisioning: native OpenSearch datasource (Explore, index patterns, logs).
+# Demo-hub: this block is already merged into prometheus-datasource.yaml for a single mount.
+# Use this file alone if you provision /etc/grafana/provisioning/datasources/ from multiple files.
+#
+# Local port-forward: set url to http://127.0.0.1:9200 (or your tunnel).
+# TLS + auth: add jsonData.tlsSkipVerify / secureJsonData.basicAuthPassword per Grafana docs.
+#
+# Ref: https://grafana.com/docs/grafana/latest/datasources/opensearch/
+
+apiVersion: 1
+
+datasources:
+  - name: OpenSearch
+    uid: opensearch
+    type: grafana-opensearch-datasource
+    access: proxy
+    url: http://opensearch:9200
+    editable: true
+    isDefault: false
+    jsonData:
+      flavor: opensearch
+      version: "2.11.0"
+      timeField: "@timestamp"
+      database: "*"
+      maxConcurrentShardRequests: 5

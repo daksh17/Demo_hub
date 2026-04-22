@@ -3,11 +3,17 @@
 # Full wipe + sink tables + re-register: ../reset-kafka-connect-demo.sh [url]
 # Usage (host): ./register-all.sh           → http://localhost:8083 (Compose publishes 8083)
 #            ./register-all.sh http://kafka-connect:8083  → only from inside the demo Docker network
+# Kubernetes demo-hub: port-forward Connect REST, then e.g.
+#   DEMO_HUB_K8S=1 ./register-all.sh http://127.0.0.1:8083
+# (sets SCHEMA_HISTORY_KAFKA_BOOTSTRAP=kafka:9092 for Debezium; override if needed.)
 # Compose one-shot passes the kafka-connect URL explicitly as $1.
 set -euo pipefail
 
 CONNECT="${1:-${KAFKA_CONNECT_URL:-http://127.0.0.1:8083}}"
 CONNECT="${CONNECT%/}"
+if [[ "${DEMO_HUB_K8S:-}" == "1" ]]; then
+  export SCHEMA_HISTORY_KAFKA_BOOTSTRAP="${SCHEMA_HISTORY_KAFKA_BOOTSTRAP:-kafka:9092}"
+fi
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEMO="$(cd "${HERE}/.." && pwd)"
 

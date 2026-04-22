@@ -12,10 +12,10 @@ from typing import Literal
 import httpx
 import psycopg
 import redis
-from cassandra.cluster import Cluster
+from cassandra.cluster import Cluster, UnresolvableContactPoints
 from cassandra.query import BatchStatement, ConsistencyLevel
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pymongo import MongoClient
 
@@ -42,16 +42,22 @@ PG_DSN = os.environ.get(
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb://mongo-mongos1:27017")
 REDIS_URL = os.environ.get("REDIS_URL", "redis://:demoredispass@redis:6379/0")
 def _cassandra_contact_points() -> list[str]:
-    return [
-        h.strip()
-        for h in os.environ.get("CASSANDRA_HOSTS", "cassandra").split(",")
-        if h.strip()
-    ]
+    # If CASSANDRA_HOSTS is set to "" in the environment, get() still returns "" — treat as unset.
+    raw = os.environ.get("CASSANDRA_HOSTS", "cassandra")
+    if not (raw or "").strip():
+        raw = "cassandra"
+    return [h.strip() for h in raw.split(",") if h.strip()]
 
 
 def _connect_cassandra_cluster():
     """Create Cluster + Session; retry while the ring is still opening CQL (common on K8s)."""
     hosts = _cassandra_contact_points()
+    if not hosts:
+        raise ValueError(
+            "CASSANDRA_HOSTS has no hostnames after parsing. "
+            "Example local: export CASSANDRA_HOSTS=127.0.0.1 "
+            "(with kubectl port-forward to Cassandra :9042)."
+        )
     max_attempts = int(os.environ.get("CASSANDRA_CONNECT_MAX_ATTEMPTS", "45"))
     delay_sec = float(os.environ.get("CASSANDRA_CONNECT_RETRY_DELAY_SEC", "2"))
     last_err: Exception | None = None
@@ -59,6 +65,18 @@ def _connect_cassandra_cluster():
         cluster = Cluster(hosts, connect_timeout=15)
         try:
             return cluster, cluster.connect()
+        except UnresolvableContactPoints as e:
+            last_err = e
+            try:
+                cluster.shutdown()
+            except Exception:
+                pass
+            raise RuntimeError(
+                "Cassandra contact points could not be resolved (DNS). "
+                f"hosts={hosts!r}. On the host (uvicorn), use a resolvable address, e.g. "
+                "CASSANDRA_HOSTS=127.0.0.1 after port-forwarding CQL 9042; "
+                "inside Compose/K8s, use service DNS like cassandra."
+            ) from e
         except Exception as e:
             last_err = e
             try:
@@ -92,6 +110,14 @@ OPENSEARCH_BULK_MAX_BYTES = int(
 # Debezium Postgres snapshot loads full TEXT per row into heap; multi‑MiB names OOM Connect (default ~2–4G).
 POSTGRES_WORKLOAD_NAME_MAX_CHARS = int(
     os.environ.get("POSTGRES_WORKLOAD_NAME_MAX_CHARS", str(16 * 1024))
+)
+# Read-back page: max rows per store per /api/workload/read request (Cassandra IN, Redis MGET, OS size, etc.).
+WORKLOAD_READ_SAMPLE_LIMIT_MAX = max(
+    1, int(os.environ.get("WORKLOAD_READ_SAMPLE_LIMIT_MAX", "500"))
+)
+# Read-back UI: max parallel browser→API requests (each request hits all selected targets).
+WORKLOAD_READ_PARALLEL_MAX = max(
+    1, min(64, int(os.environ.get("WORKLOAD_READ_PARALLEL_MAX", "32")))
 )
 
 _cassandra_session = None
@@ -462,11 +488,24 @@ READS_PAGE = f"""<!DOCTYPE html>
   {NAV}
   <h1>Read workload data (Redis + others)</h1>
   <p>Poll the same stores the workload uses. <strong>Redis</strong> reads keys <code>hub:wl:&lt;run_id&gt;:0 .. n-1</code>.
-    Paste the <code>run_id</code> from a workload response (the page saves the last one in the browser).</p>
-  <label>run_id</label>
-  <input type="text" id="run_id" placeholder="e.g. a1b2c3d4" autocomplete="off"/>
-  <label>Rows per store (1–50)</label>
-  <input type="number" id="limit" value="10" min="1" max="50"/>
+    Paste the <code>run_id</code> from a workload response (the page saves the last one in the browser), or generate a random id.
+    Cap per store is <code>{WORKLOAD_READ_SAMPLE_LIMIT_MAX}</code> (raise with env <code>WORKLOAD_READ_SAMPLE_LIMIT_MAX</code> on hub-demo-ui).</p>
+  <div class="row">
+    <div style="flex:1;min-width:12rem">
+      <label>run_id</label>
+      <input type="text" id="run_id" placeholder="e.g. a1b2c3d4" autocomplete="off"/>
+    </div>
+    <div style="align-self:flex-end">
+      <button type="button" class="secondary" id="rand_rid" title="8 hex chars, same shape as workload run_id">Random run_id</button>
+    </div>
+  </div>
+  <label>Rows per store (1–{WORKLOAD_READ_SAMPLE_LIMIT_MAX})</label>
+  <input type="number" id="limit" value="10" min="1" max="{WORKLOAD_READ_SAMPLE_LIMIT_MAX}"/>
+  <label>Parallel API requests (1–{WORKLOAD_READ_PARALLEL_MAX}) — simulates N clients reading at once</label>
+  <input type="number" id="parallel" value="1" min="1" max="{WORKLOAD_READ_PARALLEL_MAX}"/>
+  <div class="row" style="margin-top:0.5rem">
+    <label><input type="checkbox" id="random_per_req"/> Random <code>run_id</code> per request (ignores field; use with parallel to fan out random keys)</label>
+  </div>
   <fieldset>
     <legend>Targets</legend>
     <div class="row">
@@ -499,6 +538,13 @@ READS_PAGE = f"""<!DOCTYPE html>
     To ship <em>application / Docker logs</em> into OpenSearch you would add a log collector (e.g. Fluent Bit) — this demo only indexes JSON docs from the hub UI.
   </div>
   <script>
+    const SAMPLE_CAP = {WORKLOAD_READ_SAMPLE_LIMIT_MAX};
+    const PARALLEL_CAP = {WORKLOAD_READ_PARALLEL_MAX};
+    function randomRunId() {{
+      const a = new Uint8Array(4);
+      crypto.getRandomValues(a);
+      return [...a].map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 8);
+    }}
     const out = document.getElementById("out");
     const st = document.getElementById("st");
     const tick = document.getElementById("tick");
@@ -508,31 +554,74 @@ READS_PAGE = f"""<!DOCTYPE html>
       const x = localStorage.getItem("hub_last_run_id");
       if (x) document.getElementById("run_id").value = x;
     }} catch (e) {{}}
+    document.getElementById("rand_rid").addEventListener("click", () => {{
+      document.getElementById("run_id").value = randomRunId();
+    }});
     async function doRead() {{
-      const run_id = document.getElementById("run_id").value.trim();
-      if (!run_id) {{
-        st.textContent = "Set run_id first.";
+      const randomPer = document.getElementById("random_per_req").checked;
+      const runField = document.getElementById("run_id").value.trim();
+      if (!randomPer && !runField) {{
+        st.textContent = "Set run_id or enable Random run_id per request.";
         st.className = "err";
         return;
       }}
-      const limit = Number(document.getElementById("limit").value);
+      let limit = Number(document.getElementById("limit").value);
+      if (!Number.isFinite(limit)) limit = 10;
+      limit = Math.min(SAMPLE_CAP, Math.max(1, limit));
       const targets = [...document.querySelectorAll(".tg:checked")].map((x) => x.value);
       if (!targets.length) {{
         st.textContent = "Pick at least one target.";
         st.className = "err";
         return;
       }}
-      const r = await fetch("/api/workload/read", {{
-        method: "POST",
-        headers: {{ "Content-Type": "application/json" }},
-        body: JSON.stringify({{ run_id, sample_limit: limit, targets }}),
-      }});
-      const data = await r.json();
+      let parallel = Number(document.getElementById("parallel").value);
+      if (!Number.isFinite(parallel)) parallel = 1;
+      parallel = Math.min(PARALLEL_CAP, Math.max(1, parallel));
+
+      const bodies = [];
+      for (let i = 0; i < parallel; i++) {{
+        const run_id = randomPer ? randomRunId() : runField;
+        bodies.push({{ run_id, sample_limit: limit, targets }});
+      }}
+
+      const started = performance.now();
+      const results = await Promise.all(
+        bodies.map((body) =>
+          fetch("/api/workload/read", {{
+            method: "POST",
+            headers: {{ "Content-Type": "application/json" }},
+            body: JSON.stringify(body),
+          }}).then(async (r) => ({{
+            http_ok: r.ok,
+            status: r.status,
+            data: await r.json(),
+          }}))
+        )
+      );
+      const ms = Math.round(performance.now() - started);
+
       nread += 1;
-      tick.textContent = "reads: " + nread + " · " + new Date().toISOString();
-      out.textContent = JSON.stringify(data, null, 2);
-      st.textContent = r.ok && data.ok ? "OK" : "Some reads failed — see errors in JSON.";
-      st.className = r.ok && data.ok ? "ok" : "err";
+      tick.textContent = "batches: " + nread + " · parallel=" + parallel + " · " + ms + "ms · " + new Date().toISOString();
+
+      const allApiOk = results.every((x) => x.http_ok && x.data && x.data.ok);
+      const payload = {{
+        parallel,
+        random_run_id_per_request: randomPer,
+        sample_limit: limit,
+        wall_ms: ms,
+        results: results.map((r, i) => ({{
+          index: i,
+          run_id: bodies[i].run_id,
+          http_ok: r.http_ok,
+          status: r.status,
+          response: r.data,
+        }})),
+      }};
+      out.textContent = JSON.stringify(payload, null, 2);
+      st.textContent = allApiOk
+        ? "OK (" + parallel + " request(s), " + ms + " ms wall)"
+        : "Some requests failed — see results[].http_ok / response.errors.";
+      st.className = allApiOk ? "ok" : "err";
     }}
     document.getElementById("read").addEventListener("click", () => doRead());
     document.getElementById("toggle").addEventListener("click", () => {{
@@ -564,6 +653,7 @@ _SCENARIO_PAGE_TEMPLATE = """<!DOCTYPE html>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>Multi-DB scenario — hub demo</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
   <style>
     :root { font-family: ui-sans-serif, system-ui, sans-serif; background: #0f1419; color: #e7e9ea; }
     body { margin: 0; padding: 1rem 1.25rem 2rem; line-height: 1.55; }
@@ -605,6 +695,7 @@ _SCENARIO_PAGE_TEMPLATE = """<!DOCTYPE html>
       background: #1d9bf0; color: #fff; border: 0; border-radius: 9999px;
       padding: 0.5rem 1.1rem; font-size: 0.95rem; font-weight: 600; cursor: pointer; margin: 0.35rem 0.35rem 0 0;
     }
+    button.secondary { background: #38444d; }
     button:disabled { opacity: 0.5; cursor: not-allowed; }
     pre {
       background: #16181c; border: 1px solid #2f3336; border-radius: 8px;
@@ -632,6 +723,25 @@ _SCENARIO_PAGE_TEMPLATE = """<!DOCTYPE html>
     .line-flow .sub { font-size: 9px; fill: #71767b; }
     .line-flow .fan { stroke: #4a5f78; stroke-width: 1.2; fill: none; }
     .flow-svg .fan { stroke: #4a5f78; stroke-width: 1.2; fill: none; }
+    .order-step3 {
+      background: #16181c;
+      border: 1px solid #38444d;
+      border-radius: 10px;
+      padding: 1rem 1rem 1.25rem;
+      margin: 1rem 0 1.25rem;
+    }
+    .order-step3 label { display: block; margin: 0.65rem 0 0.2rem; font-size: 0.88rem; color: #8899a6; }
+    .order-step3 input[type="text"], .order-step3 input[type="email"], .order-step3 input[type="number"] {
+      width: 100%; max-width: 28rem; padding: 0.45rem; border-radius: 6px;
+      border: 1px solid #38444d; background: #16181c; color: #e7e9ea; box-sizing: border-box;
+    }
+    .order-step3 select {
+      max-width: 28rem; width: 100%; padding: 0.45rem; border-radius: 6px;
+      border: 1px solid #38444d; background: #16181c; color: #e7e9ea;
+    }
+    #scenario-map { height: 260px; border-radius: 10px; border: 1px solid #38444d; margin: 0.75rem 0 0.25rem; }
+    .order-latlon { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: flex-end; margin-top: 0.5rem; }
+    .order-latlon > div { flex: 1; min-width: 8rem; max-width: 12rem; }
   </style>
 </head>
 <body>
@@ -685,8 +795,8 @@ _SCENARIO_PAGE_TEMPLATE = """<!DOCTYPE html>
         <p class="hint">Runs <code>op_pipeline_mongo_to_postgres_and_kafka</code>: reads up to 80 products from Mongo, <strong>UPSERTs</strong> into Postgres <code>scenario_catalog_mirror</code>. For each row it sends a message to Kafka topic <code>scenario.catalog.changes</code> (if the broker is reachable) and <strong>indexes the same payload</strong> into OpenSearch <code>hub-scenario-pipeline</code> with direction <code>mongo→kafka+os</code>. Pushes a short entry onto Redis list <code>scenario:kafka:recent</code> and refreshes <code>scenario:dashboard:summary</code> (counts from Postgres + Mongo).</p>
       </details>
       <details class="behind">
-        <summary>3 · Place random order</summary>
-        <p class="hint">Runs <code>op_place_order</code>: loads SKUs from Mongo, loads prices from <code>scenario_catalog_mirror</code> when possible (otherwise random cents). Inserts one row into <code>scenario_orders</code> with JSON <code>lines</code>, customer fields, <code>order_ref</code>. Produces <code>scenario.orders.events</code> on Kafka, mirrors to OpenSearch, writes <code>ORDER_PLACED</code> to Cassandra <code>scenario_timeline</code>, sets Redis key <code>scenario:order:latest:&lt;order_ref&gt;</code> (1h TTL), updates recent list + dashboard summary.</p>
+        <summary>3 · Place order (Faker + map)</summary>
+        <p class="hint"><strong>Form</strong> → <code>POST /api/scenario/order/custom</code>: same as <code>op_place_order</code> but with your <strong>customer name, email</strong>, and <strong>ship_lat / ship_lon / ship_label</strong> (preset city, map click, or Faker). <strong>Quick random</strong> → <code>POST /api/scenario/order</code> (fully server-side Faker for customer + lines). Both paths insert <code>scenario_orders</code>, emit Kafka, OpenSearch, Redis, Cassandra timeline.</p>
       </details>
       <details class="behind">
         <summary>4 · Fulfillment rows + Kafka + OS + Cassandra</summary>
@@ -698,11 +808,53 @@ _SCENARIO_PAGE_TEMPLATE = """<!DOCTYPE html>
       <div>
         <button type="button" id="b_seed">1 · Seed Mongo catalog (Faker)</button>
         <button type="button" id="b_sync">2 · Sync catalog → Postgres + Kafka + OpenSearch</button>
-        <button type="button" id="b_order">3 · Place random order</button>
+      </div>
+
+      <h2>3 · Place order</h2>
+      <p class="hint">Fill customer + shipping (Faker button, preset city, or map). Submits to <code>scenario_orders</code> with <code>ship_lat</code> / <code>ship_lon</code> / <code>ship_label</code>. Or use <strong>Quick random</strong> for an all-server-side demo row.</p>
+      <div class="order-step3">
+        <button type="button" class="secondary" id="btn_faker_scenario">Fill form with Faker (server)</button>
+        <form id="order_form">
+          <label>Customer name</label>
+          <input type="text" name="customer_name" id="customer_name" required autocomplete="name"/>
+          <label>Email</label>
+          <input type="email" name="customer_email" id="customer_email" required autocomplete="email"/>
+          <label>Preset location</label>
+          <select id="loc_preset">
+            <option value="">Custom — use map / Faker only</option>
+            <option value="60.1699,24.9384,Helsinki, Finland">Helsinki, Finland</option>
+            <option value="59.4370,24.7536,Tallinn, Estonia">Tallinn, Estonia</option>
+            <option value="51.5074,-0.1278,London, UK">London, UK</option>
+            <option value="52.5200,13.4050,Berlin, Germany">Berlin, Germany</option>
+            <option value="48.8566,2.3522,Paris, France">Paris, France</option>
+            <option value="40.7128,-74.0060,New York, USA">New York, USA</option>
+            <option value="37.7749,-122.4194,San Francisco, USA">San Francisco, USA</option>
+            <option value="19.0760,72.8777,Mumbai, India">Mumbai, India</option>
+            <option value="35.6762,139.6503,Tokyo, Japan">Tokyo, Japan</option>
+          </select>
+          <label>Location label (optional)</label>
+          <input type="text" name="ship_label" id="ship_label" placeholder="e.g. pinned address" maxlength="500"/>
+          <p class="hint" style="margin:0.5rem 0 0">Map: click or drag marker. Coordinates are stored on the order.</p>
+          <div id="scenario-map"></div>
+          <div class="order-latlon">
+            <div><label>Latitude</label><input type="text" name="ship_lat" id="ship_lat" required readonly style="opacity:0.95"/></div>
+            <div><label>Longitude</label><input type="text" name="ship_lon" id="ship_lon" required readonly style="opacity:0.95"/></div>
+          </div>
+          <label>Line items (SKUs from Mongo catalog)</label>
+          <input type="number" name="lines_count" id="lines_count" value="3" min="1" max="10"/>
+          <div style="margin-top:1rem">
+            <button type="submit" id="btn_submit_order">Place order with this profile</button>
+          </div>
+        </form>
+        <p class="hint" style="margin:0.75rem 0 0">No form — one click, random customer + lines entirely on the server:</p>
+        <button type="button" class="secondary" id="b_order_quick">Quick random order (server-side)</button>
+      </div>
+
+      <div>
         <button type="button" id="b_fulfill">4 · Fulfillment rows + Kafka + OS + Cassandra</button>
       </div>
       <p id="st"></p>
-      <pre id="out">Click a step to see JSON.</pre>
+      <pre id="out">Click a step or submit the order form to see JSON.</pre>
       <h2>View data per store</h2>
       <div class="grid">
         <a href="/scenario/data/postgres">Postgres</a>
@@ -750,6 +902,7 @@ _SCENARIO_PAGE_TEMPLATE = """<!DOCTYPE html>
       </svg>
     </aside>
   </div>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
   <script>
     async function call(path, st, out) {
       st.textContent = "…";
@@ -770,8 +923,100 @@ _SCENARIO_PAGE_TEMPLATE = """<!DOCTYPE html>
     const out = document.getElementById("out");
     document.getElementById("b_seed").onclick = () => call("/api/scenario/seed?count=12", st, out);
     document.getElementById("b_sync").onclick = () => call("/api/scenario/pipeline/mongo-sync", st, out);
-    document.getElementById("b_order").onclick = () => call("/api/scenario/order", st, out);
+    document.getElementById("b_order_quick").onclick = () => call("/api/scenario/order", st, out);
     document.getElementById("b_fulfill").onclick = () => call("/api/scenario/pipeline/fulfill", st, out);
+
+    const latEl = document.getElementById("ship_lat");
+    const lonEl = document.getElementById("ship_lon");
+    const scenMap = L.map("scenario-map").setView([60.1699, 24.9384], 11);
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 19,
+      attribution: "&copy; OpenStreetMap",
+    }).addTo(scenMap);
+    let scenMarker = L.marker([60.1699, 24.9384], { draggable: true }).addTo(scenMap);
+    function setShipPos(lat, lng) {
+      latEl.value = lat.toFixed(6);
+      lonEl.value = lng.toFixed(6);
+      scenMarker.setLatLng([lat, lng]);
+    }
+    setShipPos(60.1699, 24.9384);
+    scenMap.on("click", (e) => {
+      document.getElementById("loc_preset").value = "";
+      setShipPos(e.latlng.lat, e.latlng.lng);
+    });
+    scenMarker.on("dragend", (e) => {
+      document.getElementById("loc_preset").value = "";
+      const p = e.target.getLatLng();
+      setShipPos(p.lat, p.lng);
+    });
+    document.getElementById("loc_preset").addEventListener("change", (ev) => {
+      const v = ev.target.value;
+      if (!v) return;
+      const parts = v.split(",");
+      if (parts.length < 4) return;
+      const lat = Number(parts[0]);
+      const lon = Number(parts[1]);
+      const ship = parts.slice(2).join(",");
+      if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+      document.getElementById("ship_label").value = ship;
+      setShipPos(lat, lon);
+      scenMap.setView([lat, lon], 8);
+    });
+    document.getElementById("btn_faker_scenario").addEventListener("click", async () => {
+      st.textContent = "Loading…";
+      st.className = "";
+      try {
+        const r = await fetch("/api/scenario/faker-profile");
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.detail || JSON.stringify(d));
+        document.getElementById("loc_preset").value = "";
+        document.getElementById("customer_name").value = d.customer_name || "";
+        document.getElementById("customer_email").value = d.customer_email || "";
+        document.getElementById("ship_label").value = d.ship_label || "";
+        if (typeof d.ship_lat === "number" && typeof d.ship_lon === "number") {
+          setShipPos(d.ship_lat, d.ship_lon);
+          scenMap.setView([d.ship_lat, d.ship_lon], 6);
+        }
+        st.textContent = "Form filled.";
+        st.className = "ok";
+      } catch (e) {
+        st.textContent = String(e);
+        st.className = "err";
+      }
+    });
+    document.getElementById("order_form").addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const btn = document.getElementById("btn_submit_order");
+      btn.disabled = true;
+      st.textContent = "Placing order…";
+      st.className = "";
+      out.textContent = "";
+      const body = {
+        customer_name: document.getElementById("customer_name").value.trim(),
+        customer_email: document.getElementById("customer_email").value.trim(),
+        ship_label: document.getElementById("ship_label").value.trim() || null,
+        ship_lat: Number(latEl.value),
+        ship_lon: Number(lonEl.value),
+        lines_count: Number(document.getElementById("lines_count").value),
+      };
+      try {
+        const r = await fetch("/api/scenario/order/custom", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        const data = await r.json();
+        out.textContent = JSON.stringify(data, null, 2);
+        st.textContent = r.ok && data.ok ? "OK — see scenario_orders + other stores." : "See JSON.";
+        st.className = r.ok && data.ok ? "ok" : "err";
+      } catch (e) {
+        st.textContent = String(e);
+        st.className = "err";
+      } finally {
+        btn.disabled = false;
+      }
+    });
+    setTimeout(() => { scenMap.invalidateSize(); }, 100);
   </script>
 </body>
 </html>
@@ -1051,7 +1296,7 @@ def _execute_workload_wave(
 
 class WorkloadReadRequest(BaseModel):
     run_id: str = Field(..., min_length=1, max_length=32)
-    sample_limit: int = Field(10, ge=1, le=50)
+    sample_limit: int = Field(10, ge=1, le=WORKLOAD_READ_SAMPLE_LIMIT_MAX)
     targets: list[str] = Field(
         default_factory=lambda: ["postgres", "mongo", "redis", "cassandra", "opensearch"]
     )
@@ -1223,6 +1468,39 @@ async def scenario_page():
     return HTMLResponse(SCENARIO_PAGE)
 
 
+@app.get("/faker-order")
+async def faker_order_redirect():
+    """Old path: Faker + map order UI now lives under /scenario (step 3)."""
+    return RedirectResponse(url="/scenario", status_code=307)
+
+
+@app.get("/api/scenario/faker-profile")
+async def api_scenario_faker_profile():
+    return scenario.build_faker_customer_bundle()
+
+
+class ScenarioCustomOrderRequest(BaseModel):
+    customer_name: str = Field(..., min_length=1, max_length=200)
+    customer_email: str = Field(..., min_length=3, max_length=320)
+    ship_lat: float = Field(..., ge=-90, le=90)
+    ship_lon: float = Field(..., ge=-180, le=180)
+    ship_label: str | None = Field(None, max_length=500)
+    lines_count: int = Field(3, ge=1, le=10)
+
+
+@app.post("/api/scenario/order/custom")
+async def api_scenario_order_custom(req: ScenarioCustomOrderRequest):
+    return scenario.op_place_order(
+        req.lines_count,
+        cassandra_session=_cassandra_session,
+        customer_email=req.customer_email,
+        customer_name=req.customer_name,
+        ship_lat=req.ship_lat,
+        ship_lon=req.ship_lon,
+        ship_label=req.ship_label,
+    )
+
+
 @app.get("/scenario/data/{store}", response_class=HTMLResponse)
 async def scenario_data_page(store: str):
     _ = store  # rendered client-side from path
@@ -1231,7 +1509,10 @@ async def scenario_data_page(store: str):
 
 @app.post("/api/scenario/seed")
 async def api_scenario_seed(count: int = 12):
-    return scenario.op_seed_catalog(min(max(count, 1), 50))
+    out = scenario.op_seed_catalog(min(max(count, 1), 50))
+    if not out.get("ok", True):
+        raise HTTPException(503, detail=out)
+    return out
 
 
 @app.post("/api/scenario/pipeline/mongo-sync")

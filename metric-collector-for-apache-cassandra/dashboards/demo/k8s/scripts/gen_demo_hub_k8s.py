@@ -252,12 +252,17 @@ def _kafka_wait_broker() -> str:
 def _hub_wait_upstream() -> str:
     # Must match app.py lifespan(): Cluster(cassandra), psycopg, httpx→OpenSearch. Without these,
     # uvicorn exits immediately → CrashLoopBackOff (init used to wait only kafka+opensearch).
+    #
+    # MongoDB mongos is intentionally NOT gated here: on some CNIs / dual-stack clusters, TCP
+    # probes to mongo-mongos1:27017 from init stay flaky while mongosh from the host works.
+    # lifespan() does not open Mongo; scenario routes need mongos — fix the mongo stack if those fail.
     kh = fqdn_service("kafka")
     oh = fqdn_service("opensearch")
     pg = fqdn_service("postgresql-primary")
-    cs = fqdn_service("cassandra")
+    # CQL: probe cassandra-0 via headless (same stable target as port-forward / driver contact points).
+    # The ClusterIP Service name "cassandra" can lag or not match nc expectations on some CNIs.
+    cs0 = f"cassandra-0.cassandra-headless.{NS}.svc.cluster.local"
     rd = fqdn_service("redis")
-    mg = fqdn_service("mongo-mongos1")
     return f"""      initContainers:
         - name: wait-hub-deps
           image: alpine:3.19
@@ -266,19 +271,23 @@ def _hub_wait_upstream() -> str:
             - -c
             - |
               apk add --no-cache netcat-openbsd >/dev/null
+              p() {{ nc -z -w 3 "$1" "$2" 2>/dev/null && echo OK || echo FAIL; }}
               for i in $(seq 1 200); do
-                if nc -z -w 2 {kh} 9092 2>/dev/null \\
-                  && nc -z -w 2 {oh} 9200 2>/dev/null \\
-                  && nc -z -w 2 {pg} 5432 2>/dev/null \\
-                  && nc -z -w 2 {cs} 9042 2>/dev/null \\
-                  && nc -z -w 2 {rd} 6379 2>/dev/null \\
-                  && nc -z -w 2 {mg} 27017 2>/dev/null; then
+                if nc -z -w 3 {kh} 9092 2>/dev/null \\
+                  && nc -z -w 3 {oh} 9200 2>/dev/null \\
+                  && nc -z -w 3 {pg} 5432 2>/dev/null \\
+                  && nc -z -w 3 {cs0} 9042 2>/dev/null \\
+                  && nc -z -w 3 {rd} 6379 2>/dev/null; then
+                  echo "wait-hub-deps: all upstream TCP checks OK (attempt $i)" >&2
                   exit 0
+                fi
+                if [ $((i % 15)) -eq 0 ]; then
+                  echo "wait-hub-deps: attempt $i/200 — kafka:9092=$(p {kh} 9092) opensearch:9200=$(p {oh} 9200) postgres:5432=$(p {pg} 5432) cassandra-0:9042=$(p {cs0} 9042) redis:6379=$(p {rd} 6379) (mongos not gated)" >&2
                 fi
                 sleep 2
               done
               echo "timeout waiting for kafka:9092, opensearch:9200, postgresql-primary:5432," >&2
-              echo "  cassandra:9042, redis:6379, mongo-mongos1:27017" >&2
+              echo "  cassandra-0:9042 (headless), redis:6379" >&2
               exit 1
 """
 
@@ -566,9 +575,12 @@ spec:
             - name: curl
               image: curlimages/curl:8.5.0
               imagePullPolicy: IfNotPresent
+              command: ["/bin/sh", "-c"]
               args:
-                - -sf
-                - http://hub-demo-ui:8888/docs
+                - |
+                  set -e
+                  curl -sf http://hub-demo-ui:8888/docs >/dev/null
+                  curl -sf http://hub-demo-ui:8888/api/scenario/faker-profile >/dev/null
 """
     return join_docs(np, ing, pdb_c, pdb_pg, pdb_hub, hpa, cron)
 

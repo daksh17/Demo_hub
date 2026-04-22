@@ -6,6 +6,136 @@ If you are new to Kubernetes, read **[Kubernetes basics (for this demo)](#kubern
 
 ---
 
+## Quick start (step by step)
+
+All paths below are relative to **`dashboards/demo`** (this repo: `metric-collector-for-apache-cassandra/dashboards/demo`). Namespace is **`demo-hub`** unless you set **`NS`**.
+
+### 1. Build images on your machine (required before first apply)
+
+The cluster **cannot pull** these names from Docker Hub. Build them with Docker (same engine your local Kubernetes uses — OrbStack / Docker Desktop usually share the image store; **kind** / **minikube** need an extra **`kind load docker-image …`** step).
+
+| Image | Role | How it is built |
+|-------|------|-----------------|
+| **`mcac-demo/mcac-init:local`** | Cassandra **initContainer** copies the MCAC agent into the ring pods (`imagePullPolicy: Never`) | [`k8s/scripts/build-mcac-init-image.sh`](scripts/build-mcac-init-image.sh) |
+| **`mcac-demo/hub-demo-ui:latest`** | Hub FastAPI UI | `docker build -t mcac-demo/hub-demo-ui:latest -f realtime-orders-search-hub/demo-ui/Dockerfile realtime-orders-search-hub/demo-ui` |
+| **`mcac-demo/kafka-connect:2.7.3-mongo-sink`** | Kafka Connect (Debezium + Mongo sink) | `docker build -t mcac-demo/kafka-connect:2.7.3-mongo-sink -f mongo-kafka/Dockerfile.connect mongo-kafka` |
+| **`demo-hub/nodetool-exporter:latest`** | Scrapes `nodetool` metrics | `docker build -t demo-hub/nodetool-exporter:latest -f nodetool-exporter/Dockerfile nodetool-exporter` |
+
+**One command** (runs all four):
+
+```bash
+cd /path/to/metric-collector-for-apache-cassandra/dashboards/demo
+chmod +x k8s/scripts/build-all-custom-images.sh
+./k8s/scripts/build-all-custom-images.sh
+```
+
+After changing Dockerfiles or hub code, rebuild and roll out, for example:
+
+```bash
+kubectl rollout restart deployment/kafka-connect deployment/hub-demo-ui deployment/nodetool-exporter statefulset/cassandra -n demo-hub
+```
+
+### 2. Generate manifests (if you edit the generator or Prometheus/Grafana assets)
+
+```bash
+cd /path/to/metric-collector-for-apache-cassandra/dashboards/demo
+python3 k8s/scripts/gen_demo_hub_k8s.py
+```
+
+Committed **`k8s/generated/all.yaml`** is usually enough; use **`REGEN=1`** with **`demo-hub.sh`** to regenerate before apply.
+
+### 3. Start workloads and bootstrap Jobs
+
+From **`dashboards/demo`**:
+
+```bash
+chmod +x k8s/scripts/demo-hub.sh k8s/scripts/apply-data-bootstrap.sh
+./k8s/scripts/demo-hub.sh start
+```
+
+This **`kubectl apply -f k8s/generated/all.yaml`** (namespace + everything) and runs **`k8s/scripts/apply-data-bootstrap.sh`**, which waits for Postgres/Cassandra, then applies/runs the **Postgres**, **Cassandra schema**, and **Mongo** bootstrap **Jobs**.
+
+Useful variants:
+
+| Goal | Command |
+|------|---------|
+| Full teardown | `./k8s/scripts/demo-hub.sh stop` |
+| Clean restart (optional regen) | `REGEN=1 ./k8s/scripts/demo-hub.sh restart` |
+| Apply YAML only, skip Jobs | `SKIP_BOOTSTRAP=1 ./k8s/scripts/demo-hub.sh start` |
+| Status snapshot | `./k8s/scripts/demo-hub.sh status` |
+
+### 4. Port-forward from your laptop
+
+ClusterIPs are **not** on `127.0.0.1` until you forward. In a **second terminal**, from **`dashboards/demo`**:
+
+```bash
+./k8s/scripts/port-forward-demo-hub.sh
+```
+
+Leave it running. Defaults map **localhost** ports to services/pods in **`demo-hub`** (see script header for **`SKIP_PROMETHEUS=1`** if Prometheus is down).
+
+**Override local ports** (host already using 9042, 5432, …):
+
+| Environment variable | Default | Remote target |
+|---------------------|---------|---------------|
+| **`LOCAL_PG_PORT`** | 5432 | `svc/postgresql-primary:5432` |
+| **`LOCAL_PG_REPLICA_1_PORT`** | 5433 | `svc/postgresql-replica-1:5432` |
+| **`LOCAL_PG_REPLICA_2_PORT`** | 5434 | `svc/postgresql-replica-2:5432` |
+| **`LOCAL_CQL_PORT`** | 9042 | **`pod/cassandra-0:9042`** (stable coordinator) |
+| **`LOCAL_MONGO_PORT`** | 27017 | `svc/mongo-mongos1:27017` |
+| **`LOCAL_REDIS_PORT`** | 6379 | `svc/redis:6379` |
+| **`LOCAL_GRAFANA_PORT`** | 3000 | `svc/grafana:3000` |
+| **`LOCAL_PROM_PORT`** | 9090 | `svc/prometheus:9090` |
+| **`LOCAL_HUB_UI_PORT`** | 8888 | `svc/hub-demo-ui:8888` |
+| **`LOCAL_KAFKA_CONNECT_PORT`** | 8083 | `svc/kafka-connect:8083` |
+| **`LOCAL_OPENSEARCH_PORT`** | 9200 | `svc/opensearch:9200` |
+| **`LOCAL_OS_DASHBOARDS_PORT`** | 5601 | `svc/opensearch-dashboards:5601` |
+
+Example — use **19042** on the host for CQL:
+
+```bash
+LOCAL_CQL_PORT=19042 ./k8s/scripts/port-forward-demo-hub.sh
+# then: cqlsh 127.0.0.1 19042
+```
+
+**`NS`** — different namespace: `NS=my-ns ./k8s/scripts/port-forward-demo-hub.sh` (stack must exist there).
+
+Alternative: **`./k8s/scripts/demo-hub.sh port-forward`** (waits for Deployments + Cassandra StatefulSet, then runs the same forwards).
+
+### 5. Cassandra (CQL) — port-forward, custom port, and fallbacks
+
+- **Inside the cluster** Cassandra always listens on **9042**. **`LOCAL_CQL_PORT`** only changes the **localhost** side of the forward.
+- The script forwards **`pod/cassandra-0`**, not **`svc/cassandra`**, so CQL does not bounce between ring members.
+- If **`kubectl port-forward`** logs **socat** / **Connection reset by peer** (common on some local clusters), use one of:
+  - **Exec** (no forward): `kubectl exec -it -n demo-hub cassandra-0 -c cassandra -- cqlsh localhost 9042`
+  - **NodePort** (DBeaver / GUI): `kubectl apply -f k8s/optional-cassandra-0-cql-nodeport.yaml` → connect to **`<node-ip>:30942`** (see [optional-cassandra-0-cql-nodeport.yaml](optional-cassandra-0-cql-nodeport.yaml)); delete the Service when finished if you do not want it permanently.
+
+### 6. Kafka Connect connectors (not auto-registered on K8s)
+
+After **`LOCAL_KAFKA_CONNECT_PORT`** is reachable (default **8083**):
+
+```bash
+cd /path/to/metric-collector-for-apache-cassandra/dashboards/demo
+DEMO_HUB_K8S=1 ./kafka-connect-register/register-all.sh http://127.0.0.1:8083
+```
+
+**`DEMO_HUB_K8S=1`** sets the Debezium Postgres connector’s schema-history bootstrap to **`kafka:9092`** (Compose uses **`kafka:29092`**). See [`kafka-connect-register/register-all.sh`](../kafka-connect-register/register-all.sh).
+
+### 7. Where things live (reference)
+
+| What | Location |
+|------|----------|
+| Generated manifests | [`k8s/generated/`](generated/) — apply **`all.yaml`** once |
+| Generator source | [`k8s/scripts/gen_demo_hub_k8s.py`](scripts/gen_demo_hub_k8s.py) |
+| Start / stop / restart | [`k8s/scripts/demo-hub.sh`](scripts/demo-hub.sh) |
+| Port-forward script | [`k8s/scripts/port-forward-demo-hub.sh`](scripts/port-forward-demo-hub.sh) |
+| Bootstrap Jobs orchestration | [`k8s/scripts/apply-data-bootstrap.sh`](scripts/apply-data-bootstrap.sh) |
+| Build all custom images | [`k8s/scripts/build-all-custom-images.sh`](scripts/build-all-custom-images.sh) |
+| Cassandra CQL NodePort (optional) | [`k8s/optional-cassandra-0-cql-nodeport.yaml`](optional-cassandra-0-cql-nodeport.yaml) |
+| Job descriptions | [`k8s/generated/README-jobs.md`](generated/README-jobs.md) |
+
+---
+
 ## Kubernetes basics (for this demo)
 
 Kubernetes (**K8s**) runs **workloads** on one or more **nodes** (machines or VMs). You declare what you want in YAML; the **control plane** (scheduler, API) places **pods** on nodes and keeps them running.
@@ -57,7 +187,7 @@ The generator ([`scripts/gen_demo_hub_k8s.py`](scripts/gen_demo_hub_k8s.py)) was
 | **PodDisruptionBudget** | same | Not present | **`cassandra-pdb`** (`minAvailable: 2`), **`postgresql-primary-pdb`**, **`hub-demo-ui-pdb`** — limits voluntary disruption during drains/upgrades (when the scheduler respects PDBs). |
 | **HorizontalPodAutoscaler** | same | Not present | **`hub-demo-ui`** — CPU **70%**, replicas **1–3**. **Needs [metrics-server](https://github.com/kubernetes-sigs/metrics-server)** in the cluster; without it, the HPA object exists but scaling metrics stay unknown. |
 | **NetworkPolicy** | same | Not present | **`demo-hub-namespace-isolation`** — selects pods with **`app.kubernetes.io/part-of: demo-hub`**; **ingress** from namespace **`demo-hub`** and from **`ingress-nginx`** (so the Ingress controller can reach Services); **egress** allowed broadly (`egress: - {}`) so DNS and pulls still work. Adjust if your Ingress runs in another namespace. |
-| **CronJob** | same | Not present | **`demo-hub-smoke-curl`** — every **30** minutes, curls **`http://hub-demo-ui:8888/docs`** (in-cluster smoke; not a substitute for monitoring). |
+| **CronJob** | same | Not present | **`demo-hub-smoke-curl`** — every **30** minutes, curls **`http://hub-demo-ui:8888/docs`** and **`http://hub-demo-ui:8888/api/scenario/faker-profile`** (in-cluster smoke; not a substitute for monitoring). |
 | **ServiceMonitor** | [`optional-prometheus-operator-servicemonitors.example.yaml`](optional-prometheus-operator-servicemonitors.example.yaml) | N/A | **Example only** — for **Prometheus Operator** users. The bundled stack uses a **static Prometheus Deployment** + `scrape_configs`, not the Operator. |
 
 **Optional (not in `all.yaml` by composition logic, separate files):**
@@ -238,7 +368,7 @@ Then open or connect locally:
 |--------|-------------------|
 | **Grafana** | http://127.0.0.1:3000/ |
 | **Prometheus** | http://127.0.0.1:9090/ |
-| **Hub demo UI** | http://127.0.0.1:8888/ |
+| **Hub demo UI** | http://127.0.0.1:8888/ · **Faker + map → `scenario_orders`:** http://127.0.0.1:8888/scenario (step **3 · Place order**; `/faker-order` redirects here) |
 | **OpenSearch** (REST API) | http://127.0.0.1:9200/ |
 | **OpenSearch Dashboards** | http://127.0.0.1:5601/ (same URL the hub UI home page links to) |
 | **Postgres** | `psql "postgresql://demo:demopass@127.0.0.1:5432/demo"` |
@@ -246,7 +376,7 @@ Then open or connect locally:
 | **MongoDB (mongos)** | `mongosh "mongodb://127.0.0.1:27017/"` |
 | **Redis** | `redis-cli -h 127.0.0.1 -p 6379 -a demoredispass` (or URI `redis://:demoredispass@127.0.0.1:6379/0`) |
 
-If a port is already in use locally, override before running the script, e.g. `LOCAL_PROM_PORT=19090 LOCAL_GRAFANA_PORT=13000 LOCAL_REDIS_PORT=16379 ./k8s/scripts/port-forward-demo-hub.sh`. For OpenSearch use `LOCAL_OPENSEARCH_PORT` / `LOCAL_OS_DASHBOARDS_PORT` (defaults **9200** / **5601**).
+If a port is already in use locally, override before running the script, e.g. `LOCAL_PROM_PORT=19090 LOCAL_GRAFANA_PORT=13000 LOCAL_REDIS_PORT=16379 ./k8s/scripts/port-forward-demo-hub.sh`. For OpenSearch use `LOCAL_OPENSEARCH_PORT` / `LOCAL_OS_DASHBOARDS_PORT` (defaults **9200** / **5601**). **Cassandra on the host:** set **`LOCAL_CQL_PORT`** (default **9042**); full **`LOCAL_*`** table: [Quick start, step 4](#4-port-forward-from-your-laptop).
 
 If **`kubectl port-forward`** prints **Connection refused** on **:9090** (often with **socat** in the message), the **Prometheus container is not listening** — usually **CrashLoopBackOff** or not **Ready**. Fix the pod (`kubectl logs deploy/prometheus -n demo-hub`), or temporarily skip that forward so other ports still work: **`SKIP_PROMETHEUS=1 ./k8s/scripts/port-forward-demo-hub.sh`**.
 

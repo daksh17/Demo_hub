@@ -1,5 +1,6 @@
 # JDK 8 + Maven; multi-arch (linux/amd64, arm64). Older `maven:3.6.3-jdk-8-slim` often fails on ARM with
 # "no match for platform in manifest" and is no longer reliably published.
+# Default pre-pull in dashboards/demo/k8s/scripts/build-mcac-init-image.sh (override: MCAC_INIT_BASE_IMAGE).
 FROM maven:3.9-eclipse-temurin-8 AS builder
 
 WORKDIR /build
