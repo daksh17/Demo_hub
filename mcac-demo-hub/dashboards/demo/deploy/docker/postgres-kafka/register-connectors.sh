@@ -11,11 +11,22 @@
 # Kubernetes (demo-hub): broker PLAINTEXT is kafka:9092 only — set
 #   SCHEMA_HISTORY_KAFKA_BOOTSTRAP=kafka:9092
 # so Debezium schema history can reach Kafka (Compose defaults to kafka:29092).
+#
+# Optional: after `source deploy/k8s/scripts/export-demo-hub-secrets-from-vault.sh`, PG_SOURCE_*
+# and JDBC_SINK_* env vars override connector passwords/hosts (Vault-backed demo-hub).
 set -euo pipefail
 CONNECT="${1:-http://localhost:8083}"
 CONNECT="${CONNECT%/}"
 # Debezium schema.history.internal.kafka.bootstrap.servers (Compose: 29092, K8s demo-hub: 9092).
 SCHEMA_HISTORY_KAFKA_BOOTSTRAP="${SCHEMA_HISTORY_KAFKA_BOOTSTRAP:-kafka:29092}"
+PG_SOURCE_DB_HOST="${PG_SOURCE_DB_HOST:-postgresql-primary}"
+PG_SOURCE_DB_PORT="${PG_SOURCE_DB_PORT:-5432}"
+PG_SOURCE_DB_USER="${PG_SOURCE_DB_USER:-replicator}"
+PG_SOURCE_DB_PASSWORD="${PG_SOURCE_DB_PASSWORD:-replicatorpass}"
+PG_SOURCE_DB_NAME="${PG_SOURCE_DB_NAME:-demo}"
+JDBC_SINK_URL="${JDBC_SINK_URL:-jdbc:postgresql://postgresql-primary:5432/demo}"
+JDBC_SINK_USER="${JDBC_SINK_USER:-demo}"
+JDBC_SINK_PASSWORD="${JDBC_SINK_PASSWORD:-demopass}"
 if [[ "$CONNECT" == "jdbc-only" ]]; then
   CONNECT="http://127.0.0.1:8083"
   JDBC_SINK_ONLY=1
@@ -110,11 +121,11 @@ if [[ "$JDBC_SINK_ONLY" != "1" ]]; then
   "config": {
     "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
     "tasks.max": "1",
-    "database.hostname": "postgresql-primary",
-    "database.port": "5432",
-    "database.user": "replicator",
-    "database.password": "replicatorpass",
-    "database.dbname": "demo",
+    "database.hostname": "${PG_SOURCE_DB_HOST}",
+    "database.port": "${PG_SOURCE_DB_PORT}",
+    "database.user": "${PG_SOURCE_DB_USER}",
+    "database.password": "${PG_SOURCE_DB_PASSWORD}",
+    "database.dbname": "${PG_SOURCE_DB_NAME}",
     "topic.prefix": "demopg",
     "table.include.list": "public.demo_items",
     "snapshot.fetch.size": "256",
@@ -136,16 +147,16 @@ JSON
   echo "Registered pg-source-demo."
 fi
 
-post_connector "jdbc-sink-demo" <<'JSON'
+post_connector "jdbc-sink-demo" <<JSON
 {
   "name": "jdbc-sink-demo",
   "config": {
     "connector.class": "io.debezium.connector.jdbc.JdbcSinkConnector",
     "tasks.max": "1",
     "topics": "demopg.public.demo_items",
-    "connection.url": "jdbc:postgresql://postgresql-primary:5432/demo",
-    "connection.username": "demo",
-    "connection.password": "demopass",
+    "connection.url": "${JDBC_SINK_URL}",
+    "connection.username": "${JDBC_SINK_USER}",
+    "connection.password": "${JDBC_SINK_PASSWORD}",
     "dialect.name": "postgresql",
     "insert.mode": "upsert",
     "delete.enabled": "false",

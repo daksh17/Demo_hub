@@ -6,6 +6,10 @@
 # Kubernetes demo-hub: port-forward Connect REST, then e.g.
 #   DEMO_HUB_K8S=1 ./register-all.sh http://127.0.0.1:8083
 # (sets SCHEMA_HISTORY_KAFKA_BOOTSTRAP=kafka:9092 for Debezium; override if needed.)
+#
+# Optional Vault-backed connector passwords/URIs (after port-forward Vault :8200 and seed Job):
+#   source deploy/k8s/scripts/export-demo-hub-secrets-from-vault.sh
+#   DEMO_HUB_K8S=1 ./register-all.sh http://127.0.0.1:8083
 # Compose one-shot passes the kafka-connect URL explicitly as $1.
 set -euo pipefail
 

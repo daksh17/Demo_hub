@@ -40,6 +40,7 @@ LOCAL_KAFKA_CONNECT_PORT="${LOCAL_KAFKA_CONNECT_PORT:-8083}"
 # Hub UI / tools use localhost:9200 / :5601 for OpenSearch REST + Dashboards (same defaults as Compose).
 LOCAL_OPENSEARCH_PORT="${LOCAL_OPENSEARCH_PORT:-9200}"
 LOCAL_OS_DASHBOARDS_PORT="${LOCAL_OS_DASHBOARDS_PORT:-5601}"
+LOCAL_VAULT_PORT="${LOCAL_VAULT_PORT:-8200}"
 
 echo "Namespace: $NS"
 echo "Open in browser or point clients at 127.0.0.1 — keep this process running (Ctrl+C stops all forwards)."
@@ -56,6 +57,7 @@ echo "  Hub demo UI   http://127.0.0.1:${LOCAL_HUB_UI_PORT}/  (Faker + map order
 echo "  Kafka Connect http://127.0.0.1:${LOCAL_KAFKA_CONNECT_PORT}/  (REST; list: curl -s http://127.0.0.1:${LOCAL_KAFKA_CONNECT_PORT}/connectors)"
 echo "  OpenSearch    http://127.0.0.1:${LOCAL_OPENSEARCH_PORT}/  (REST API; e.g. curl -s http://127.0.0.1:${LOCAL_OPENSEARCH_PORT}/_cluster/health)"
 echo "  OS Dashboards http://127.0.0.1:${LOCAL_OS_DASHBOARDS_PORT}/  (matches “OpenSearch Dashboards” link on hub home)"
+echo "  Vault UI/API http://127.0.0.1:${LOCAL_VAULT_PORT}/  (token: demo-hub-dev-root — demo dev mode only)"
 echo ""
 
 # Remote port is always 5432 (container + Service targetPort). Local ports differ so primary + replicas can all bind.
@@ -75,5 +77,6 @@ kubectl -n "$NS" port-forward "svc/hub-demo-ui" "${LOCAL_HUB_UI_PORT}:8888" &
 kubectl -n "$NS" port-forward "svc/kafka-connect" "${LOCAL_KAFKA_CONNECT_PORT}:8083" &
 kubectl -n "$NS" port-forward "svc/opensearch" "${LOCAL_OPENSEARCH_PORT}:9200" &
 kubectl -n "$NS" port-forward "svc/opensearch-dashboards" "${LOCAL_OS_DASHBOARDS_PORT}:5601" &
+kubectl -n "$NS" port-forward "svc/vault" "${LOCAL_VAULT_PORT}:8200" &
 
 wait

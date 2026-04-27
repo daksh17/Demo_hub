@@ -3,9 +3,16 @@
 # Requires: kafka-connect image built from Dockerfile.connect, mongo stack + mongo-kafka-prepare done.
 #
 # Usage: ./register-mongo-connectors.sh [http://localhost:8083]
+#
+# Optional: `source deploy/k8s/scripts/export-demo-hub-secrets-from-vault.sh` sets MONGO_SOURCE_URI,
+# MONGO_SINK_URI, MONGO_SINK_DATABASE, MONGO_SINK_COLLECTION for Vault-backed values.
 set -euo pipefail
 CONNECT="${1:-http://localhost:8083}"
 CONNECT="${CONNECT%/}"
+MONGO_SOURCE_URI="${MONGO_SOURCE_URI:-mongodb://mongo-mongos1:27017}"
+MONGO_SINK_URI="${MONGO_SINK_URI:-mongodb://mongo-mongos1:27017}"
+MONGO_SINK_DATABASE="${MONGO_SINK_DATABASE:-demo}"
+MONGO_SINK_COLLECTION="${MONGO_SINK_COLLECTION:-demo_items_from_kafka}"
 CURL_CONNECT_TIMEOUT="${CURL_CONNECT_TIMEOUT:-5}"
 CURL_MAX_TIME="${CURL_MAX_TIME:-30}"
 curl_connect_opts=(--connect-timeout "${CURL_CONNECT_TIMEOUT}" --max-time "${CURL_MAX_TIME}" -sS)
@@ -79,13 +86,13 @@ post_connector() {
   return 0
 }
 
-post_connector "mongo-source-demo" <<'JSON'
+post_connector "mongo-source-demo" <<JSON
 {
   "name": "mongo-source-demo",
   "config": {
     "connector.class": "io.debezium.connector.mongodb.MongoDbConnector",
     "tasks.max": "1",
-    "mongodb.connection.string": "mongodb://mongo-mongos1:27017",
+    "mongodb.connection.string": "${MONGO_SOURCE_URI}",
     "topic.prefix": "demomongo",
     "collection.include.list": "demo.demo_items",
     "capture.mode": "change_streams_update_full",
@@ -102,16 +109,16 @@ JSON
 
 echo "Registered mongo-source-demo (topics like demomongo.demo.demo_items)."
 
-post_connector "mongo-sink-demo" <<'JSON'
+post_connector "mongo-sink-demo" <<JSON
 {
   "name": "mongo-sink-demo",
   "config": {
     "connector.class": "com.mongodb.kafka.connect.MongoSinkConnector",
     "tasks.max": "1",
     "topics": "demomongo.demo.demo_items",
-    "connection.uri": "mongodb://mongo-mongos1:27017",
-    "database": "demo",
-    "collection": "demo_items_from_kafka",
+    "connection.uri": "${MONGO_SINK_URI}",
+    "database": "${MONGO_SINK_DATABASE}",
+    "collection": "${MONGO_SINK_COLLECTION}",
     "max.num.retries": "3",
     "errors.tolerance": "all",
     "errors.log.enable": "true",

@@ -2,8 +2,9 @@
 """Generate Kubernetes manifests from dashboards/demo/docker-compose.yml (demo-hub stack).
 
 Outputs under deploy/k8s/generated/: Deployments, StatefulSets, Services, ConfigMaps, bootstrap **Jobs**
-(Postgres/Cassandra/Mongo — same scripts as Compose), **Secret** (`demo-hub-credentials`), and ops extras
-(Ingress, PDB, NetworkPolicy, HPA, CronJob). Run **scripts/apply-data-bootstrap.sh** after workloads are up.
+(Postgres/Cassandra/Mongo — same scripts as Compose), **Secret** (`demo-hub-credentials`), **HashiCorp Vault**
+(dev mode + KV seed Job), and ops extras (Ingress, PDB, NetworkPolicy, HPA, CronJob).
+Run **scripts/apply-data-bootstrap.sh** after workloads are up.
 
 Usage:
   python3 deploy/k8s/scripts/gen_demo_hub_k8s.py
@@ -17,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shlex
 import textwrap
 from pathlib import Path
 
@@ -30,6 +32,7 @@ REPO_ROOT = DASHBOARDS.parent
 OUT = K8S_ROOT / "generated"
 NS = "demo-hub"
 # Opaque Secret with demo passwords (same values as Compose); workloads use valueFrom.secretKeyRef.
+# The same values are seeded into HashiCorp Vault (KV v2) for optional use by operators / connectors.
 SECRET_NAME = "demo-hub-credentials"
 SK_POSTGRESQL_PASSWORD = "postgresql-password"
 SK_POSTGRESQL_REPLICATION_PASSWORD = "postgresql-replication-password"
@@ -37,14 +40,20 @@ SK_REDIS_PASSWORD = "redis-password"
 SK_DEMO_USER_PASSWORD = "demo-user-password"
 SK_HUB_POSTGRES_DSN = "hub-postgres-dsn"
 SK_HUB_REDIS_URL = "hub-redis-url"
+# Vault: dev in-memory server (demo only — not HA, data lost on pod restart). See deploy/k8s/README.md.
+VAULT_IMAGE = "hashicorp/vault:1.15.6"
+VAULT_DEV_ROOT_TOKEN = "demo-hub-dev-root"
 # Cassandra data disk: use default StorageClass when set to "" (cluster must provide one).
 CASSANDRA_DATA_STORAGE_CLASS = ""
 CASSANDRA_DATA_STORAGE_SIZE = "10Gi"
 # Local-only image (not on Docker Hub). Tag is NOT :latest so the kubelet does not always try to pull.
 # Build: `docker build -t mcac-demo/mcac-init:local <repo-root>` (see deploy/k8s/scripts/build-mcac-init-image.sh).
 MCAC_INIT_IMAGE = "mcac-demo/mcac-init:local"
-# `docker.io/bitnami/postgresql:16` often 404s ("manifest unknown"); legacy repo has multi-arch pins (same line as ZooKeeper/Kafka).
-POSTGRESQL_IMAGE = "docker.io/bitnamilegacy/postgresql:16.6.0-debian-12-r2"
+# Custom image: Bitnami PostgreSQL 16.6.0 pin + repmgr (see deploy/docker/postgres-kafka/Dockerfile.repmgr). Build before K8s apply.
+POSTGRESQL_IMAGE = "mcac-demo/postgresql-repmgr:16.6.0"
+
+# WAL archive: set via /bitnami/postgresql/conf/conf.d/ (init container), not POSTGRESQL_EXTRA_FLAGS —
+# Bitnami splits EXTRA_FLAGS on spaces, so archive_command / mkdir -p / test -f break postgres argv.
 
 
 def fqdn_service(svc: str) -> str:
@@ -394,7 +403,20 @@ spec:
     return join_docs(dep, svc)
 
 
+def demo_hub_secret_stringdata() -> dict[str, str]:
+    """Single source for Kubernetes Secret and Vault KV seed (demo literals)."""
+    return {
+        SK_POSTGRESQL_PASSWORD: "postgres",
+        SK_POSTGRESQL_REPLICATION_PASSWORD: "replicatorpass",
+        SK_REDIS_PASSWORD: "demoredispass",
+        SK_DEMO_USER_PASSWORD: "demopass",
+        SK_HUB_POSTGRES_DSN: "postgresql://demo:demopass@postgresql-primary:5432/demo",
+        SK_HUB_REDIS_URL: "redis://:demoredispass@redis:6379/0",
+    }
+
+
 def demo_hub_credentials_secret() -> str:
+    sd = "\n".join(f"  {k}: {v}" for k, v in demo_hub_secret_stringdata().items())
     return f"""apiVersion: v1
 kind: Secret
 metadata:
@@ -405,13 +427,168 @@ metadata:
     demo-hub.io/group: credentials
 type: Opaque
 stringData:
-  {SK_POSTGRESQL_PASSWORD}: postgres
-  {SK_POSTGRESQL_REPLICATION_PASSWORD}: replicatorpass
-  {SK_REDIS_PASSWORD}: demoredispass
-  {SK_DEMO_USER_PASSWORD}: demopass
-  {SK_HUB_POSTGRES_DSN}: postgresql://demo:demopass@postgresql-primary:5432/demo
-  {SK_HUB_REDIS_URL}: redis://:demoredispass@redis:6379/0
+{sd}
 """
+
+
+def vault_stack() -> str:
+    """HashiCorp Vault in -dev mode + Job that seeds KV v2 paths (mirrors demo-hub credentials + connector fields)."""
+    vaddr = f"http://{fqdn_service('vault')}:8200"
+    vhost = fqdn_service("vault")
+    ml_v, pl_v = lbl("vault", "vault")
+
+    def q(s: str) -> str:
+        return shlex.quote(s)
+
+    cred_args = " \\\n            ".join(f"{k}={q(v)}" for k, v in demo_hub_secret_stringdata().items())
+    seed_body = f"""set -eux
+export VAULT_ADDR={q(vaddr)}
+export VAULT_TOKEN={q(VAULT_DEV_ROOT_TOKEN)}
+vault kv put secret/demo-hub/credentials \\
+            {cred_args}
+vault kv put secret/demo-hub/kafka-connect/pg-source \\
+            database.hostname={q("postgresql-primary")} \\
+            database.port={q("5432")} \\
+            database.user={q("replicator")} \\
+            database.password={q("replicatorpass")} \\
+            database.dbname={q("demo")}
+vault kv put secret/demo-hub/kafka-connect/jdbc-sink \\
+            connection.url={q("jdbc:postgresql://postgresql-primary:5432/demo")} \\
+            connection.username={q("demo")} \\
+            connection.password={q("demopass")}
+vault kv put secret/demo-hub/kafka-connect/mongo-source \\
+            mongodb.connection.string={q("mongodb://mongo-mongos1:27017")}
+vault kv put secret/demo-hub/kafka-connect/mongo-sink \\
+            connection.uri={q("mongodb://mongo-mongos1:27017")} \\
+            database={q("demo")} \\
+            collection={q("demo_items_from_kafka")}
+echo "Vault KV seed complete."
+"""
+    sa = f"""apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vault
+  namespace: {NS}
+  labels:
+{ml_v}
+"""
+    dep = f"""apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vault
+  namespace: {NS}
+  labels:
+{ml_v}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+{pl_v}
+  template:
+    metadata:
+      labels:
+{pl_v}
+    spec:
+      serviceAccountName: vault
+      containers:
+        - name: vault
+          image: {VAULT_IMAGE}
+          imagePullPolicy: IfNotPresent
+          args:
+            - server
+            - -dev
+            - -dev-listen-address=0.0.0.0:8200
+            - -dev-root-token-id={VAULT_DEV_ROOT_TOKEN}
+          env:
+            - name: VAULT_API_ADDR
+              value: {jdump("http://0.0.0.0:8200")}
+          ports:
+            - name: http
+              containerPort: 8200
+          securityContext:
+            capabilities:
+              add:
+                - IPC_LOCK
+          readinessProbe:
+            httpGet:
+              path: /v1/sys/health
+              port: http
+              scheme: HTTP
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /v1/sys/health
+              port: http
+              scheme: HTTP
+            initialDelaySeconds: 10
+            periodSeconds: 15
+"""
+    svc = f"""apiVersion: v1
+kind: Service
+metadata:
+  name: vault
+  namespace: {NS}
+  labels:
+{ml_v}
+spec:
+  type: ClusterIP
+  selector:
+{pl_v}
+  ports:
+    - name: http
+      port: 8200
+      targetPort: http
+"""
+    wait_url = q(f"http://{vhost}:8200/v1/sys/health")
+    job = f"""apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vault-demo-hub-seed
+  namespace: {NS}
+  labels:
+{ml_v}
+spec:
+  ttlSecondsAfterFinished: 86400
+  backoffLimit: 8
+  activeDeadlineSeconds: 600
+  template:
+    metadata:
+      labels:
+{pl_v}
+    spec:
+      restartPolicy: Never
+      initContainers:
+        - name: wait-vault
+          image: busybox:1.36
+          command:
+            - /bin/sh
+            - -c
+            - |
+              for i in $(seq 1 90); do
+                if wget -q -O- {wait_url} >/dev/null 2>&1; then
+                  exit 0
+                fi
+                sleep 2
+              done
+              echo "timeout waiting for Vault" >&2
+              exit 1
+      containers:
+        - name: seed
+          image: {VAULT_IMAGE}
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: VAULT_ADDR
+              value: {jdump(vaddr)}
+            - name: VAULT_TOKEN
+              value: {jdump(VAULT_DEV_ROOT_TOKEN)}
+          command:
+            - /bin/sh
+            - -c
+            - |
+{textwrap.indent(seed_body, "              ")}
+"""
+    return join_docs(sa, dep, svc, job)
 
 
 def kubernetes_ops_extras() -> str:
@@ -483,6 +660,16 @@ spec:
                 name: prometheus
                 port:
                   number: 9090
+    - host: vault.demo-hub.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: vault
+                port:
+                  number: 8200
 """
     pdb_c = f"""apiVersion: policy/v1
 kind: PodDisruptionBudget
@@ -1230,6 +1417,46 @@ def zookeeper_kafka() -> str:
     return join_docs(zk, kf)
 
 
+def _postgres_ha_init_containers(archive_mode: str) -> str:
+    """repmgr check + conf.d snippet for WAL archive (archive_mode on | always)."""
+    img = POSTGRESQL_IMAGE
+    return f"""      initContainers:
+        - name: assert-repmgr-extension
+          image: {img}
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              f=/opt/bitnami/postgresql/share/extension/repmgr.control
+              if [ ! -f "$f" ]; then
+                echo "Missing $f in image {img}." >&2
+                echo "Rebuild: docker build --no-cache -t {img} -f deploy/docker/postgres-kafka/Dockerfile.repmgr deploy/docker/postgres-kafka" >&2
+                exit 1
+              fi
+        - name: mcac-wal-archive-conf
+          image: {img}
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MCAC_ARCHIVE_MODE
+              value: "{archive_mode}"
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              conf_dir=/bitnami/postgresql/conf/conf.d
+              mkdir -p "$conf_dir"
+              printf '%s\\n' "archive_mode = ${{MCAC_ARCHIVE_MODE}}" \\
+                "archive_command = '/opt/bitnami/scripts/mcac-wal-archive.sh %p %f'" \\
+                > "$conf_dir/99-mcac-archive.conf"
+          volumeMounts:
+            - name: data
+              mountPath: /bitnami/postgresql
+"""
+
+
 def postgres_ha() -> str:
     pg_secret = [
         ("POSTGRESQL_REPLICATION_PASSWORD", SECRET_NAME, SK_POSTGRESQL_REPLICATION_PASSWORD),
@@ -1240,7 +1467,7 @@ def postgres_ha() -> str:
         ("POSTGRESQL_REPLICATION_USER", "replicator"),
         ("POSTGRESQL_USERNAME", "postgres"),
         ("POSTGRESQL_DATABASE", "demo"),
-        ("POSTGRESQL_SHARED_PRELOAD_LIBRARIES", "pgaudit,pg_stat_statements"),
+        ("POSTGRESQL_SHARED_PRELOAD_LIBRARIES", "repmgr,pgaudit,pg_stat_statements"),
         (
             "POSTGRESQL_EXTRA_FLAGS",
             "-c wal_level=logical -c max_replication_slots=8 -c max_wal_senders=8 "
@@ -1257,6 +1484,7 @@ def postgres_ha() -> str:
             primary,
             data_mount="/bitnami/postgresql",
             env_secret_refs=pg_secret,
+            init_before_containers=_postgres_ha_init_containers("on"),
         )
     ]
     rep_base = [
@@ -1264,13 +1492,13 @@ def postgres_ha() -> str:
         ("POSTGRESQL_REPLICATION_USER", "replicator"),
         ("POSTGRESQL_MASTER_HOST", "postgresql-primary"),
         ("POSTGRESQL_MASTER_PORT_NUMBER", "5432"),
-        ("POSTGRESQL_SHARED_PRELOAD_LIBRARIES", "pgaudit,pg_stat_statements"),
+        ("POSTGRESQL_SHARED_PRELOAD_LIBRARIES", "repmgr,pgaudit,pg_stat_statements"),
     ]
     for slot, rname in ((1, "postgresql-replica-1"), (2, "postgresql-replica-2")):
         env = rep_base + [
             (
                 "POSTGRESQL_EXTRA_FLAGS",
-                f"-c primary_slot_name=pgdemo_phys_replica_{slot} "
+                f"-c wal_level=replica -c primary_slot_name=pgdemo_phys_replica_{slot} "
                 f"-c pg_stat_statements.max=10000 -c pg_stat_statements.track=all",
             ),
         ]
@@ -1284,6 +1512,7 @@ def postgres_ha() -> str:
                 env,
                 data_mount="/bitnami/postgresql",
                 env_secret_refs=pg_secret,
+                init_before_containers=_postgres_ha_init_containers("always"),
             )
         )
     return join_docs(*docs)
@@ -1402,6 +1631,10 @@ export PGPASSWORD=replicatorpass
 psql -h "$PGHOST" -U replicator -d postgres -v ON_ERROR_STOP=1 -f /scripts/ensure-physical-replication-slots.sql
 export PGPASSWORD=postgres
 psql -h "$PGHOST" -U postgres -d postgres -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements;"
+if ! psql -h "$PGHOST" -U postgres -d postgres -v ON_ERROR_STOP=1 -tc "SELECT 1 FROM pg_database WHERE datname = 'repmgr'" | grep -q 1; then
+  psql -h "$PGHOST" -U postgres -d postgres -v ON_ERROR_STOP=1 -c "CREATE DATABASE repmgr;"
+fi
+psql -h "$PGHOST" -U postgres -d repmgr -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS repmgr;"
 psql -h "$PGHOST" -U postgres -d demo -v ON_ERROR_STOP=1 -f /scripts/04-scenario-hub-schema-indexes.sql
 echo "postgres bootstrap done."
 """
@@ -1643,6 +1876,7 @@ Generated Jobs (apply **after** workloads are running):
 
 | Job | Purpose |
 |-----|---------|
+| **vault-demo-hub-seed** | Writes demo credentials + Kafka Connect fields into Vault KV v2 (`secret/demo-hub/...`). Re-run after Vault pod restart (dev mode is in-memory). |
 | **postgres-demo-bootstrap** | Debezium user/table/publication + physical replication slots + scenario schema (mirrors `postgres-kafka/*.sql` init). |
 | **cassandra-demo-schema** | `demo_hub` keyspace with **RF=3** + placeholder table (ring replication). |
 | **mongo-demo-bootstrap** | Config RS → shard RS → addShard → sharded collections (mirrors `mongo-sharded/*.sh` + `prepare-demo-collections.sh`). |
@@ -1665,6 +1899,7 @@ def main() -> None:
     bundles: list[tuple[str, str]] = [
         ("00-namespace.yaml", copy_namespace()),
         ("01-demo-hub-credentials.yaml", demo_hub_credentials_secret()),
+        ("02-vault.yaml", vault_stack()),
         ("10-observability-prometheus-grafana.yaml", join_docs(prometheus_stack(), grafana_stack())),
         ("20-zookeeper-kafka.yaml", zookeeper_kafka()),
         ("30-cassandra-ring.yaml", cassandra_statefulset()),

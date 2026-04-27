@@ -1,6 +1,7 @@
 # Debezium Connect 2.7 + MongoDB Kafka sink (fat JAR from Maven Central).
 FROM quay.io/debezium/connect:2.7.3.Final
 USER root:root
+RUN microdnf -y install vim-minimal && microdnf clean all
 ARG MKC_VERSION=1.14.1
 RUN mkdir -p /kafka/connect/mongodb-kafka-connect \
     && curl -fsSL \

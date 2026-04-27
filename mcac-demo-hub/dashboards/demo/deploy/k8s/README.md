@@ -92,6 +92,7 @@ Leave it running. Defaults map **localhost** ports to services/pods in **`demo-h
 | **`LOCAL_KAFKA_CONNECT_PORT`** | 8083 | `svc/kafka-connect:8083` |
 | **`LOCAL_OPENSEARCH_PORT`** | 9200 | `svc/opensearch:9200` |
 | **`LOCAL_OS_DASHBOARDS_PORT`** | 5601 | `svc/opensearch-dashboards:5601` |
+| **`LOCAL_VAULT_PORT`** | 8200 | `svc/vault:8200` |
 
 Example — use **19042** on the host for CQL:
 
@@ -122,6 +123,64 @@ DEMO_HUB_K8S=1 ./deploy/docker/kafka-connect-register/register-all.sh http://127
 ```
 
 **`DEMO_HUB_K8S=1`** sets the Debezium Postgres connector’s schema-history bootstrap to **`kafka:9092`** (Compose uses **`kafka:29092`**). See [`deploy/docker/kafka-connect-register/register-all.sh`](../docker/kafka-connect-register/register-all.sh).
+
+### HashiCorp Vault (demo secrets + connector fields)
+
+The generator emits **`deploy/k8s/generated/02-vault.yaml`**: a **single-replica Vault in `-dev` mode** (in-memory storage — **secrets are lost if the Vault pod restarts**; re-run the seed Job). This is for **local/demo only**, not production HA.
+
+| Item | Value |
+|------|--------|
+| Service | **`vault`** in **`demo-hub`**, port **8200** |
+| Root token | **`demo-hub-dev-root`** (fixed; rotate for anything beyond a lab) |
+| KV paths | **`secret/demo-hub/credentials`** (same keys as `demo-hub-credentials` Secret), **`secret/demo-hub/kafka-connect/*`** (Postgres/Mongo connector fields) |
+
+After apply, wait for **`vault-demo-hub-seed`** Job to complete. If the Job ran before Vault was ready, delete and re-apply:
+
+```bash
+kubectl delete job -n demo-hub vault-demo-hub-seed --ignore-not-found
+kubectl apply -f deploy/k8s/generated/02-vault.yaml
+```
+
+**Web UI / API** (with port-forward): open **`http://127.0.0.1:8200`**, sign in with token **`demo-hub-dev-root`**, or use Ingress **`http://vault.demo-hub.local`** if that host resolves.
+
+**Vault CLI:** use the **demo** token on **this** server — a corporate `VAULT_TOKEN` in your shell will yield **403** on reads.
+
+Vault **1.11+** CLI:
+
+```bash
+VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=demo-hub-dev-root vault kv get -mount=secret demo-hub/credentials
+```
+
+Older **`vault` binaries** (error: `flag provided but not defined: -mount`) — use the full KV v2 path:
+
+```bash
+VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=demo-hub-dev-root vault read secret/data/demo-hub/credentials
+```
+
+Or the legacy-style path (works on many versions):
+
+```bash
+vault kv get secret/demo-hub/credentials
+```
+
+**List every secret path** (recursive metadata walk, stdlib Python only):
+
+```bash
+chmod +x deploy/k8s/scripts/vault-list-secrets.sh
+./deploy/k8s/scripts/vault-list-secrets.sh
+./deploy/k8s/scripts/vault-list-secrets.sh --prefix demo-hub --full-paths
+```
+
+**Connectors from Vault** — load env vars then register (same scripts as Compose):
+
+```bash
+source deploy/k8s/scripts/export-demo-hub-secrets-from-vault.sh
+DEMO_HUB_K8S=1 ./deploy/docker/kafka-connect-register/register-all.sh http://127.0.0.1:8083
+```
+
+If your shell already exports **`VAULT_ADDR`** for a **corporate Vault**, the export script **ignores** it and uses **`http://127.0.0.1:8200`** (after port-forward). To reuse global `VAULT_ADDR` / `VAULT_TOKEN` instead, run with **`DEMO_HUB_RESPECT_GLOBAL_VAULT=1`**. To point at another instance explicitly: **`DEMO_HUB_VAULT_ADDR=...`** and **`DEMO_HUB_VAULT_TOKEN=...`**.
+
+**Runtime:** Pods (hub UI, Postgres, Redis, etc.) **do not** read Vault. They use **`demo-hub-credentials`** only. Cassandra, Kafka, and OpenSearch are contacted via in-cluster DNS; this demo does not put their connection secrets on a Vault path for the app. Vault mirrors the hub/Postgres/Redis-style credentials for **operators** and **Kafka Connect registration** (`export-demo-hub-secrets-from-vault.sh`). To drive workloads from Vault, add External Secrets / Vault Agent (or similar) and point manifests at the synced Secret—not included here.
 
 ### 7. Where things live (reference)
 
