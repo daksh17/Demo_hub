@@ -369,3 +369,21 @@ scrape_configs:
           - opensearch-exporter:9114
         labels:
           os_cluster: demo
+
+  # SQL Server (awaragi/prometheus-mssql-exporter; one target per instance on demo_net)
+  - job_name: "mssql_demo"
+    scrape_interval: 30s
+    scrape_timeout: 25s
+    metrics_path: /metrics
+    scheme: http
+    static_configs:
+      - targets:
+          - mssql-exporter-publisher:4000
+        labels:
+          mssql_role: publisher
+          mssql_cluster: demo-hub
+      - targets:
+          - mssql-exporter-subscriber:4000
+        labels:
+          mssql_role: subscriber
+          mssql_cluster: demo-hub

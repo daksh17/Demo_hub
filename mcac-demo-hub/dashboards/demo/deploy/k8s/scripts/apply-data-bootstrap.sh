@@ -37,4 +37,12 @@ kubectl delete job mongo-demo-bootstrap -n "$NS" --ignore-not-found=true
 kubectl apply -f "$GEN/61-mongo-bootstrap-job.yaml"
 kubectl wait --for=condition=complete job/mongo-demo-bootstrap -n "$NS" --timeout=7200s
 
+echo "Waiting for Kafka Connect (MSSQL connector registration)..."
+kubectl rollout status deployment/kafka-connect -n "$NS" --timeout=600s
+
+echo "Applying MSSQL schema + connector registration Job..."
+kubectl delete job mssql-demo-bootstrap -n "$NS" --ignore-not-found=true
+kubectl apply -f "$GEN/62-mssql.yaml"
+kubectl wait --for=condition=complete job/mssql-demo-bootstrap -n "$NS" --timeout=3600s
+
 echo "Bootstrap jobs complete. kubectl get jobs -n $NS"

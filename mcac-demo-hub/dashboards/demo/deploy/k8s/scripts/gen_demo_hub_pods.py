@@ -6,10 +6,25 @@ For Deployments / StatefulSets / ConfigMaps aligned with docker-compose.yml, use
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _postgresql_image_from_generator() -> str:
+    """Same pin as gen_demo_hub_k8s.POSTGRESQL_IMAGE (Bitnami + repmgr)."""
+    path = Path(__file__).resolve().with_name("gen_demo_hub_k8s.py")
+    spec = importlib.util.spec_from_file_location("_gen_demo_hub_k8s", path)
+    mod = importlib.util.module_from_spec(spec)
+    loader = spec.loader
+    assert loader is not None
+    loader.exec_module(mod)
+    return str(mod.POSTGRESQL_IMAGE)
+
+
+POSTGRESQL_IMAGE = _postgresql_image_from_generator()
 OUT = ROOT / "pods"
 OUT_SVC = ROOT / "services"
 # Align with gen_demo_hub_k8s.hub_demo_ui (headless per-pod DNS for the driver).
@@ -30,9 +45,9 @@ SPECS: list[tuple[str, str, list[int], list[str] | None, list[str] | None]] = [
     ("stress", "thelastpickle/tlp-stress:latest", [9500], ["run", "KeyValue", "--rate", "30", "-d", "1d", "-r", ".8"], None),
     ("zookeeper", "confluentinc/cp-zookeeper:7.6.1", [2181], None, None),
     ("kafka", "confluentinc/cp-kafka:7.6.1", [9092, 29092], None, None),
-    ("postgresql-primary", "docker.io/bitnami/postgresql:latest", [5432], None, None),
-    ("postgresql-replica-1", "docker.io/bitnami/postgresql:latest", [5432], None, None),
-    ("postgresql-replica-2", "docker.io/bitnami/postgresql:latest", [5432], None, None),
+    ("postgresql-primary", POSTGRESQL_IMAGE, [5432], None, None),
+    ("postgresql-replica-1", POSTGRESQL_IMAGE, [5432], None, None),
+    ("postgresql-replica-2", POSTGRESQL_IMAGE, [5432], None, None),
     ("kafka-connect", "mcac-demo/kafka-connect:2.7.3-mongo-sink", [8083], None, None),
     ("kafka-connect-register", "alpine:3.19", [], ["sh", "-c", "echo use-Kubernetes-Job-for-one-shot"], None),
     ("postgres-exporter-primary", "prometheuscommunity/postgres-exporter:v0.17.1", [9187], None, None),
@@ -144,6 +159,9 @@ OPENSEARCH_ENV: list[tuple[str, str]] = [
     ("DISABLE_INSTALL_DEMO_CONFIG", "true"),
 ]
 
+# WAL archive is configured on PostgreSQL Deployments via conf.d (see gen_demo_hub_k8s.postgres_ha), not here —
+# POSTGRESQL_EXTRA_FLAGS is space-split by Bitnami and breaks archive_command.
+
 POSTGRES_PRIMARY_ENV: list[tuple[str, str]] = [
     ("POSTGRESQL_REPLICATION_MODE", "master"),
     ("POSTGRESQL_REPLICATION_USER", "replicator"),
@@ -151,6 +169,12 @@ POSTGRES_PRIMARY_ENV: list[tuple[str, str]] = [
     ("POSTGRESQL_USERNAME", "postgres"),
     ("POSTGRESQL_PASSWORD", "postgres"),
     ("POSTGRESQL_DATABASE", "demo"),
+    ("POSTGRESQL_SHARED_PRELOAD_LIBRARIES", "repmgr,pgaudit,pg_stat_statements"),
+    (
+        "POSTGRESQL_EXTRA_FLAGS",
+        "-c wal_level=logical -c max_replication_slots=8 -c max_wal_senders=8 "
+        "-c pg_stat_statements.max=10000 -c pg_stat_statements.track=all",
+    ),
 ]
 
 POSTGRES_REPLICA_ENV: list[tuple[str, str]] = [
@@ -159,6 +183,7 @@ POSTGRES_REPLICA_ENV: list[tuple[str, str]] = [
     ("POSTGRESQL_REPLICATION_PASSWORD", "replicatorpass"),
     ("POSTGRESQL_USERNAME", "postgres"),
     ("POSTGRESQL_PASSWORD", "postgres"),
+    ("POSTGRESQL_SHARED_PRELOAD_LIBRARIES", "repmgr,pgaudit,pg_stat_statements"),
 ]
 
 
@@ -234,7 +259,13 @@ def pod_yaml(
                 ("POSTGRESQL_MASTER_PORT_NUMBER", "5432"),
             ]
         )
-        env_pairs.append(("POSTGRESQL_EXTRA_FLAGS", "-c primary_slot_name=pgdemo_phys_replica_1"))
+        env_pairs.append(
+            (
+                "POSTGRESQL_EXTRA_FLAGS",
+                "-c wal_level=replica -c primary_slot_name=pgdemo_phys_replica_1 "
+                "-c pg_stat_statements.max=10000 -c pg_stat_statements.track=all",
+            )
+        )
     if name == "postgresql-replica-2":
         env_pairs.extend(POSTGRES_REPLICA_ENV)
         env_pairs.extend(
@@ -243,7 +274,13 @@ def pod_yaml(
                 ("POSTGRESQL_MASTER_PORT_NUMBER", "5432"),
             ]
         )
-        env_pairs.append(("POSTGRESQL_EXTRA_FLAGS", "-c primary_slot_name=pgdemo_phys_replica_2"))
+        env_pairs.append(
+            (
+                "POSTGRESQL_EXTRA_FLAGS",
+                "-c wal_level=replica -c primary_slot_name=pgdemo_phys_replica_2 "
+                "-c pg_stat_statements.max=10000 -c pg_stat_statements.track=all",
+            )
+        )
 
     if env_pairs:
         lines.extend(env_lines(env_pairs))

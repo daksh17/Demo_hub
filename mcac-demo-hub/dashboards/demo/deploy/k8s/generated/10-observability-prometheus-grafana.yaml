@@ -373,6 +373,24 @@ data:
               - opensearch-exporter:9114
             labels:
               os_cluster: demo
+
+      # SQL Server (awaragi/prometheus-mssql-exporter; one target per instance on demo_net)
+      - job_name: "mssql_demo"
+        scrape_interval: 30s
+        scrape_timeout: 25s
+        metrics_path: /metrics
+        scheme: http
+        static_configs:
+          - targets:
+              - mssql-exporter-publisher:4000
+            labels:
+              mssql_role: publisher
+              mssql_cluster: demo-hub
+          - targets:
+              - mssql-exporter-subscriber:4000
+            labels:
+              mssql_role: subscriber
+              mssql_cluster: demo-hub
 ---
 
 apiVersion: v1
@@ -5855,6 +5873,275 @@ data:
       "timezone": "browser",
       "title": "MongoDB tic/tac/toe sharded \u2014 detailed",
       "uid": "mongo-tictactoe-detailed",
+      "version": 1
+    }
+---
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-db-mssql-demo-overview-json
+  namespace: demo-hub
+  labels:
+    demo-hub.io/group: observability
+    app.kubernetes.io/part-of: demo-hub
+data:
+  mssql-demo-overview.json: |
+    {
+      "annotations": { "list": [] },
+      "description": "SQL Server 2022 demo instances (publisher + subscriber) via awaragi/prometheus-mssql-exporter. Job label mssql_demo; use legend for role (publisher vs subscriber).",
+      "editable": true,
+      "gnetId": null,
+      "graphTooltip": 1,
+      "hideControls": false,
+      "id": null,
+      "links": [],
+      "refresh": "30s",
+      "rows": [
+        {
+          "collapse": false,
+          "collapsed": false,
+          "height": "300px",
+          "panels": [
+            {
+              "aliasColors": {},
+              "bars": false,
+              "dashLength": 10,
+              "dashes": false,
+              "datasource": "$PROMETHEUS_DS",
+              "fill": 1,
+              "fillGradient": 0,
+              "gridPos": { "h": 8, "w": 8, "x": 0, "y": 0 },
+              "id": 701,
+              "legend": { "alignAsTable": true, "avg": false, "current": true, "max": true, "min": false, "show": true, "values": true },
+              "lines": true,
+              "linewidth": 1,
+              "nullPointMode": "null",
+              "percentage": false,
+              "pointradius": 2,
+              "points": false,
+              "renderer": "flot",
+              "seriesOverrides": [],
+              "spaceLength": 10,
+              "stack": false,
+              "steppedLine": false,
+              "targets": [
+                {
+                  "expr": "mssql_up{job=\"mssql_demo\"}",
+                  "format": "time_series",
+                  "intervalFactor": 2,
+                  "legendFormat": "{{mssql_role}} / {{instance}}",
+                  "refId": "A"
+                }
+              ],
+              "thresholds": [],
+              "title": "mssql_up (scrape health)",
+              "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+              "type": "graph",
+              "xaxis": { "mode": "time", "show": true, "values": [] },
+              "yaxes": [
+                { "format": "short", "logBase": 1, "max": 1, "min": 0, "show": true },
+                { "format": "short", "logBase": 1, "show": false }
+              ]
+            },
+            {
+              "aliasColors": {},
+              "bars": false,
+              "dashLength": 10,
+              "dashes": false,
+              "datasource": "$PROMETHEUS_DS",
+              "fill": 1,
+              "fillGradient": 0,
+              "gridPos": { "h": 8, "w": 8, "x": 8, "y": 0 },
+              "id": 702,
+              "legend": { "alignAsTable": true, "avg": false, "current": true, "max": true, "min": false, "show": true, "values": true },
+              "lines": true,
+              "linewidth": 1,
+              "nullPointMode": "null",
+              "percentage": false,
+              "pointradius": 2,
+              "points": false,
+              "renderer": "flot",
+              "seriesOverrides": [],
+              "spaceLength": 10,
+              "stack": false,
+              "steppedLine": false,
+              "targets": [
+                {
+                  "expr": "sum by (mssql_role, database, state) (mssql_connections{job=\"mssql_demo\"})",
+                  "format": "time_series",
+                  "intervalFactor": 2,
+                  "legendFormat": "{{mssql_role}} {{database}} {{state}}",
+                  "refId": "A"
+                }
+              ],
+              "thresholds": [],
+              "title": "Active connections (mssql_connections)",
+              "tooltip": { "shared": true, "sort": 2, "value_type": "individual" },
+              "type": "graph",
+              "xaxis": { "mode": "time", "show": true, "values": [] },
+              "yaxes": [
+                { "format": "short", "logBase": 1, "min": 0, "show": true },
+                { "format": "short", "logBase": 1, "show": false }
+              ]
+            },
+            {
+              "aliasColors": {},
+              "bars": false,
+              "dashLength": 10,
+              "dashes": false,
+              "datasource": "$PROMETHEUS_DS",
+              "fill": 1,
+              "fillGradient": 0,
+              "gridPos": { "h": 8, "w": 8, "x": 16, "y": 0 },
+              "id": 703,
+              "legend": { "alignAsTable": true, "avg": true, "current": true, "max": true, "min": false, "show": true, "values": true },
+              "lines": true,
+              "linewidth": 1,
+              "nullPointMode": "null",
+              "percentage": false,
+              "pointradius": 2,
+              "points": false,
+              "renderer": "flot",
+              "seriesOverrides": [],
+              "spaceLength": 10,
+              "stack": false,
+              "steppedLine": false,
+              "targets": [
+                {
+                  "expr": "mssql_batch_requests{job=\"mssql_demo\"}",
+                  "format": "time_series",
+                  "intervalFactor": 2,
+                  "legendFormat": "{{mssql_role}} batch req / s (exporter)",
+                  "refId": "A"
+                }
+              ],
+              "thresholds": [],
+              "title": "Batch requests / sec (rate)",
+              "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+              "type": "graph",
+              "xaxis": { "mode": "time", "show": true, "values": [] },
+              "yaxes": [
+                { "format": "short", "logBase": 1, "min": 0, "show": true },
+                { "format": "short", "logBase": 1, "show": false }
+              ]
+            },
+            {
+              "aliasColors": {},
+              "bars": false,
+              "dashLength": 10,
+              "dashes": false,
+              "datasource": "$PROMETHEUS_DS",
+              "fill": 1,
+              "fillGradient": 0,
+              "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+              "id": 704,
+              "legend": { "alignAsTable": true, "avg": false, "current": true, "max": true, "min": false, "show": true, "values": true },
+              "lines": true,
+              "linewidth": 1,
+              "nullPointMode": "null",
+              "percentage": false,
+              "pointradius": 2,
+              "points": false,
+              "renderer": "flot",
+              "seriesOverrides": [],
+              "spaceLength": 10,
+              "stack": false,
+              "steppedLine": false,
+              "targets": [
+                {
+                  "expr": "mssql_memory_utilization_percentage{job=\"mssql_demo\"}",
+                  "format": "time_series",
+                  "intervalFactor": 2,
+                  "legendFormat": "{{mssql_role}} memory %",
+                  "refId": "A"
+                }
+              ],
+              "thresholds": [],
+              "title": "SQL Server memory utilization %",
+              "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+              "type": "graph",
+              "xaxis": { "mode": "time", "show": true, "values": [] },
+              "yaxes": [
+                { "format": "percent", "logBase": 1, "max": 100, "min": 0, "show": true },
+                { "format": "short", "logBase": 1, "show": false }
+              ]
+            },
+            {
+              "aliasColors": {},
+              "bars": false,
+              "dashLength": 10,
+              "dashes": false,
+              "datasource": "$PROMETHEUS_DS",
+              "fill": 1,
+              "fillGradient": 0,
+              "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+              "id": 705,
+              "legend": { "alignAsTable": true, "avg": false, "current": true, "max": true, "min": false, "show": true, "values": true },
+              "lines": true,
+              "linewidth": 1,
+              "nullPointMode": "null",
+              "percentage": false,
+              "pointradius": 2,
+              "points": false,
+              "renderer": "flot",
+              "seriesOverrides": [],
+              "spaceLength": 10,
+              "stack": false,
+              "steppedLine": false,
+              "targets": [
+                {
+                  "expr": "mssql_page_life_expectancy{job=\"mssql_demo\"}",
+                  "format": "time_series",
+                  "intervalFactor": 2,
+                  "legendFormat": "{{mssql_role}} PLE (s)",
+                  "refId": "A"
+                }
+              ],
+              "thresholds": [],
+              "title": "Buffer pool page life expectancy",
+              "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+              "type": "graph",
+              "xaxis": { "mode": "time", "show": true, "values": [] },
+              "yaxes": [
+                { "format": "short", "logBase": 1, "min": 0, "show": true },
+                { "format": "short", "logBase": 1, "show": true }
+              ]
+            }
+          ],
+          "repeat": null,
+          "showTitle": true,
+          "title": "SQL Server (demo hub, prometheus-mssql-exporter)",
+          "titleSize": "h6",
+          "type": "row"
+        }
+      ],
+      "schemaVersion": 14,
+      "style": "dark",
+      "tags": ["mssql", "sql-server", "demo"],
+      "templating": {
+        "list": [
+          {
+            "current": { "text": "prometheus", "value": "prometheus" },
+            "hide": 2,
+            "label": null,
+            "name": "PROMETHEUS_DS",
+            "options": [],
+            "query": "prometheus",
+            "refresh": 1,
+            "regex": "",
+            "type": "datasource"
+          }
+        ]
+      },
+      "time": { "from": "now-1h", "to": "now" },
+      "timepicker": {
+        "refresh_intervals": ["5s", "10s", "30s", "1m", "5m", "15m", "30m", "1h"],
+        "time_options": ["5m", "15m", "1h", "6h", "12h", "24h"]
+      },
+      "timezone": "browser",
+      "title": "SQL Server (demo hub)",
+      "uid": "demo-mssql",
       "version": 1
     }
 ---
@@ -16424,6 +16711,11 @@ spec:
                   items:
                     - key: "mongodb-tictactoe-detailed.json"
                       path: "mongodb-tictactoe-detailed.json"
+              - configMap:
+                  name: grafana-db-mssql-demo-overview-json
+                  items:
+                    - key: "mssql-demo-overview.json"
+                      path: "mssql-demo-overview.json"
               - configMap:
                   name: grafana-db-opensearch-demo-overview-json
                   items:

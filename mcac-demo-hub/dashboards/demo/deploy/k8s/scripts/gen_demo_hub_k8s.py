@@ -40,6 +40,9 @@ SK_REDIS_PASSWORD = "redis-password"
 SK_DEMO_USER_PASSWORD = "demo-user-password"
 SK_HUB_POSTGRES_DSN = "hub-postgres-dsn"
 SK_HUB_REDIS_URL = "hub-redis-url"
+SK_MSSQL_SA_PASSWORD = "mssql-sa-password"
+MSSQL_SERVER_IMAGE = "mcr.microsoft.com/mssql/server:2022-CU14-ubuntu-22.04"
+MSSQL_TOOLS_IMAGE = "mcac-demo/mssql-tools:22.04"
 # Vault: dev in-memory server (demo only — not HA, data lost on pod restart). See deploy/k8s/README.md.
 VAULT_IMAGE = "hashicorp/vault:1.15.6"
 VAULT_DEV_ROOT_TOKEN = "demo-hub-dev-root"
@@ -144,11 +147,17 @@ def batch_job(
     mount_path: str = "/scripts",
     ttl_seconds: int = 86400,
     active_deadline_seconds: int | None = 7200,
+    env_pairs: list[tuple[str, str]] | None = None,
+    env_secret_refs: list[tuple[str, str, str]] | None = None,
+    image_pull_policy: str = "IfNotPresent",
 ) -> str:
     cmd = "\n".join(f"            - {jdump(c)}" for c in command)
     deadline = ""
     if active_deadline_seconds is not None:
         deadline = f"  activeDeadlineSeconds: {active_deadline_seconds}\n"
+    env_blk = ""
+    if env_pairs or env_secret_refs:
+        env_blk = env_lines(env_pairs or [], env_secret_refs)
     return f"""apiVersion: batch/v1
 kind: Job
 metadata:
@@ -170,10 +179,10 @@ spec:
       containers:
         - name: run
           image: {image}
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: {image_pull_policy}
           command:
 {cmd}
-          volumeMounts:
+{env_blk}          volumeMounts:
             - name: scripts
               mountPath: {mount_path}
               readOnly: true
@@ -274,6 +283,7 @@ def _hub_wait_upstream() -> str:
     # The ClusterIP Service name "cassandra" can lag or not match nc expectations on some CNIs.
     cs0 = f"cassandra-0.cassandra-headless.{NS}.svc.cluster.local"
     rd = fqdn_service("redis")
+    ms = fqdn_service("mssql-publisher")
     return f"""      initContainers:
         - name: wait-hub-deps
           image: alpine:3.19
@@ -288,17 +298,18 @@ def _hub_wait_upstream() -> str:
                   && nc -z -w 3 {oh} 9200 2>/dev/null \\
                   && nc -z -w 3 {pg} 5432 2>/dev/null \\
                   && nc -z -w 3 {cs0} 9042 2>/dev/null \\
-                  && nc -z -w 3 {rd} 6379 2>/dev/null; then
+                  && nc -z -w 3 {rd} 6379 2>/dev/null \\
+                  && nc -z -w 3 {ms} 1433 2>/dev/null; then
                   echo "wait-hub-deps: all upstream TCP checks OK (attempt $i)" >&2
                   exit 0
                 fi
                 if [ $((i % 15)) -eq 0 ]; then
-                  echo "wait-hub-deps: attempt $i/200 — kafka:9092=$(p {kh} 9092) opensearch:9200=$(p {oh} 9200) postgres:5432=$(p {pg} 5432) cassandra-0:9042=$(p {cs0} 9042) redis:6379=$(p {rd} 6379) (mongos not gated)" >&2
+                  echo "wait-hub-deps: attempt $i/200 — kafka:9092=$(p {kh} 9092) opensearch:9200=$(p {oh} 9200) postgres:5432=$(p {pg} 5432) cassandra-0:9042=$(p {cs0} 9042) redis:6379=$(p {rd} 6379) mssql-publisher:1433=$(p {ms} 1433) (mongos not gated)" >&2
                 fi
                 sleep 2
               done
               echo "timeout waiting for kafka:9092, opensearch:9200, postgresql-primary:5432," >&2
-              echo "  cassandra-0:9042 (headless), redis:6379" >&2
+              echo "  cassandra-0:9042 (headless), redis:6379, mssql-publisher:1433" >&2
               exit 1
 """
 
@@ -412,6 +423,7 @@ def demo_hub_secret_stringdata() -> dict[str, str]:
         SK_DEMO_USER_PASSWORD: "demopass",
         SK_HUB_POSTGRES_DSN: "postgresql://demo:demopass@postgresql-primary:5432/demo",
         SK_HUB_REDIS_URL: "redis://:demoredispass@redis:6379/0",
+        SK_MSSQL_SA_PASSWORD: "Demo_hub_Mssql_2025!",
     }
 
 
@@ -1748,6 +1760,136 @@ echo "mongo sharded bootstrap done."
     return join_docs(cm, job)
 
 
+def _mssql_wait_server(svc_short: str) -> str:
+    host = fqdn_service(svc_short)
+    return f"""      initContainers:
+        - name: wait-mssql
+          image: alpine:3.19
+          command:
+            - /bin/sh
+            - -c
+            - |
+              apk add --no-cache netcat-openbsd >/dev/null
+              for i in $(seq 1 150); do
+                if nc -z -w 2 {host} 1433 2>/dev/null; then exit 0; fi
+                sleep 2
+              done
+              echo "timeout waiting for {host}:1433" >&2
+              exit 1
+"""
+
+
+def mssql_server(name: str) -> str:
+    return deployment(
+        name,
+        "mssql",
+        MSSQL_SERVER_IMAGE,
+        1,
+        [(1433, "mssql")],
+        [
+            ("ACCEPT_EULA", "Y"),
+            ("MSSQL_PID", "Developer"),
+            ("MSSQL_AGENT_ENABLED", "true"),
+        ],
+        env_secret_refs=[("MSSQL_SA_PASSWORD", SECRET_NAME, SK_MSSQL_SA_PASSWORD)],
+        data_mount="/var/opt/mssql",
+        fs_group=10001,
+        readiness_probe=tcp_readiness_probe(1433, initial_delay=45, period=8, failure_threshold=30),
+        resources="""          resources:
+            requests:
+              memory: "2Gi"
+            limits:
+              memory: "4Gi"
+""",
+    )
+
+
+def mssql_exporter(dep_name: str, server_svc: str) -> str:
+    return deployment(
+        dep_name,
+        "mssql",
+        "awaragi/prometheus-mssql-exporter:latest",
+        1,
+        [(4000, "metrics")],
+        [
+            ("SERVER", server_svc),
+            ("PORT", "1433"),
+            ("USERNAME", "sa"),
+            ("ENCRYPT", "true"),
+            ("TRUST_SERVER_CERTIFICATE", "true"),
+        ],
+        env_secret_refs=[("PASSWORD", SECRET_NAME, SK_MSSQL_SA_PASSWORD)],
+        init_before_containers=_mssql_wait_server(server_svc),
+        strategy_recreate=True,
+    )
+
+
+def mssql_scripts_and_bootstrap_job() -> str:
+    pub = read_repo("mssql-kafka/init-publisher.sh") or 'echo "missing init-publisher.sh"; exit 1\n'
+    sub = read_repo("mssql-kafka/init-subscriber.sh") or 'echo "missing init-subscriber.sh"; exit 1\n'
+    repl = read_repo("mssql-kafka/try-replication-bootstrap.sh") or "exit 0\n"
+    reg = read_repo("mssql-kafka/register-mssql-connectors.sh") or 'echo "missing register-mssql-connectors.sh"; exit 1\n'
+    sql_pub = read_repo("mssql-kafka/01-publisher-schema.sql") or ""
+    sql_sub = read_repo("mssql-kafka/02-subscriber-schema.sql") or ""
+    sql_repl = read_repo("mssql-kafka/05-transactional-replication-bootstrap.sql") or ""
+    chain = """#!/usr/bin/env bash
+set -euo pipefail
+export MSSQL_SA_PASSWORD="${MSSQL_SA_PASSWORD:?}"
+bash /scripts/init-publisher.sh
+bash /scripts/init-subscriber.sh
+bash /scripts/try-replication-bootstrap.sh
+for i in $(seq 1 180); do
+  if curl -sf "http://kafka-connect:8083/connectors" >/dev/null 2>&1; then
+    echo "kafka-connect ready (attempt $i)" >&2
+    break
+  fi
+  sleep 2
+  if [[ "$i" -eq 180 ]]; then
+    echo "timeout waiting for kafka-connect:8083" >&2
+    exit 1
+  fi
+done
+export SCHEMA_HISTORY_KAFKA_BOOTSTRAP="${SCHEMA_HISTORY_KAFKA_BOOTSTRAP:-kafka:9092}"
+exec bash /scripts/register-mssql-connectors.sh "http://kafka-connect:8083"
+"""
+    cm = configmap(
+        "mssql-kafka-scripts",
+        "mssql",
+        {
+            "chain.sh": chain,
+            "init-publisher.sh": pub,
+            "init-subscriber.sh": sub,
+            "try-replication-bootstrap.sh": repl,
+            "register-mssql-connectors.sh": reg,
+            "01-publisher-schema.sql": sql_pub,
+            "02-subscriber-schema.sql": sql_sub,
+            "05-transactional-replication-bootstrap.sql": sql_repl,
+        },
+    )
+    job = batch_job(
+        "mssql-demo-bootstrap",
+        "mssql",
+        MSSQL_TOOLS_IMAGE,
+        ["/bin/bash", "/scripts/chain.sh"],
+        "mssql-kafka-scripts",
+        active_deadline_seconds=3600,
+        env_secret_refs=[("MSSQL_SA_PASSWORD", SECRET_NAME, SK_MSSQL_SA_PASSWORD)],
+        # Local-only image (build-mssql-tools-image.sh). Never avoids useless pulls from a registry.
+        image_pull_policy="Never",
+    )
+    return join_docs(cm, job)
+
+
+def mssql_stack() -> str:
+    return join_docs(
+        mssql_server("mssql-publisher"),
+        mssql_server("mssql-subscriber"),
+        mssql_exporter("mssql-exporter-publisher", "mssql-publisher"),
+        mssql_exporter("mssql-exporter-subscriber", "mssql-subscriber"),
+        mssql_scripts_and_bootstrap_job(),
+    )
+
+
 def kafka_connect() -> str:
     env = [
         ("BOOTSTRAP_SERVERS", "kafka:9092"),
@@ -1859,12 +2001,17 @@ def hub_demo_ui() -> str:
             ("CASSANDRA_WORKLOAD_REQUEST_TIMEOUT_SECONDS", "300"),
             ("CASSANDRA_WORKLOAD_INTER_BATCH_SLEEP_MS", "25"),
             ("CASSANDRA_WORKLOAD_WRITE_RETRIES", "3"),
+            ("MSSQL_HOST", "mssql-publisher"),
+            ("MSSQL_USER", "sa"),
+            ("MSSQL_DATABASE", "demo"),
+            ("MSSQL_ENCRYPT", "off"),
         ],
         init_before_containers=_hub_wait_upstream(),
         strategy_recreate=True,
         env_secret_refs=[
             ("POSTGRES_DSN", SECRET_NAME, SK_HUB_POSTGRES_DSN),
             ("REDIS_URL", SECRET_NAME, SK_HUB_REDIS_URL),
+            ("MSSQL_SA_PASSWORD", SECRET_NAME, SK_MSSQL_SA_PASSWORD),
         ],
     )
 
@@ -1880,10 +2027,11 @@ Generated Jobs (apply **after** workloads are running):
 | **postgres-demo-bootstrap** | Debezium user/table/publication + physical replication slots + scenario schema (mirrors `postgres-kafka/*.sql` init). |
 | **cassandra-demo-schema** | `demo_hub` keyspace with **RF=3** + placeholder table (ring replication). |
 | **mongo-demo-bootstrap** | Config RS → shard RS → addShard → sharded collections (mirrors `mongo-sharded/*.sh` + `prepare-demo-collections.sh`). |
+| **mssql-demo-bootstrap** | Publisher + subscriber schema (`sqlcmd`), optional replication try, then **register-mssql-connectors.sh** against **kafka-connect:8083** (needs Connect rollout first — see `apply-data-bootstrap.sh`). |
 
 Re-run: `kubectl delete job -n {NS} <name>` then `kubectl apply -f …` again.
 
-Not generated here: **kafka-connect-register** (use host script against `kafka-connect:8083`). MCAC agent JAR is populated by StatefulSet **initContainer** (`mcac-copy-agent`); build **`mcac-demo/mcac-init:local`** from the repo-root **Dockerfile** (`deploy/k8s/scripts/build-mcac-init-image.sh`).
+Not generated here: **postgres/mongo kafka-connect-register** beyond MSSQL (use host scripts against `kafka-connect:8083` if needed). MCAC agent JAR is populated by StatefulSet **initContainer** (`mcac-copy-agent`); build **`mcac-demo/mcac-init:local`** from the repo-root **Dockerfile** (`deploy/k8s/scripts/build-mcac-init-image.sh`).
 
 See **../scripts/apply-data-bootstrap.sh**.
 """
@@ -1909,6 +2057,7 @@ def main() -> None:
         ("50-redis.yaml", redis_stack()),
         ("60-mongo-sharded.yaml", mongo_sharded_all_deployments()),
         ("61-mongo-bootstrap-job.yaml", mongo_sharded_scripts_and_jobs()),
+        ("62-mssql.yaml", mssql_stack()),
         ("70-kafka-connect.yaml", kafka_connect()),
         ("80-exporters.yaml", exporters()),
         ("90-opensearch.yaml", opensearch_stack()),

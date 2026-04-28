@@ -1,9 +1,10 @@
-%% End-to-end sequence: one "order" touches Postgres, Mongo, Kafka, Cassandra, Redis, OpenSearch
+%% End-to-end sequence: one order + optional SQL Server scenario path
 sequenceDiagram
   autonumber
   participant App as API / worker
   participant PG as Postgres primary
   participant M as Mongos
+  participant MSSQL as SQL Server publisher
   participant Connect as Kafka Connect
   participant K as Kafka
   participant C as Cassandra
@@ -19,11 +20,17 @@ sequenceDiagram
   App->>M: update catalog collection (e.g. sku stockByWarehouse)
   M-->>App: OK
 
+  Note over App, MSSQL: Step B2 — scenario hub only MERGE catalog mirror
+  App->>MSSQL: MERGE dbo.scenario_catalog_mirror_mssql
+  MSSQL-->>App: OK
+
   Note over PG, K: Step C — CDC to Kafka (Debezium sources)
   PG--)Connect: logical replication / WAL events
   Connect->>K: produce demopg.public.*
   M--)Connect: change streams via mongos
   Connect->>K: produce demomongo.demo.*
+  MSSQL--)Connect: CDC on mirror table
+  Connect->>K: produce demomssql.dbo.*
 
   Note over App, K: Step D — fan-out (your microservices or Flink-style jobs)
   K--)App: consume order + catalog topics

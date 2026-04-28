@@ -1,10 +1,18 @@
-# Debezium Connect 2.7 + MongoDB Kafka sink (fat JAR from Maven Central).
+# Debezium Connect 2.7 + MongoDB Kafka sink + SQL Server source plugin + JDBC driver for sink dialect.
 FROM quay.io/debezium/connect:2.7.3.Final
 USER root:root
 RUN microdnf -y install vim-minimal && microdnf clean all
 ARG MKC_VERSION=1.14.1
+ARG DEBZ_SQLSERVER=2.7.3.Final
+ARG MSSQL_JDBC=12.6.1.jre11
 RUN mkdir -p /kafka/connect/mongodb-kafka-connect \
     && curl -fsSL \
       "https://repo1.maven.org/maven2/org/mongodb/kafka/mongo-kafka-connect/${MKC_VERSION}/mongo-kafka-connect-${MKC_VERSION}-all.jar" \
-      -o /kafka/connect/mongodb-kafka-connect/mongo-kafka-connect-all.jar
+      -o /kafka/connect/mongodb-kafka-connect/mongo-kafka-connect-all.jar \
+    && curl -fsSL \
+      "https://repo1.maven.org/maven2/io/debezium/debezium-connector-sqlserver/${DEBZ_SQLSERVER}/debezium-connector-sqlserver-${DEBZ_SQLSERVER}-plugin.tar.gz" \
+      | tar -xz -C /kafka/connect \
+    && curl -fsSL \
+      "https://repo1.maven.org/maven2/com/microsoft/sqlserver/mssql-jdbc/${MSSQL_JDBC}/mssql-jdbc-${MSSQL_JDBC}.jar" \
+      -o /kafka/libs/mssql-jdbc.jar
 USER kafka:kafka

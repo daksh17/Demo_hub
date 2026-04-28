@@ -108,8 +108,8 @@ echo "Removing stray ${COMPOSE_PROJECT_NAME}-* containers (orphans / failed part
 _remove_stray_containers
 echo "Cleanup finished."
 
-echo "Building mcac (agent into volume), kafka-connect (Mongo sink), and hub-demo-ui..."
-docker compose build mcac kafka-connect hub-demo-ui
+echo "Building mcac (agent into volume), kafka-connect (Mongo sink), hub-demo-ui, and postgresql-repmgr..."
+docker compose build mcac kafka-connect hub-demo-ui postgresql-primary
 
 echo "Starting all services (this may take several minutes)..."
 # Re-run stray cleanup after build (long gap: other terminals / half-dead orphans can race names).

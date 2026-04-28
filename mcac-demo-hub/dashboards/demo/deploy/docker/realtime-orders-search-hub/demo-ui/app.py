@@ -3,6 +3,8 @@ Browser UI + API: single-order ingest and configurable multi-DB workload generat
 """
 import json
 import os
+import secrets
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -14,12 +16,44 @@ import psycopg
 import redis
 from cassandra.cluster import Cluster, UnresolvableContactPoints
 from cassandra.query import BatchStatement, ConsistencyLevel
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pymongo import MongoClient
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.sessions import SessionMiddleware
 
 import scenario
+from hub_config import (
+    SK_CASSANDRA_HOSTS,
+    SK_CASSANDRA_KEYSPACE,
+    SK_MONGO_URI,
+    SK_OS_INDEX,
+    SK_OS_URL,
+    SK_OS_WORKLOAD_INDEX,
+    SK_POSTGRES_DSN,
+    SK_REDIS_URL,
+    SK_SCENARIO_OS_INDEX,
+    env_base_config,
+    get_runtime_config,
+    keyspace_valid,
+    mask_connection_hint,
+    reset_runtime_config_token,
+    runtime_config_from_request_session,
+    set_runtime_config_token,
+)
+
+_CONNECTION_SESSION_KEYS: tuple[tuple[str, str], ...] = (
+    ("postgres_dsn", SK_POSTGRES_DSN),
+    ("mongo_uri", SK_MONGO_URI),
+    ("redis_url", SK_REDIS_URL),
+    ("opensearch_url", SK_OS_URL),
+    ("cassandra_hosts", SK_CASSANDRA_HOSTS),
+    ("cassandra_keyspace", SK_CASSANDRA_KEYSPACE),
+    ("opensearch_index", SK_OS_INDEX),
+    ("opensearch_workload_index", SK_OS_WORKLOAD_INDEX),
+    ("scenario_opensearch_index", SK_SCENARIO_OS_INDEX),
+)
 
 WORKLOAD_SUSTAIN_MAX_SECONDS = int(
     os.environ.get("WORKLOAD_SUSTAIN_MAX_SECONDS", str(9 * 3600))
@@ -35,23 +69,10 @@ WORKLOAD_SUSTAIN_NOMINAL_CAP_MB = int(
     os.environ.get("WORKLOAD_SUSTAIN_NOMINAL_CAP_MB", str(50_000_000))
 )
 
-PG_DSN = os.environ.get(
-    "POSTGRES_DSN",
-    "postgresql://demo:demopass@postgresql-primary:5432/demo",
-)
-MONGO_URI = os.environ.get("MONGO_URI", "mongodb://mongo-mongos1:27017")
-REDIS_URL = os.environ.get("REDIS_URL", "redis://:demoredispass@redis:6379/0")
-def _cassandra_contact_points() -> list[str]:
-    # If CASSANDRA_HOSTS is set to "" in the environment, get() still returns "" — treat as unset.
-    raw = os.environ.get("CASSANDRA_HOSTS", "cassandra")
-    if not (raw or "").strip():
-        raw = "cassandra"
-    return [h.strip() for h in raw.split(",") if h.strip()]
-
-
-def _connect_cassandra_cluster():
+def _connect_cassandra_cluster(hosts: list[str] | None = None):
     """Create Cluster + Session; retry while the ring is still opening CQL (common on K8s)."""
-    hosts = _cassandra_contact_points()
+    if hosts is None:
+        hosts = list(env_base_config().cassandra_hosts)
     if not hosts:
         raise ValueError(
             "CASSANDRA_HOSTS has no hostnames after parsing. "
@@ -98,11 +119,7 @@ CASSANDRA_WORKLOAD_INTER_BATCH_SLEEP_MS = float(
 CASSANDRA_WORKLOAD_WRITE_RETRIES = int(
     os.environ.get("CASSANDRA_WORKLOAD_WRITE_RETRIES", "2")
 )
-OPENSEARCH_URL = os.environ.get("OPENSEARCH_URL", "http://opensearch:9200").rstrip("/")
-HUB_KEYSPACE = os.environ.get("CASSANDRA_KEYSPACE", "demo_hub")
-OS_INDEX = os.environ.get("OPENSEARCH_INDEX", "hub-orders")
 WORKLOAD_REDIS_PREFIX = os.environ.get("WORKLOAD_REDIS_PREFIX", "hub:wl:")
-OS_WORKLOAD_INDEX = os.environ.get("OPENSEARCH_WORKLOAD_INDEX", "hub-workload")
 # OpenSearch default http.max_content_length is often 100 MiB; stay under to avoid HTTP 413 on /_bulk.
 OPENSEARCH_BULK_MAX_BYTES = int(
     os.environ.get("OPENSEARCH_BULK_MAX_BYTES", str(48 * 1024 * 1024))
@@ -123,7 +140,9 @@ WORKLOAD_READ_PARALLEL_MAX = max(
 _cassandra_session = None
 _cassandra_insert_prep = None
 
-ALLOWED_TARGETS = frozenset({"postgres", "mongo", "redis", "cassandra", "opensearch"})
+ALLOWED_TARGETS = frozenset(
+    {"postgres", "mongo", "redis", "cassandra", "opensearch", "mssql"}
+)
 
 
 def _make_pad(payload_kb: int) -> str:
@@ -173,14 +192,14 @@ def _opensearch_bulk_chunk_size(pad: str, requested_bs: int) -> int:
     return max(1, min(requested_bs, cap))
 
 
-def _ensure_cassandra_schema(session):
+def _ensure_cassandra_schema(session, keyspace: str) -> None:
     session.execute(
         f"""
-        CREATE KEYSPACE IF NOT EXISTS {HUB_KEYSPACE}
+        CREATE KEYSPACE IF NOT EXISTS {keyspace}
         WITH replication = {{'class': 'SimpleStrategy', 'replication_factor': 1}}
         """
     )
-    session.set_keyspace(HUB_KEYSPACE)
+    session.set_keyspace(keyspace)
     session.execute(
         """
         CREATE TABLE IF NOT EXISTS orders (
@@ -192,10 +211,10 @@ def _ensure_cassandra_schema(session):
     )
 
 
-def _ensure_opensearch_index(client: httpx.Client) -> None:
+def _ensure_opensearch_index(client: httpx.Client, cfg) -> None:
     specs = [
         (
-            OS_INDEX,
+            cfg.opensearch_index,
             {
                 "mappings": {
                     "properties": {
@@ -208,7 +227,7 @@ def _ensure_opensearch_index(client: httpx.Client) -> None:
             },
         ),
         (
-            OS_WORKLOAD_INDEX,
+            cfg.opensearch_workload_index,
             {
                 "mappings": {
                     "properties": {
@@ -222,41 +241,119 @@ def _ensure_opensearch_index(client: httpx.Client) -> None:
         ),
     ]
     for idx, body in specs:
-        r = client.head(f"{OPENSEARCH_URL}/{idx}")
+        r = client.head(f"{cfg.opensearch_url}/{idx}")
         if r.status_code == 200:
             continue
-        r = client.put(f"{OPENSEARCH_URL}/{idx}", json=body)
+        r = client.put(f"{cfg.opensearch_url}/{idx}", json=body)
         if r.status_code not in (200, 201):
             raise RuntimeError(f"OpenSearch create index {idx}: {r.status_code} {r.text}")
+
+
+_os_index_bootstrapped: set[str] = set()
+
+
+def _ensure_hub_opensearch_for_cfg(client: httpx.Client, cfg) -> None:
+    k = f"{cfg.opensearch_url}\0{cfg.opensearch_index}\0{cfg.opensearch_workload_index}"
+    if k in _os_index_bootstrapped:
+        return
+    _ensure_opensearch_index(client, cfg)
+    _os_index_bootstrapped.add(k)
+
+
+_cass_override_lock = threading.Lock()
+_cass_override: dict[str, tuple[Cluster, object, object]] = {}
+
+
+def _cass_override_key(cfg) -> str:
+    return ",".join(cfg.cassandra_hosts) + "#" + cfg.cassandra_keyspace
+
+
+def get_hub_cassandra_handles(cfg):
+    """Return (session, prepared_insert) for hub orders table; uses env cluster when unmodified."""
+    boot = env_base_config()
+    if cfg.is_default_cassandra(boot):
+        return _cassandra_session, _cassandra_insert_prep
+    key = _cass_override_key(cfg)
+    with _cass_override_lock:
+        if key not in _cass_override:
+            cluster, sess = _connect_cassandra_cluster(list(cfg.cassandra_hosts))
+            _ensure_cassandra_schema(sess, cfg.cassandra_keyspace)
+            scenario.ensure_cassandra_scenario_schema(
+                sess, cfg.cassandra_keyspace
+            )
+            prep = sess.prepare(
+                f"INSERT INTO {cfg.cassandra_keyspace}.orders "
+                "(order_id, label, created_at) VALUES (?, ?, ?)"
+            )
+            _cass_override[key] = (cluster, sess, prep)
+        _cluster, sess, prep = _cass_override[key]
+    return sess, prep
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _cassandra_session, _cassandra_insert_prep
-    cluster, _cassandra_session = _connect_cassandra_cluster()
+    boot = env_base_config()
+    cluster, _cassandra_session = _connect_cassandra_cluster(
+        list(boot.cassandra_hosts)
+    )
     try:
-        _ensure_cassandra_schema(_cassandra_session)
+        _ensure_cassandra_schema(_cassandra_session, boot.cassandra_keyspace)
         _cassandra_insert_prep = _cassandra_session.prepare(
-            f"INSERT INTO {HUB_KEYSPACE}.orders (order_id, label, created_at) VALUES (?, ?, ?)"
+            f"INSERT INTO {boot.cassandra_keyspace}.orders "
+            "(order_id, label, created_at) VALUES (?, ?, ?)"
         )
-        scenario.ensure_cassandra_scenario_schema(_cassandra_session)
-        with psycopg.connect(PG_DSN) as conn:
+        scenario.ensure_cassandra_scenario_schema(
+            _cassandra_session, boot.cassandra_keyspace
+        )
+        with psycopg.connect(boot.postgres_dsn) as conn:
             scenario.ensure_postgres_scenario_schema(conn)
             conn.commit()
         with httpx.Client(timeout=120.0) as hc:
-            _ensure_opensearch_index(hc)
+            _ensure_opensearch_index(hc, boot)
             scenario.ensure_scenario_os_index(hc)
         yield
     finally:
         cluster.shutdown()
+        for cl, _s, _p in _cass_override.values():
+            try:
+                cl.shutdown()
+            except Exception:
+                pass
+        _cass_override.clear()
 
 
 app = FastAPI(title="Realtime hub demo UI", lifespan=lifespan)
 
+
+class HubRuntimeConfigMiddleware(BaseHTTPMiddleware):
+    """Runs *inside* SessionMiddleware so ``request.session`` is available."""
+
+    async def dispatch(self, request: Request, call_next):
+        rt = runtime_config_from_request_session(dict(request.session))
+        tok = set_runtime_config_token(rt)
+        try:
+            return await call_next(request)
+        finally:
+            reset_runtime_config_token(tok)
+
+
+_SESSION_SECRET = os.environ.get("HUB_SESSION_SECRET", "").strip() or secrets.token_hex(32)
+# Starlette inserts each add_middleware at index 0: register Hub first, then Session so
+# the stack is Session(Hub(app)) — session cookie is parsed before Hub runs.
+app.add_middleware(HubRuntimeConfigMiddleware)
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=_SESSION_SECRET,
+    max_age=14 * 24 * 3600,
+    same_site="lax",
+)
+
 NAV = """
   <nav style="margin-bottom:1rem;font-size:0.95rem;">
     <a href="/">Single order</a> · <a href="/workload">Workload</a> ·
-    <a href="/reads">Read-back</a> · <a href="/scenario">Scenario</a>
+    <a href="/reads">Read-back</a> · <a href="/scenario">Scenario</a> ·
+    <a href="/connections">External DBs</a>
   </nav>
 """
 
@@ -369,7 +466,7 @@ WORKLOAD_PAGE = f"""<!DOCTYPE html>
   <h1>Workload generator</h1>
   <p>Writes synthetic rows in <strong>batches</strong>. <strong>Payload block size (KB)</strong> repeats filler bytes per record (larger = heavier writes).
     <strong>Postgres</strong> stores the pad inside <code>demo_items.name</code> with a <strong>CDC‑safe max length</strong> (default 16&nbsp;KiB; override <code>POSTGRES_WORKLOAD_NAME_MAX_CHARS</code>) so Debezium snapshot does not OOM Kafka Connect on huge pads.     <strong>Cassandra</strong> puts the pad in <code>label</code> (truncated); each batch row count is <strong>capped automatically</strong> so size stays under Cassandra&apos;s limit (prevents <code>Batch too large</code>). Sustained + large payloads can overload demo nodes (coordinator timeout / code 1100)—raise <code>CASSANDRA_WORKLOAD_REQUEST_TIMEOUT_SECONDS</code>, set <code>CASSANDRA_WORKLOAD_INTER_BATCH_SLEEP_MS</code> (e.g. 15–40), or lower payload / sustain duration.
-    OpenSearch uses index <code>hub-workload</code>. REST: <code>http://localhost:9200</code>, Dashboards: <code>http://localhost:5601</code>. Grafana: separate dashboards per subsystem (Mongo, Redis, Kafka, Cassandra, …).</p>
+    OpenSearch uses index <code>hub-workload</code>. <strong>SQL Server</strong> (when <code>MSSQL_HOST</code> is set on the hub) inserts into <code>demo.dbo.hub_workload_mssql</code> on the <strong>publisher</strong> — same <code>wl-&lt;run_id&gt;-&lt;seq&gt;</code> naming; not enabled for CDC (keeps Debezium topics focused on the catalog mirror). REST: <code>http://localhost:9200</code>, Dashboards: <code>http://localhost:5601</code>. Grafana: <strong>SQL Server (demo hub)</strong> dashboard (awaragi exporter) plus Mongo, Redis, Kafka, Cassandra, ….</p>
   <form id="f">
     <label>Total records (1–100000)</label>
     <input type="number" name="total_records" value="200" min="1" max="100000"/>
@@ -401,6 +498,7 @@ WORKLOAD_PAGE = f"""<!DOCTYPE html>
       <label><input type="checkbox" name="tg" value="redis" checked /> Redis keys <code>hub:wl:*</code></label>
       <label><input type="checkbox" name="tg" value="cassandra" checked /> Cassandra <code>demo_hub.orders</code></label>
       <label><input type="checkbox" name="tg" value="opensearch" checked /> OpenSearch <code>hub-workload</code></label>
+      <label><input type="checkbox" name="tg" value="mssql" /> SQL Server <code>demo.dbo.hub_workload_mssql</code> (publisher)</label>
     </fieldset>
     <button type="submit" id="run">Run workload</button>
   </form>
@@ -488,6 +586,7 @@ READS_PAGE = f"""<!DOCTYPE html>
   {NAV}
   <h1>Read workload data (Redis + others)</h1>
   <p>Poll the same stores the workload uses. <strong>Redis</strong> reads keys <code>hub:wl:&lt;run_id&gt;:0 .. n-1</code>.
+    <strong>SQL Server</strong> returns recent rows from <code>dbo.hub_workload_mssql</code> for the given <code>run_id</code>.
     Paste the <code>run_id</code> from a workload response (the page saves the last one in the browser), or generate a random id.
     Cap per store is <code>{WORKLOAD_READ_SAMPLE_LIMIT_MAX}</code> (raise with env <code>WORKLOAD_READ_SAMPLE_LIMIT_MAX</code> on hub-demo-ui).</p>
   <div class="row">
@@ -514,6 +613,7 @@ READS_PAGE = f"""<!DOCTYPE html>
       <label><input type="checkbox" class="tg" value="redis" checked/> Redis</label>
       <label><input type="checkbox" class="tg" value="cassandra" checked/> Cassandra</label>
       <label><input type="checkbox" class="tg" value="opensearch" checked/> OpenSearch</label>
+      <label><input type="checkbox" class="tg" value="mssql"/> SQL Server</label>
     </div>
   </fieldset>
   <div class="row">
@@ -772,15 +872,16 @@ _SCENARIO_PAGE_TEMPLATE = """<!DOCTYPE html>
           <text x="430" y="28" text-anchor="middle" class="lbl">4 · Fulfill</text>
           <text x="550" y="28" text-anchor="middle" class="lbl">◆</text>
           <text x="70" y="78" text-anchor="middle" class="sub">Faker→Mongo</text>
-          <text x="190" y="78" text-anchor="middle" class="sub">PG+K+OS+R</text>
+          <text x="190" y="78" text-anchor="middle" class="sub">PG+MS+K+OS+R</text>
           <text x="310" y="78" text-anchor="middle" class="sub">PG+K+OS+R+C*</text>
           <text x="430" y="78" text-anchor="middle" class="sub">PG+K+OS+C*</text>
           <text x="550" y="78" text-anchor="middle" class="sub">end</text>
-          <text x="300" y="108" text-anchor="middle" class="sub">C* = Cassandra · K = Kafka · OS = hub-scenario-pipeline · R = Redis · PG = Postgres</text>
+          <text x="300" y="108" text-anchor="middle" class="sub">C* = Cassandra · K = Kafka · MS = SQL Server (publisher) · OS = hub-scenario-pipeline · R = Redis · PG = Postgres</text>
         </svg>
       </div>
       <p class="hint"><strong>Mongo</strong> is the <em>catalog service</em>: rich product docs in <code>demo.scenario_products</code>.
         <strong>Postgres</strong> holds a <em>relational mirror</em> (<code>scenario_catalog_mirror</code>), <em>orders</em> (<code>scenario_orders</code>), and <em>fulfillment lines</em> (<code>scenario_fulfillment_lines</code>).
+        <strong>SQL Server</strong> (when <code>MSSQL_HOST</code> + <code>MSSQL_SA_PASSWORD</code> are set — Compose/K8s: <code>mssql-publisher</code>) gets a second mirror <code>dbo.scenario_catalog_mirror_mssql</code> on step 2 for <em>Debezium CDC</em> → Kafka → JDBC sink to the subscriber; workload generator can also write <code>dbo.hub_workload_mssql</code>.
         <strong>Kafka</strong> gets event payloads for integration testing; the same JSON is written to <strong>OpenSearch</strong> index <code>hub-scenario-pipeline</code> (simulating what a Kafka→OpenSearch sink would index).
         <strong>Redis</strong> stores a small dashboard summary + a rolling list of recent pipeline events + per-order cache keys.
         <strong>Cassandra</strong> appends an <em>order timeline</em> (<code>demo_hub.scenario_timeline</code>) for steps 3–4.</p>
@@ -792,7 +893,7 @@ _SCENARIO_PAGE_TEMPLATE = """<!DOCTYPE html>
       </details>
       <details class="behind">
         <summary>2 · Sync catalog → Postgres + Kafka + OpenSearch</summary>
-        <p class="hint">Runs <code>op_pipeline_mongo_to_postgres_and_kafka</code>: reads up to 80 products from Mongo, <strong>UPSERTs</strong> into Postgres <code>scenario_catalog_mirror</code>. For each row it sends a message to Kafka topic <code>scenario.catalog.changes</code> (if the broker is reachable) and <strong>indexes the same payload</strong> into OpenSearch <code>hub-scenario-pipeline</code> with direction <code>mongo→kafka+os</code>. Pushes a short entry onto Redis list <code>scenario:kafka:recent</code> and refreshes <code>scenario:dashboard:summary</code> (counts from Postgres + Mongo).</p>
+        <p class="hint">Runs <code>op_pipeline_mongo_to_postgres_and_kafka</code>: reads up to 80 products from Mongo, <strong>UPSERTs</strong> into Postgres <code>scenario_catalog_mirror</code>. When <code>MSSQL_HOST</code> is set (Compose: <code>mssql-publisher</code>), each product is also <strong>MERGE</strong>d into SQL Server <code>dbo.scenario_catalog_mirror_mssql</code> for Debezium CDC → Kafka → JDBC sink to the subscriber. For each row it sends a message to Kafka topic <code>scenario.catalog.changes</code> (if the broker is reachable) and <strong>indexes the same payload</strong> into OpenSearch <code>hub-scenario-pipeline</code> with direction <code>mongo→kafka+os</code>. Pushes a short entry onto Redis list <code>scenario:kafka:recent</code> and refreshes <code>scenario:dashboard:summary</code> (counts from Postgres + Mongo).</p>
       </details>
       <details class="behind">
         <summary>3 · Place order (Faker + map)</summary>
@@ -863,42 +964,45 @@ _SCENARIO_PAGE_TEMPLATE = """<!DOCTYPE html>
         <a href="/scenario/data/cassandra">Cassandra</a>
         <a href="/scenario/data/opensearch">OpenSearch</a>
         <a href="/scenario/data/kafka">Kafka (meta)</a>
+        <a href="/scenario/data/mssql">SQL Server</a>
       </div>
     </div>
     <aside class="diagram-aside">
       <h2>Vertical line (detail)</h2>
       <p class="hint" style="margin-top:0">Spine + branches. Same steps as the horizontal line above.</p>
-      <svg class="flow-svg" viewBox="0 0 340 600" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Vertical scenario timeline">
+      <svg class="flow-svg" viewBox="0 0 340 560" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Vertical scenario timeline">
         <defs>
           <marker id="ah" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto">
             <path d="M0,0 L8,4 L0,8 Z" fill="#8899a6"/>
           </marker>
         </defs>
-        <line x1="40" y1="28" x2="40" y2="402" stroke="#6cb5f4" stroke-width="3" stroke-linecap="round"/>
+        <line x1="40" y1="28" x2="40" y2="428" stroke="#6cb5f4" stroke-width="3" stroke-linecap="round"/>
         <circle class="node" cx="40" cy="40" r="9" fill="#1d9bf0" stroke="#e7e9ea" stroke-width="1.5"/>
-        <circle class="node" cx="40" cy="140" r="9" fill="#1d9bf0" stroke="#e7e9ea" stroke-width="1.5"/>
-        <circle class="node" cx="40" cy="280" r="9" fill="#1d9bf0" stroke="#e7e9ea" stroke-width="1.5"/>
-        <circle class="node" cx="40" cy="400" r="9" fill="#1d9bf0" stroke="#e7e9ea" stroke-width="1.5"/>
+        <circle class="node" cx="40" cy="148" r="9" fill="#1d9bf0" stroke="#e7e9ea" stroke-width="1.5"/>
+        <circle class="node" cx="40" cy="296" r="9" fill="#1d9bf0" stroke="#e7e9ea" stroke-width="1.5"/>
+        <circle class="node" cx="40" cy="416" r="9" fill="#1d9bf0" stroke="#e7e9ea" stroke-width="1.5"/>
         <path class="arrow" d="M55 40 L115 40"/>
         <text x="120" y="44" font-size="11px" fill="#e7e9ea" font-weight="700">① Faker → Mongo</text>
         <text x="120" y="58" class="muted">demo.scenario_products</text>
-        <path class="arrow" d="M55 140 L115 140"/>
-        <text x="120" y="128" font-size="11px" fill="#e7e9ea" font-weight="700">② Sync catalog</text>
-        <text x="120" y="142" class="muted">PG+K+OS+R · mirror → bus</text>
-        <text x="118" y="158" class="muted" font-size="10px">K · scenario.catalog.changes</text>
-        <text x="118" y="172" class="muted" font-size="10px">OS · index hub-scenario-pipeline</text>
-        <path class="arrow" d="M55 280 L115 280"/>
-        <text x="120" y="272" font-size="11px" fill="#e7e9ea" font-weight="700">③ New order</text>
-        <text x="120" y="286" class="muted">PG+K+OS+R+C* · scenario_orders</text>
-        <path class="arrow" d="M55 400 L115 400"/>
-        <text x="120" y="392" font-size="11px" fill="#e7e9ea" font-weight="700">④ Fulfillment</text>
-        <text x="120" y="406" class="muted">PG+K+OS+C* · scenario_fulfillment_lines</text>
-        <text x="16" y="448" font-size="10px" fill="#8899a6">Key · C* Cassandra · K Kafka · OS OpenSearch · R Redis · PG Postgres</text>
-        <text x="16" y="464" class="muted" font-size="10px">PG workload SQL · pg_stat_statements on DB postgres</text>
-        <text x="16" y="482" class="muted" font-size="10px">ORDER_PLACED (step ③) · FULFILLMENT_READY (step ④)</text>
-        <text x="16" y="500" font-size="10px" fill="#8899a6">Kafka topics</text>
-        <text x="16" y="514" class="muted" font-size="10px">scenario.catalog.changes · scenario.orders.events</text>
-        <text x="16" y="528" class="muted" font-size="10px">scenario.pipeline.sync</text>
+        <path class="arrow" d="M55 148 L115 148"/>
+        <text x="120" y="136" font-size="11px" fill="#e7e9ea" font-weight="700">② Sync catalog</text>
+        <text x="120" y="150" class="muted">PG+MS+K+OS+R · mirrors → bus</text>
+        <text x="118" y="164" class="muted" font-size="10px">MS · dbo.scenario_catalog_mirror_mssql (Debezium CDC)</text>
+        <text x="118" y="178" class="muted" font-size="10px">K · scenario.catalog.changes</text>
+        <text x="118" y="192" class="muted" font-size="10px">OS · index hub-scenario-pipeline</text>
+        <path class="arrow" d="M55 296 L115 296"/>
+        <text x="120" y="288" font-size="11px" fill="#e7e9ea" font-weight="700">③ New order</text>
+        <text x="120" y="302" class="muted">PG+K+OS+R+C* · scenario_orders</text>
+        <path class="arrow" d="M55 416 L115 416"/>
+        <text x="120" y="408" font-size="11px" fill="#e7e9ea" font-weight="700">④ Fulfillment</text>
+        <text x="120" y="422" class="muted">PG+K+OS+C* · scenario_fulfillment_lines</text>
+        <text x="16" y="452" font-size="10px" fill="#8899a6">Key · C* Cassandra · K Kafka · MS SQL Server · OS OpenSearch · R Redis · PG Postgres</text>
+        <text x="16" y="468" class="muted" font-size="10px">MS hub_workload on publisher (workload page) · pymssql + FreeTDS in hub image</text>
+        <text x="16" y="484" class="muted" font-size="10px">PG workload SQL · pg_stat_statements on DB postgres</text>
+        <text x="16" y="500" class="muted" font-size="10px">ORDER_PLACED (step ③) · FULFILLMENT_READY (step ④)</text>
+        <text x="16" y="518" font-size="10px" fill="#8899a6">Kafka topics</text>
+        <text x="16" y="532" class="muted" font-size="10px">scenario.catalog.changes · scenario.orders.events</text>
+        <text x="16" y="546" class="muted" font-size="10px">scenario.pipeline.sync</text>
       </svg>
     </aside>
   </div>
@@ -1055,6 +1159,121 @@ SCENARIO_DATA_PAGE = f"""<!DOCTYPE html>
 """
 
 
+CONNECTIONS_PAGE = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>External databases — hub demo</title>
+  <style>
+    :root {{ font-family: ui-sans-serif, system-ui, sans-serif; background: #0f1419; color: #e7e9ea; }}
+    body {{ max-width: 44rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }}
+    a {{ color: #6cb5f4; }}
+    h1 {{ font-size: 1.35rem; font-weight: 600; }}
+    p.note {{ color: #8899a6; font-size: 0.9rem; }}
+    label {{ display: block; margin: 0.85rem 0 0.25rem; font-size: 0.88rem; color: #c8d0d8; }}
+    input[type="text"] {{
+      width: 100%; box-sizing: border-box; padding: 0.45rem 0.6rem;
+      border-radius: 6px; border: 1px solid #38444d; background: #16181c; color: #e7e9ea;
+      font-family: ui-monospace, monospace; font-size: 0.82rem;
+    }}
+    button {{
+      background: #1d9bf0; color: #fff; border: 0; border-radius: 9999px;
+      padding: 0.55rem 1.2rem; font-size: 0.95rem; font-weight: 600; cursor: pointer; margin: 1rem 0.75rem 0 0;
+    }}
+    button.secondary {{ background: #38444d; }}
+    #status {{ margin-top: 1rem; font-size: 0.9rem; }}
+    #status.ok {{ color: #7af87a; }}
+    #status.err {{ color: #f66; }}
+    pre {{ background: #16181c; border: 1px solid #2f3336; border-radius: 8px; padding: 1rem; overflow: auto; font-size: 0.78rem; }}
+  </style>
+</head>
+<body>
+  {NAV}
+  <h1>Optional external connections</h1>
+  <p class="note">The stack still runs with the in-cluster (or Compose) databases from environment variables.
+    Use this page only when you want <strong>this browser session</strong> to send demo writes and scenario traffic
+    to your own MongoDB, Postgres, Redis, Cassandra, or OpenSearch instead. Leave a field empty and save to clear
+    that override. Secrets are stored in a signed session cookie — use HTTPS in production; for shared demos set
+    <code>HUB_SESSION_SECRET</code> on the server.</p>
+  <form id="connf">
+    <label>Postgres DSN <span style="color:#71767b">(postgresql://…)</span></label>
+    <input type="text" name="postgres_dsn" autocomplete="off" placeholder="Leave blank for env default"/>
+    <label>MongoDB URI</label>
+    <input type="text" name="mongo_uri" autocomplete="off" placeholder="mongodb://… or mongodb+srv://…"/>
+    <label>Redis URL</label>
+    <input type="text" name="redis_url" autocomplete="off" placeholder="redis://…"/>
+    <label>Cassandra contact points <span style="color:#71767b">(comma-separated hosts)</span></label>
+    <input type="text" name="cassandra_hosts" autocomplete="off" placeholder="host1,host2"/>
+    <label>Cassandra keyspace <span style="color:#71767b">(letters, digits, underscore; default demo_hub)</span></label>
+    <input type="text" name="cassandra_keyspace" autocomplete="off" placeholder="demo_hub"/>
+    <label>OpenSearch base URL</label>
+    <input type="text" name="opensearch_url" autocomplete="off" placeholder="https://search-….amazonaws.com"/>
+    <label>Hub single-order / CDC index name</label>
+    <input type="text" name="opensearch_index" autocomplete="off" placeholder="hub-orders"/>
+    <label>Workload index name</label>
+    <input type="text" name="opensearch_workload_index" autocomplete="off" placeholder="hub-workload"/>
+    <label>Scenario pipeline index name</label>
+    <input type="text" name="scenario_opensearch_index" autocomplete="off" placeholder="hub-scenario-pipeline"/>
+    <button type="submit">Save session overrides</button>
+    <button type="button" class="secondary" id="clearbtn">Clear all overrides</button>
+  </form>
+  <p id="status"></p>
+  <pre id="out">Loading status…</pre>
+  <script>
+    async function refresh() {{
+      const r = await fetch("/api/connections");
+      const d = await r.json();
+      document.getElementById("out").textContent = JSON.stringify(d, null, 2);
+    }}
+    document.getElementById("connf").addEventListener("submit", async (ev) => {{
+      ev.preventDefault();
+      const st = document.getElementById("status");
+      const fd = new FormData(ev.target);
+      const body = {{}};
+      for (const [k, v] of fd.entries()) {{
+        const s = String(v).trim();
+        if (s) body[k] = s;
+        else body[k] = "";
+      }}
+      st.textContent = "Saving…";
+      st.className = "";
+      try {{
+        const r = await fetch("/api/connections", {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify(body),
+        }});
+        const d = await r.json();
+        st.textContent = r.ok ? "Saved. Overrides apply to this browser session only." : (d.detail || r.statusText);
+        st.className = r.ok ? "ok" : "err";
+        await refresh();
+      }} catch (e) {{
+        st.textContent = String(e);
+        st.className = "err";
+      }}
+    }});
+    document.getElementById("clearbtn").addEventListener("click", async () => {{
+      const st = document.getElementById("status");
+      st.textContent = "Clearing…";
+      try {{
+        const r = await fetch("/api/connections/clear", {{ method: "POST" }});
+        st.textContent = r.ok ? "Cleared — using env defaults again." : "Clear failed";
+        st.className = r.ok ? "ok" : "err";
+        document.getElementById("connf").reset();
+        await refresh();
+      }} catch (e) {{
+        st.textContent = String(e);
+        st.className = "err";
+      }}
+    }});
+    refresh();
+  </script>
+</body>
+</html>
+"""
+
+
 class WorkloadRequest(BaseModel):
     total_records: int = Field(100, ge=1, le=100_000)
     batch_size: int = Field(50, ge=1, le=2000)
@@ -1116,6 +1335,7 @@ class WorkloadRequest(BaseModel):
 
 def _execute_workload_wave(
     *,
+    cfg,
     total_records: int,
     batch_size_req: int,
     targets: set[str],
@@ -1125,6 +1345,7 @@ def _execute_workload_wave(
     seq_base: int,
     bs: int,
     c_batches: int,
+    cassandra_session,
     cassandra_prep,
     redis_client: redis.Redis | None = None,
 ) -> tuple[dict[str, int], dict[str, str]]:
@@ -1135,7 +1356,7 @@ def _execute_workload_wave(
     if "postgres" in targets:
         try:
             n = 0
-            with psycopg.connect(PG_DSN) as conn:
+            with psycopg.connect(cfg.postgres_dsn) as conn:
                 with conn.cursor() as cur:
                     for start in range(0, total_records, bs):
                         chunk = []
@@ -1153,7 +1374,7 @@ def _execute_workload_wave(
 
     if "mongo" in targets:
         try:
-            m = MongoClient(MONGO_URI, serverSelectionTimeoutMS=120_000)
+            m = MongoClient(cfg.mongo_uri, serverSelectionTimeoutMS=120_000)
             coll = m["demo"]["demo_items"]
             n = 0
             for start in range(0, total_records, bs):
@@ -1182,7 +1403,7 @@ def _execute_workload_wave(
             own_redis = False
             r = redis_client
             if r is None:
-                r = redis.from_url(REDIS_URL, decode_responses=False)
+                r = redis.from_url(cfg.redis_url, decode_responses=False)
                 own_redis = True
             n = 0
             try:
@@ -1190,7 +1411,7 @@ def _execute_workload_wave(
                     pipe = r.pipeline(transaction=False)
                     for j in range(start, min(start + bs, total_records)):
                         i = seq_base + j
-                        key = f"{WORKLOAD_REDIS_PREFIX}{run_id}:{i}"
+                        key = f"{cfg.workload_redis_prefix}{run_id}:{i}"
                         payload = json.dumps(
                             {
                                 "run_id": run_id,
@@ -1211,7 +1432,7 @@ def _execute_workload_wave(
 
     if "cassandra" in targets:
         try:
-            sess = _cassandra_session
+            sess = cassandra_session
             cass_label_max = 60000
             n = 0
             sleep_s = max(0.0, CASSANDRA_WORKLOAD_INTER_BATCH_SLEEP_MS / 1000.0)
@@ -1254,6 +1475,7 @@ def _execute_workload_wave(
             n = 0
             os_chunk = _opensearch_bulk_chunk_size(pad, bs)
             with httpx.Client(timeout=120.0) as hc:
+                _ensure_hub_opensearch_for_cfg(hc, cfg)
                 for start in range(0, total_records, os_chunk):
                     lines: list[str] = []
                     for j in range(start, min(start + os_chunk, total_records)):
@@ -1261,7 +1483,12 @@ def _execute_workload_wave(
                         doc_id = f"{run_id}-{i}"
                         lines.append(
                             json.dumps(
-                                {"index": {"_index": OS_WORKLOAD_INDEX, "_id": doc_id}}
+                                {
+                                    "index": {
+                                        "_index": cfg.opensearch_workload_index,
+                                        "_id": doc_id,
+                                    }
+                                }
                             )
                         )
                         lines.append(
@@ -1277,7 +1504,7 @@ def _execute_workload_wave(
                         n += 1
                     body = "\n".join(lines) + "\n"
                     resp = hc.post(
-                        f"{OPENSEARCH_URL}/_bulk",
+                        f"{cfg.opensearch_url}/_bulk",
                         content=body.encode(),
                         headers={"Content-Type": "application/x-ndjson"},
                     )
@@ -1290,6 +1517,18 @@ def _execute_workload_wave(
             counts["opensearch"] = n
         except Exception as e:
             errors["opensearch"] = str(e)
+
+    if "mssql" in targets:
+        try:
+            n, err = scenario.workload_mssql_batch(
+                run_id, seq_base, total_records, bs, pad
+            )
+            if err:
+                errors["mssql"] = err
+            else:
+                counts["mssql"] = n
+        except Exception as e:
+            errors["mssql"] = str(e)
 
     return counts, errors
 
@@ -1315,6 +1554,7 @@ class WorkloadReadRequest(BaseModel):
 
 def _workload_read_sample(req: WorkloadReadRequest) -> dict:
     """Fetch a small slice of workload-shaped rows from each selected store."""
+    cfg = get_runtime_config()
     out: dict = {"ok": True, "run_id": req.run_id, "samples": {}, "errors": {}}
     lim = req.sample_limit
     tg = set(req.targets)
@@ -1322,7 +1562,7 @@ def _workload_read_sample(req: WorkloadReadRequest) -> dict:
 
     if "postgres" in tg:
         try:
-            with psycopg.connect(PG_DSN) as conn:
+            with psycopg.connect(cfg.postgres_dsn) as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         "SELECT id, name, created_at FROM demo_items WHERE name LIKE %s ORDER BY id DESC LIMIT %s",
@@ -1346,7 +1586,7 @@ def _workload_read_sample(req: WorkloadReadRequest) -> dict:
 
     if "mongo" in tg:
         try:
-            m = MongoClient(MONGO_URI, serverSelectionTimeoutMS=30_000)
+            m = MongoClient(cfg.mongo_uri, serverSelectionTimeoutMS=30_000)
             coll = m["demo"]["demo_items"]
             cur = (
                 coll.find(
@@ -1367,8 +1607,8 @@ def _workload_read_sample(req: WorkloadReadRequest) -> dict:
 
     if "redis" in tg:
         try:
-            r = redis.from_url(REDIS_URL, decode_responses=True)
-            keys = [f"{WORKLOAD_REDIS_PREFIX}{req.run_id}:{i}" for i in range(lim)]
+            r = redis.from_url(cfg.redis_url, decode_responses=True)
+            keys = [f"{cfg.workload_redis_prefix}{req.run_id}:{i}" for i in range(lim)]
             raw = r.mget(keys)
             entries = []
             for k, vzip in zip(keys, raw):
@@ -1393,13 +1633,13 @@ def _workload_read_sample(req: WorkloadReadRequest) -> dict:
 
     if "cassandra" in tg:
         try:
-            sess = _cassandra_session
+            sess, _ = get_hub_cassandra_handles(cfg)
             # Same key convention as workload writes: order_id = wl-{run_id}-{seq} (partition key lookup, no LIKE).
             order_ids = [f"wl-{req.run_id}-{i}" for i in range(lim)]
             # Bind one placeholder per IN value; a single tuple bound to IN %s can yield invalid CQL on some stacks.
             ph = ", ".join(["%s"] * len(order_ids))
             rows = sess.execute(
-                f"SELECT order_id, label, created_at FROM {HUB_KEYSPACE}.orders "
+                f"SELECT order_id, label, created_at FROM {cfg.cassandra_keyspace}.orders "
                 f"WHERE order_id IN ({ph})",
                 tuple(order_ids),
             )
@@ -1426,8 +1666,9 @@ def _workload_read_sample(req: WorkloadReadRequest) -> dict:
                 "sort": [{"seq": "desc"}],
             }
             with httpx.Client(timeout=30.0) as hc:
+                _ensure_hub_opensearch_for_cfg(hc, cfg)
                 resp = hc.post(
-                    f"{OPENSEARCH_URL}/{OS_WORKLOAD_INDEX}/_search",
+                    f"{cfg.opensearch_url}/{cfg.opensearch_workload_index}/_search",
                     json=query,
                     headers={"Content-Type": "application/json"},
                 )
@@ -1444,6 +1685,21 @@ def _workload_read_sample(req: WorkloadReadRequest) -> dict:
         except Exception as e:
             out["ok"] = False
             out["errors"]["opensearch"] = str(e)
+
+    if "mssql" in tg:
+        try:
+            sm = scenario.fetch_workload_sample_mssql(req.run_id, lim)
+            if sm.get("ok"):
+                out["samples"]["mssql"] = {
+                    "count": sm.get("count", 0),
+                    "rows": sm.get("rows", []),
+                }
+            else:
+                out["ok"] = False
+                out["errors"]["mssql"] = sm.get("error", "unknown")
+        except Exception as e:
+            out["ok"] = False
+            out["errors"]["mssql"] = str(e)
 
     return out
 
@@ -1468,6 +1724,70 @@ async def scenario_page():
     return HTMLResponse(SCENARIO_PAGE)
 
 
+@app.get("/connections", response_class=HTMLResponse)
+async def connections_page():
+    return HTMLResponse(CONNECTIONS_PAGE)
+
+
+@app.get("/api/connections")
+async def api_connections_get(request: Request):
+    base = env_base_config()
+    rt = runtime_config_from_request_session(dict(request.session))
+    ov = rt.session_overrides_only(base)
+    return {
+        "session_overrides_active": any(ov.values()),
+        "per_field": ov,
+        "masked_effective": {
+            "postgres_dsn": mask_connection_hint(rt.postgres_dsn),
+            "mongo_uri": mask_connection_hint(rt.mongo_uri),
+            "redis_url": mask_connection_hint(rt.redis_url),
+            "opensearch_url": mask_connection_hint(rt.opensearch_url),
+            "cassandra_hosts": ", ".join(rt.cassandra_hosts),
+            "cassandra_keyspace": rt.cassandra_keyspace,
+            "opensearch_index": rt.opensearch_index,
+            "opensearch_workload_index": rt.opensearch_workload_index,
+            "scenario_opensearch_index": rt.scenario_opensearch_index,
+        },
+    }
+
+
+@app.post("/api/connections")
+async def api_connections_post(request: Request):
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(400, "expected JSON object")
+    s = request.session
+    for py, sk in _CONNECTION_SESSION_KEYS:
+        if py not in body:
+            continue
+        raw = body[py]
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            s.pop(sk, None)
+            continue
+        val = str(raw).strip()
+        if py == "cassandra_keyspace" and not keyspace_valid(val):
+            raise HTTPException(
+                400,
+                "cassandra_keyspace must match [a-zA-Z_][a-zA-Z0-9_]{0,47}",
+            )
+        s[sk] = val
+    return {"ok": True}
+
+
+@app.post("/api/connections/clear")
+async def api_connections_clear(request: Request):
+    for _py, sk in _CONNECTION_SESSION_KEYS:
+        request.session.pop(sk, None)
+    with _cass_override_lock:
+        for cl, _s, _p in _cass_override.values():
+            try:
+                cl.shutdown()
+            except Exception:
+                pass
+        _cass_override.clear()
+    return {"ok": True}
+
+
 @app.get("/faker-order")
 async def faker_order_redirect():
     """Old path: Faker + map order UI now lives under /scenario (step 3)."""
@@ -1490,9 +1810,10 @@ class ScenarioCustomOrderRequest(BaseModel):
 
 @app.post("/api/scenario/order/custom")
 async def api_scenario_order_custom(req: ScenarioCustomOrderRequest):
+    cass, _ = get_hub_cassandra_handles(get_runtime_config())
     return scenario.op_place_order(
         req.lines_count,
-        cassandra_session=_cassandra_session,
+        cassandra_session=cass,
         customer_email=req.customer_email,
         customer_name=req.customer_name,
         ship_lat=req.ship_lat,
@@ -1522,12 +1843,14 @@ async def api_scenario_mongo_sync():
 
 @app.post("/api/scenario/order")
 async def api_scenario_order():
-    return scenario.op_place_order(cassandra_session=_cassandra_session)
+    cass, _ = get_hub_cassandra_handles(get_runtime_config())
+    return scenario.op_place_order(cassandra_session=cass)
 
 
 @app.post("/api/scenario/pipeline/fulfill")
 async def api_scenario_fulfill():
-    return scenario.op_pipeline_postgres_to_fulfillment_and_kafka(_cassandra_session)
+    cass, _ = get_hub_cassandra_handles(get_runtime_config())
+    return scenario.op_pipeline_postgres_to_fulfillment_and_kafka(cass)
 
 
 @app.get("/api/scenario/view/{store}")
@@ -1541,11 +1864,14 @@ async def api_scenario_view(store: str):
         if key == "redis":
             return scenario.fetch_view_redis()
         if key == "cassandra":
-            return scenario.fetch_view_cassandra(_cassandra_session)
+            cass, _ = get_hub_cassandra_handles(get_runtime_config())
+            return scenario.fetch_view_cassandra(cass)
         if key == "opensearch":
             return scenario.fetch_view_opensearch()
         if key == "kafka":
             return scenario.fetch_view_kafka_meta()
+        if key == "mssql":
+            return scenario.fetch_view_mssql()
     except Exception as e:
         raise HTTPException(500, str(e)) from e
     raise HTTPException(404, f"unknown store: {store}")
@@ -1563,6 +1889,7 @@ async def api_workload(req: WorkloadRequest):
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
 
+    cfg = get_runtime_config()
     run_id = str(uuid.uuid4())[:8]
     pad = _make_pad(req.payload_kb)
     now = datetime.now(timezone.utc)
@@ -1571,7 +1898,7 @@ async def api_workload(req: WorkloadRequest):
     bs = min(req.batch_size, 500)
     c_batches = _cassandra_rows_per_batch(pad, min(req.batch_size, 50))
     targets = set(req.targets)
-    prep = _cassandra_insert_prep
+    cass_sess, cass_prep = get_hub_cassandra_handles(cfg)
 
     sustain_deadline: float | None = None
     if req.sustain:
@@ -1590,7 +1917,7 @@ async def api_workload(req: WorkloadRequest):
             # One connection for all sustain waves: opening a new TCP client every wave
             # can overwhelm Redis / hit connection limits ("Connection reset by peer").
             wl_redis = redis.from_url(
-                REDIS_URL,
+                cfg.redis_url,
                 decode_responses=False,
                 socket_keepalive=True,
                 health_check_interval=30,
@@ -1598,6 +1925,7 @@ async def api_workload(req: WorkloadRequest):
             )
         while True:
             w_counts, w_err = _execute_workload_wave(
+                cfg=cfg,
                 total_records=req.total_records,
                 batch_size_req=req.batch_size,
                 targets=targets,
@@ -1607,7 +1935,8 @@ async def api_workload(req: WorkloadRequest):
                 seq_base=seq_base,
                 bs=bs,
                 c_batches=c_batches,
-                cassandra_prep=prep,
+                cassandra_session=cass_sess,
+                cassandra_prep=cass_prep,
                 redis_client=wl_redis,
             )
             waves += 1
@@ -1659,6 +1988,7 @@ async def api_workload(req: WorkloadRequest):
 
 @app.post("/api/ingest")
 async def ingest():
+    cfg = get_runtime_config()
     order_id = str(uuid.uuid4())
     label = f"hub-ui-order-{order_id[:8]}"
     now = datetime.now(timezone.utc)
@@ -1667,7 +1997,7 @@ async def ingest():
     ok = True
 
     try:
-        with psycopg.connect(PG_DSN) as conn:
+        with psycopg.connect(cfg.postgres_dsn) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "INSERT INTO demo_items (name) VALUES (%s) RETURNING id, created_at",
@@ -1687,7 +2017,7 @@ async def ingest():
         steps["postgres"] = {"ok": False, "error": str(e)}
 
     try:
-        m = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10_000)
+        m = MongoClient(cfg.mongo_uri, serverSelectionTimeoutMS=10_000)
         coll = m["demo"]["demo_items"]
         ins = coll.insert_one(
             {
@@ -1708,7 +2038,7 @@ async def ingest():
         steps["mongo"] = {"ok": False, "error": str(e)}
 
     try:
-        r = redis.from_url(REDIS_URL, decode_responses=True)
+        r = redis.from_url(cfg.redis_url, decode_responses=True)
         payload = json.dumps(
             {"order_id": order_id, "label": label, "created_at": created_iso},
             separators=(",", ":"),
@@ -1725,18 +2055,18 @@ async def ingest():
         steps["redis"] = {"ok": False, "error": str(e)}
 
     try:
-        sess = _cassandra_session
+        sess, _ = get_hub_cassandra_handles(cfg)
         sess.execute(
-            f"INSERT INTO {HUB_KEYSPACE}.orders (order_id, label, created_at) VALUES (%s, %s, %s)",
+            f"INSERT INTO {cfg.cassandra_keyspace}.orders (order_id, label, created_at) VALUES (%s, %s, %s)",
             (order_id, label, now),
         )
         row = sess.execute(
-            f"SELECT order_id, label, created_at FROM {HUB_KEYSPACE}.orders WHERE order_id = %s",
+            f"SELECT order_id, label, created_at FROM {cfg.cassandra_keyspace}.orders WHERE order_id = %s",
             (order_id,),
         ).one()
         steps["cassandra"] = {
             "ok": True,
-            "keyspace": HUB_KEYSPACE,
+            "keyspace": cfg.cassandra_keyspace,
             "table": "orders",
             "row": {
                 "order_id": row.order_id,
@@ -1756,8 +2086,9 @@ async def ingest():
             "created_at": created_iso,
         }
         with httpx.Client(timeout=30.0) as hc:
+            _ensure_hub_opensearch_for_cfg(hc, cfg)
             resp = hc.post(
-                f"{OPENSEARCH_URL}/{OS_INDEX}/_doc/{order_id}",
+                f"{cfg.opensearch_url}/{cfg.opensearch_index}/_doc/{order_id}",
                 json=doc,
                 headers={"Content-Type": "application/json"},
             )
@@ -1765,7 +2096,7 @@ async def ingest():
             body = resp.json()
         steps["opensearch"] = {
             "ok": True,
-            "index": OS_INDEX,
+            "index": cfg.opensearch_index,
             "id": order_id,
             "result": body.get("result"),
         }

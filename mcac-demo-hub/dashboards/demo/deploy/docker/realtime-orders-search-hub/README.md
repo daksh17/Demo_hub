@@ -12,7 +12,8 @@ This folder describes a **single coherent real-time story** across everything in
 | **Cassandra** | High-volume **order events** / timeline (append-heavy, wide rows)—good fit for MCAC metrics and **`../cassandra/`** topology. |
 | **Redis** | **Hot cache**: latest order status, product availability snapshot, rate limits (**`../redis/README.md`**). |
 | **OpenSearch** | **Full-text search** and customer-facing browse (indexes built from Kafka topics or denormalized writes). |
-| **Prometheus + Grafana** | End-to-end observability (**`../observability/`**). |
+| **SQL Server (×2)** | **Publisher + subscriber** (host **14331** / **14332**): scenario **catalog mirror** + optional **workload** table on publisher; **Debezium SQL Server** → Kafka → **JDBC sink** to subscriber (**`../mssql-kafka/`**). **Prometheus** scrapes **`mssql-exporter-*`** (job **`mssql_demo`**). |
+| **Prometheus + Grafana** | End-to-end observability (**`../observability/`**); SQL Server dashboard **`mssql-demo-overview.json`**. |
 
 This is a **reference architecture** you can implement incrementally: the repo already brings up the infrastructure; connectors and app code can follow the flows below.
 
@@ -20,7 +21,7 @@ This is a **reference architecture** you can implement incrementally: the repo a
 
 ## Scenario in one paragraph
 
-A customer places an order: the **API** persists the order in **Postgres** and updates **Mongo** catalog stock. **Debezium** streams both changes to **Kafka**. A **consumer** (or **sink**) updates **OpenSearch** so the “my orders” and catalog search UI stay current; another path writes an **event** to **Cassandra** for analytics and pushes a **short-TTL cache** entry in **Redis** for the order status API. **Prometheus** scrapes brokers, DBs, Redis, OpenSearch exporters, and **Grafana** gives you one place to see lag, errors, and saturation.
+A customer places an order: the **API** persists the order in **Postgres** and updates **Mongo** catalog stock. **Debezium** streams both changes to **Kafka**. The **hub scenario** can also **MERGE** the same catalog into **SQL Server** on the publisher; **Debezium SQL Server** captures that table to Kafka and a **JDBC sink** can apply changes to the subscriber. A **consumer** (or **sink**) updates **OpenSearch** so the “my orders” and catalog search UI stay current; another path writes an **event** to **Cassandra** for analytics and pushes a **short-TTL cache** entry in **Redis** for the order status API. **Prometheus** scrapes brokers, DBs, Redis, OpenSearch, **SQL Server** exporters, and **Grafana** gives you one place to see lag, errors, and saturation.
 
 ---
 
@@ -32,11 +33,11 @@ Service **`hub-demo-ui`** in **`../../../docker-compose.yml`** serves a small pa
 2. Open **http://localhost:8888** and click **Create demo order**.
 3. The response JSON shows per-store success and the shared **`order_id`**. The page also links to Grafana, Prometheus, OpenSearch Dashboards, and Kafka Connect.
 
-**Grafana:** open **http://localhost:3000** — separate provisioned JSON dashboards under **`../../../../grafana/generated-dashboards/`** (e.g. **`mongodb-tictactoe-detailed.json`**, **`redis-demo-overview.json`**, **`kafka-cluster-overview.json`**, **`cassandra-condensed.json`**, **`overview.json`**). OpenSearch cluster metrics: import a community **Elasticsearch exporter** dashboard and point the **job** variable at **`opensearch_demo`** (see **`../opensearch/README.md`**).
+**Grafana:** open **http://localhost:3000** — provisioned JSON dashboards under **`../../../../grafana/generated-dashboards/`** (e.g. **`mssql-demo-overview.json`**, **`mongodb-tictactoe-detailed.json`**, **`redis-demo-overview.json`**, **`kafka-cluster-overview.json`**, **`cassandra-condensed.json`**, **`postgres-database.json`**, **`overview.json`**). OpenSearch cluster metrics: import a community **Elasticsearch exporter** dashboard and point the **job** variable at **`opensearch_demo`** (see **`../opensearch/README.md`**).
 
-**Tunable load:** open **http://localhost:8888/workload** to drive batches with **total records**, **batch size**, **payload size (KB)**, and choose **Postgres / Mongo / Redis / Cassandra / OpenSearch**. OpenSearch writes go to index **`hub-workload`** (large payloads × many rows can stress disk; stay within the UI limits).
+**Tunable load:** open **http://localhost:8888/workload** to drive batches with **total records**, **batch size**, **payload size (KB)**, and choose **Postgres / Mongo / Redis / Cassandra / OpenSearch / SQL Server** (optional checkbox). **SQL Server** targets **`demo.dbo.hub_workload_mssql`** on the **publisher** (same `wl-<run_id>-<seq>` pattern; table is **not** CDC-enabled so Debezium stays focused on the catalog mirror). OpenSearch writes go to index **`hub-workload`** (large payloads × many rows can stress disk; stay within the UI limits).
 
-**Multi-DB scenario (Faker, pipelines):** **http://localhost:8888/scenario** seeds a **MongoDB** product catalog (rich documents), syncs a mirror into **Postgres**, emits **Kafka** topics (`scenario.catalog.changes`, `scenario.orders.events`, `scenario.pipeline.sync`), indexes the same payloads in **OpenSearch** (`hub-scenario-pipeline`) as a stand-in for a Kafka→OpenSearch sink, refreshes **Redis** dashboard keys, and writes order timelines to **Cassandra**. Use the numbered buttons, then open each store’s **View data** page. Requires **`docker compose build hub-demo-ui`** after pulling (adds Faker + kafka-python). **Full narrative with Mermaid diagrams, connector counts, source/sink tables, and Mongo sharding:** [`scenario-flow/README.md`](scenario-flow/README.md). **Compact version:** [`README-SCENARIO-FLOW.md`](README-SCENARIO-FLOW.md). **Indexes** (Postgres BRIN/GIN/GiST/HASH/partial/covering, Mongo ESR compounds + partial + text, Cassandra secondary index): [`../../README.md` → Hub scenario indexes](../../README.md#hub-scenario-indexes-multi-db-reference); implementation in **`demo-ui/scenario.py`** and **`../mongo-kafka/demo-indexes.js`**.
+**Multi-DB scenario (Faker, pipelines):** **http://localhost:8888/scenario** seeds a **MongoDB** product catalog (rich documents), syncs a mirror into **Postgres** and (when **`MSSQL_HOST`** is set) into **SQL Server** **`dbo.scenario_catalog_mirror_mssql`**, emits **Kafka** topics (`scenario.catalog.changes`, `scenario.orders.events`, `scenario.pipeline.sync`), indexes the same payloads in **OpenSearch** (`hub-scenario-pipeline`) as a stand-in for a Kafka→OpenSearch sink, refreshes **Redis** dashboard keys, and writes order timelines to **Cassandra**. Use the numbered buttons, then open each store’s **View data** page (including **SQL Server**). Requires **`docker compose build hub-demo-ui`** after pulling (adds Faker + kafka-python + pymssql). **SQL Server compose + connectors:** [`../mssql-kafka/README.md`](../mssql-kafka/README.md). **Full narrative with Mermaid diagrams, connector counts, source/sink tables, and Mongo sharding:** [`scenario-flow/README.md`](scenario-flow/README.md). **Compact version:** [`README-SCENARIO-FLOW.md`](README-SCENARIO-FLOW.md). **Indexes** (Postgres BRIN/GIN/GiST/HASH/partial/covering, Mongo ESR compounds + partial + text, Cassandra secondary index): [`../../README.md` → Hub scenario indexes](../../README.md#hub-scenario-indexes-multi-db-reference); implementation in **`demo-ui/scenario.py`** and **`../mongo-kafka/demo-indexes.js`**.
 
 | Store | What the UI writes | Quick verify |
 |--------|-------------------|--------------|
@@ -45,6 +46,7 @@ Service **`hub-demo-ui`** in **`../../../docker-compose.yml`** serves a small pa
 | **Redis** | Key **`hub:order:<order_id>`** (TTL 1h) | JSON shows `read_back`; or `redis-cli -a demoredispass GET hub:order:<uuid>` |
 | **Cassandra** | Row in **`demo_hub.orders`** | JSON shows row; or `SELECT * FROM demo_hub.orders LIMIT 10;` via **cqlsh** (e.g. **19442**) |
 | **OpenSearch** | Document in index **`hub-orders`** | **GET** `http://localhost:9200/hub-orders/_doc/<order_id>?pretty` or in **OpenSearch Dashboards** → **Dev Tools**: `GET hub-orders/_search?q=hub-demo-ui&pretty` |
+| **SQL Server** | Scenario **MERGE** into **`demo.dbo.scenario_catalog_mirror_mssql`** (publisher); workload optional **`dbo.hub_workload_mssql`** | **Scenario** → **View data** → SQL Server, or `sqlcmd` to **localhost,14331** / **14332** (see **`../mssql-kafka/README.md`**) |
 
 **OpenSearch Dashboards (5601):** after a few writes, under **Management** → **Index patterns**, create **`hub-orders*`** then open **Discover** to search by `order_id` or `label`. Dev Tools is fastest for ad hoc `GET`/`POST`.
 
@@ -56,16 +58,13 @@ Source: **[`demo-ui/`](demo-ui/)** (FastAPI + Dockerfile).
 
 ## Entire workflow (diagrams)
 
-**If you only see raw `flowchart` / `sequenceDiagram` text:** your preview does not render Mermaid. That is normal in **Cursor / VS Code** unless you add a Mermaid-capable Markdown preview (e.g. extension “Markdown Preview Mermaid Support”). **GitHub** renders Mermaid in `README.md` on the repo website. **Below each heading, the same diagram is also inlined as an SVG** so it shows in any viewer that supports images.
+**If you only see raw `flowchart` / `sequenceDiagram` text:** your preview does not render Mermaid. That is normal in **Cursor / VS Code** unless you add a Mermaid-capable Markdown preview (e.g. extension “Markdown Preview Mermaid Support”). **GitHub** renders Mermaid in `README.md` on the repo website.
 
-Canonical editable sources: [`.mmd` files in `diagrams/`](diagrams/).
+**Sections 1, 2, and 6** show the **Mermaid diagram first** (always up to date in git), then an **SVG** snapshot. Older sections (3–5) still lead with SVG + collapsible Mermaid. Regenerate SVGs from [`.mmd` files in `diagrams/`](diagrams/) with [`diagrams/render-all.sh`](diagrams/render-all.sh) so PNG/PDF-style viewers match.
 
 ### 1. Component context (stack + data paths)
 
-![Component context — stack and data paths](diagrams/00-component-context.svg)
-
-<details>
-<summary>Mermaid source (for GitHub / compatible viewers)</summary>
+**Rendered diagram (includes SQL Server):** the fenced **Mermaid** block below is the source of truth. The **SVG** after it is a static export — run [`diagrams/render-all.sh`](diagrams/render-all.sh) after editing [`diagrams/00-component-context.mmd`](diagrams/00-component-context.mmd) so the image matches.
 
 ```mermaid
 flowchart TB
@@ -78,6 +77,11 @@ flowchart TB
     PG[(Primary :15432)]
     PR1[(Replica 1)]
     PR2[(Replica 2)]
+  end
+
+  subgraph mssql_demo [SQL Server demo]
+    MPUB[(Publisher :14331)]
+    MSUB[(Subscriber :14332)]
   end
 
   subgraph mongo [MongoDB sharded]
@@ -105,6 +109,7 @@ flowchart TB
 
   U --> API
   API --> PG
+  API --> MPUB
   API --> MS
   API --> CS
   API --> RD
@@ -116,17 +121,21 @@ flowchart TB
 
   PG --> KC
   MS --> KC
+  MPUB --> KC
   KC --> K
   ZK --> K
 
   KC -. optional consumers / sinks .-> OS
   KC -. optional consumers .-> RD
   KC -. optional consumers .-> CS
+  KC -. JDBC sink .-> MSUB
 
   OSD --> OS
 
   PG --> PROM
   MS --> PROM
+  MPUB --> PROM
+  MSUB --> PROM
   K --> PROM
   CS --> PROM
   RD --> PROM
@@ -134,14 +143,11 @@ flowchart TB
   PROM --> GF
 ```
 
-</details>
+![Component context — stack and data paths (SVG)](./diagrams/00-component-context.svg)
 
 ### 2. End-to-end sequence (one order)
 
-![End-to-end sequence — one order](diagrams/01-sequence-order-flow.svg)
-
-<details>
-<summary>Mermaid source (for GitHub / compatible viewers)</summary>
+Same pattern: **Mermaid first** (SQL Server + `demomssql` CDC), then SVG.
 
 ```mermaid
 sequenceDiagram
@@ -149,6 +155,7 @@ sequenceDiagram
   participant App as API / worker
   participant PG as Postgres primary
   participant M as Mongos
+  participant MSSQL as SQL Server publisher
   participant Connect as Kafka Connect
   participant K as Kafka
   participant C as Cassandra
@@ -164,11 +171,17 @@ sequenceDiagram
   App->>M: update catalog collection (e.g. sku stockByWarehouse)
   M-->>App: OK
 
+  Note over App, MSSQL: Step B2 — scenario hub only MERGE catalog mirror
+  App->>MSSQL: MERGE dbo.scenario_catalog_mirror_mssql
+  MSSQL-->>App: OK
+
   Note over PG, K: Step C — CDC to Kafka (Debezium sources)
   PG--)Connect: logical replication / WAL events
   Connect->>K: produce demopg.public.*
   M--)Connect: change streams via mongos
   Connect->>K: produce demomongo.demo.*
+  MSSQL--)Connect: CDC on mirror table
+  Connect->>K: produce demomssql.dbo.*
 
   Note over App, K: Step D — fan-out (your microservices or Flink-style jobs)
   K--)App: consume order + catalog topics
@@ -181,7 +194,7 @@ sequenceDiagram
   App-->>OS: (optional) deep links from support UI
 ```
 
-</details>
+![End-to-end sequence — one order (SVG)](./diagrams/01-sequence-order-flow.svg)
 
 ### 3. Postgres → Kafka → downstream (stepped)
 
@@ -278,19 +291,50 @@ flowchart LR
 
 </details>
 
+### 6. SQL Server publisher → Kafka → subscriber (stepped)
+
+**GitHub** renders the flowchart in the fenced block below. **Cursor / VS Code** often need a [Mermaid preview extension](https://marketplace.visualstudio.com/items?itemName=bierner.markdown-mermaid); the **SVG** after it is the fallback for any viewer that only shows images.
+
+```mermaid
+flowchart TD
+  H1[Step 1: Connect publisher e.g. host port 14331]
+  H2[Step 2: MERGE catalog mirror or INSERT hub workload table]
+  H3[Step 3: CDC on scenario catalog mirror only]
+  H4[Step 4: Debezium SqlServerConnector]
+  H5[Step 5: Kafka topic for dbo scenario catalog mirror]
+  H6[Step 6: JDBC sink upserts to subscriber table]
+  H7[Step 7: Optional native replication try job]
+
+  H1 --> H2
+  H2 --> H3
+  H2 -.-> H7
+  H3 --> H4 --> H5 --> H6
+```
+
+![SQL Server CDC and sink stepped flow (SVG)](./diagrams/05-flowchart-mssql-path.svg)
+
+<details>
+<summary>Why two formats?</summary>
+
+- **Mermaid** — editable source lives in [`diagrams/05-flowchart-mssql-path.mmd`](diagrams/05-flowchart-mssql-path.mmd). Earlier, putting Mermaid only inside `<details>` hid it on some hosts; the open block above fixes that.
+- **SVG** — same diagram for PDFs, older Markdown viewers, or when Mermaid is disabled. Regenerate with [`diagrams/render-all.sh`](diagrams/render-all.sh) or the `npx` lines under **Regenerate SVGs (from this directory)** below.
+
+</details>
+
 ---
 
 ## Phase map (what to build vs what exists)
 
 | Phase | Status in repo | Your work |
 |-------|----------------|-----------|
-| Infra up | Compose: PG, Mongo sharded, Kafka, Connect, Cassandra, Redis, OpenSearch, Prometheus, Grafana | `docker compose up` from **`dashboards/demo`** per area READMEs |
+| Infra up | Compose: PG, Mongo sharded, Kafka, Connect, Cassandra, Redis, OpenSearch, **SQL Server ×2**, Prometheus, Grafana, **`mssql-exporter-*`** | `docker compose up` from **`dashboards/demo`** per area READMEs |
 | Postgres CDC | **`deploy/docker/postgres-kafka/register-connectors.sh`** | Tables, publication, sink table not in publication |
 | Mongo CDC | **`mongo-kafka/register-mongo-connectors.sh`** + **`mongo-kafka-prepare`** | Ensure topics and sinks match naming |
+| SQL Server CDC | **`mssql-kafka/register-mssql-connectors.sh`** via **`mssql-kafka-connect-register`** | Publisher CDC on mirror table; JDBC sink to subscriber; see **`../mssql-kafka/README.md`** |
 | Cassandra writes | MCAC agent on cassandra nodes | App or batch job writing order_events |
 | Redis | **`redis`** + password | App: SET order:{id} with TTL |
 | OpenSearch | **`opensearch`** + Dashboards | Index pipeline from Kafka or REST bulk |
-| Metrics | **`prometheus.yaml`** jobs | Restart Prometheus after edits |
+| Metrics | **`prometheus.yaml`** jobs (**`mssql_demo`**, **`postgres_pgdemo`**, …) | Restart Prometheus after edits; Grafana **`mssql-demo-overview.json`** |
 
 ---
 
@@ -317,10 +361,17 @@ flowchart LR
 2. **Redis**: `SET order:status:{id} {json} EX 300` after each state change (read-mostly API).
 3. **OpenSearch**: index **`orders-search-{id}`** with denormalized fields for search; refresh policy per SLA.
 
-### D. Observability (always on)
+### D. SQL Server (scenario + workload + CDC)
 
-1. **Prometheus** **http://localhost:9090/targets** — PG exporters, `kafka_pgdemo`, `mongodb`, `redis_demo`, `opensearch_demo`, `mcac`, etc. Restart after **`prometheus.yaml`** changes.
-2. **Grafana** **http://localhost:3000** — Kafka, Redis, Mongo, Cassandra dashboards in **`../../../../grafana/generated-dashboards/`**.
+1. **Compose** brings up **publisher** (**`localhost:14331`**) and **subscriber** (**`14332`**) with schema init jobs; **`mssql-kafka-connect-register`** registers Debezium source + JDBC sink when Connect is healthy.
+2. **Hub scenario** step 2 **MERGE**s catalog into **`dbo.scenario_catalog_mirror_mssql`** when **`MSSQL_*`** env is set on **`hub-demo-ui`**.
+3. **Workload** page: optional target **`mssql`** writes **`dbo.hub_workload_mssql`** (not CDC-tracked).
+4. **Metrics:** **`mssql-exporter-publisher`** / **`mssql-exporter-subscriber`** scraped as job **`mssql_demo`**; dashboard **`mssql-demo-overview.json`**.
+
+### E. Observability (always on)
+
+1. **Prometheus** **http://localhost:9090/targets** — PG exporters, `kafka_pgdemo`, `mongodb`, `redis_demo`, `opensearch_demo`, **`mssql_demo`**, `mcac`, etc. Restart after **`prometheus.yaml`** changes.
+2. **Grafana** **http://localhost:3000** — Kafka, Redis, Mongo, Cassandra, **SQL Server**, Postgres dashboards in **`../../../../grafana/generated-dashboards/`**.
 
 ---
 
@@ -353,7 +404,8 @@ Wait until Postgres, Mongo sharded chain, Kafka, Connect, Redis, OpenSearch, Cas
 | **Redis** | `redis-cli -h 127.0.0.1 -p 6379 -a demoredispass ping` → **PONG** (**[`../redis/README.md`](../redis/README.md)**). |
 | **OpenSearch** | `curl -s http://localhost:9200` — cluster info JSON (**[`../opensearch/README.md`](../opensearch/README.md)**). |
 | **Prometheus** | **http://localhost:9090/targets** — exporters **UP** for the jobs you care about. |
-| **Grafana** | **http://localhost:3000** — open Kafka / Mongo / Redis (and Cassandra) dashboards from provisioning. |
+| **Grafana** | **http://localhost:3000** — open Kafka / Mongo / Redis / Cassandra / **SQL Server (demo hub)** / Postgres dashboards from provisioning. |
+| **SQL Server metrics** | After `docker compose up`, **http://localhost:9090/targets** should list **`mssql_demo`** (two instances). Dashboard: **`mssql-demo-overview.json`**. |
 
 ### 3. What “fully tested” means for this README
 
@@ -382,18 +434,24 @@ The same diagrams are **embedded above** under **Entire workflow (diagrams)**. E
 | [`diagrams/02-flowchart-postgres-path.mmd`](diagrams/02-flowchart-postgres-path.mmd) | [`diagrams/02-flowchart-postgres-path.svg`](diagrams/02-flowchart-postgres-path.svg) | **Stepped** Postgres CDC path |
 | [`diagrams/03-flowchart-mongo-path.mmd`](diagrams/03-flowchart-mongo-path.mmd) | [`diagrams/03-flowchart-mongo-path.svg`](diagrams/03-flowchart-mongo-path.svg) | **Stepped** Mongo CDC path |
 | [`diagrams/04-flowchart-cassandra-redis-os.mmd`](diagrams/04-flowchart-cassandra-redis-os.mmd) | [`diagrams/04-flowchart-cassandra-redis-os.svg`](diagrams/04-flowchart-cassandra-redis-os.svg) | Cassandra, Redis, OpenSearch fan-out |
+| [`diagrams/05-flowchart-mssql-path.mmd`](diagrams/05-flowchart-mssql-path.mmd) | [`diagrams/05-flowchart-mssql-path.svg`](diagrams/05-flowchart-mssql-path.svg) | **SQL Server** stepped CDC + JDBC sink |
 
 ---
 
 ## Regenerate SVGs (from this directory)
 
+After editing any **`diagrams/*.mmd`**, refresh the matching **`.svg`** so image embeds match GitHub Mermaid. **`05-flowchart-mssql-path.svg`** may be hand-maintained if `mermaid-cli` is unavailable; prefer regenerating from **`05-flowchart-mssql-path.mmd`** when you can run Node.
+
 ```bash
 cd realtime-orders-search-hub
+chmod +x diagrams/render-all.sh   # once
+./diagrams/render-all.sh          # or run the npx lines below individually
 npx --yes @mermaid-js/mermaid-cli@11.4.0 -i diagrams/00-component-context.mmd -o diagrams/00-component-context.svg -b transparent
 npx --yes @mermaid-js/mermaid-cli@11.4.0 -i diagrams/01-sequence-order-flow.mmd -o diagrams/01-sequence-order-flow.svg -b transparent
 npx --yes @mermaid-js/mermaid-cli@11.4.0 -i diagrams/02-flowchart-postgres-path.mmd -o diagrams/02-flowchart-postgres-path.svg -b transparent
 npx --yes @mermaid-js/mermaid-cli@11.4.0 -i diagrams/03-flowchart-mongo-path.mmd -o diagrams/03-flowchart-mongo-path.svg -b transparent
 npx --yes @mermaid-js/mermaid-cli@11.4.0 -i diagrams/04-flowchart-cassandra-redis-os.mmd -o diagrams/04-flowchart-cassandra-redis-os.svg -b transparent
+npx --yes @mermaid-js/mermaid-cli@11.4.0 -i diagrams/05-flowchart-mssql-path.mmd -o diagrams/05-flowchart-mssql-path.svg -b transparent
 ```
 
 ---
@@ -411,3 +469,4 @@ npx --yes @mermaid-js/mermaid-cli@11.4.0 -i diagrams/04-flowchart-cassandra-redi
 | Redis | [`../redis/README.md`](../redis/README.md) |
 | OpenSearch | [`../opensearch/README.md`](../opensearch/README.md) |
 | Observability | [`../observability/README.md`](../observability/README.md) |
+| SQL Server + Kafka | [`../mssql-kafka/README.md`](../mssql-kafka/README.md) |

@@ -3,6 +3,11 @@
 # Default pre-pull in dashboards/demo/k8s/scripts/build-mcac-init-image.sh (override: MCAC_INIT_BASE_IMAGE).
 FROM maven:3.9-eclipse-temurin-8 AS builder
 
+# vi for kubectl exec into mcac init/copy pod (optional).
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends vim-tiny \
+  && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /build
 
 COPY . ./
