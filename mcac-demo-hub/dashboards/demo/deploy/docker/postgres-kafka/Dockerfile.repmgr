@@ -1,0 +1,125 @@
+# Bitnami PostgreSQL 16 with repmgr (https://repmgr.org/) CLI + extension built against the bundled server.
+# Same base pin as Kubernetes manifests (gen_demo_hub_k8s.py POSTGRESQL_IMAGE).
+FROM docker.io/bitnamilegacy/postgresql:16.6.0-debian-12-r2
+
+USER root
+
+ARG REPMGR_VERSION=5.4.1
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+       ca-certificates curl \
+       build-essential \
+       libcurl4-openssl-dev \
+       liblz4-dev libedit-dev \
+       libreadline-dev zlib1g-dev libxslt1-dev libssl-dev libxml2-dev pkg-config flex bison \
+  && curl -fsSL "https://github.com/EnterpriseDB/repmgr/releases/download/v${REPMGR_VERSION}/repmgr-${REPMGR_VERSION}.tar.gz" \
+     | tar xz -C /tmp \
+  && cd "/tmp/repmgr-${REPMGR_VERSION}" \
+  && ./configure PG_CONFIG=/opt/bitnami/postgresql/bin/pg_config \
+  && make -j"$(nproc)" \
+  && make install \
+  && BITNAMI_EXTDIR="/opt/bitnami/postgresql/share/extension" \
+  && REPMGR_BUILD="/tmp/repmgr-${REPMGR_VERSION}" \
+  && mkdir -p "${BITNAMI_EXTDIR}" \
+  && if [ -f "${REPMGR_BUILD}/repmgr.control" ]; then \
+       cp -a "${REPMGR_BUILD}/repmgr.control" "${BITNAMI_EXTDIR}/"; \
+       for f in "${REPMGR_BUILD}"/repmgr*.sql; do \
+         [ -f "$f" ] && cp -a "$f" "${BITNAMI_EXTDIR}/"; \
+       done; \
+     else \
+       echo "repmgr.control not in build tree ${REPMGR_BUILD}; ls:" >&2; ls -la "${REPMGR_BUILD}" >&2 || true; \
+       exit 1; \
+     fi \
+  && PG_SHARE="$(/opt/bitnami/postgresql/bin/pg_config --sharedir)" \
+  && for src in "${PG_SHARE}/extension" "${PG_SHARE}/postgresql/extension"; do \
+       if [ -f "${src}/repmgr.control" ]; then \
+         cp -a "${src}/repmgr.control" "${BITNAMI_EXTDIR}/"; \
+         for f in "${src}"/repmgr--*.sql; do \
+           [ -f "$f" ] && cp -a "$f" "${BITNAMI_EXTDIR}/"; \
+         done; \
+       fi; \
+     done \
+  && if [ ! -f "${BITNAMI_EXTDIR}/repmgr.control" ]; then \
+       ctrl="$(find /opt/bitnami/postgresql -name repmgr.control -print -quit 2>/dev/null || true)"; \
+       if [ -n "$ctrl" ]; then \
+         d="$(dirname "$ctrl")"; \
+         cp -a "${d}/repmgr.control" "${BITNAMI_EXTDIR}/"; \
+         for f in "${d}"/repmgr--*.sql; do \
+           [ -f "$f" ] && cp -a "$f" "${BITNAMI_EXTDIR}/"; \
+         done; \
+       fi; \
+     fi \
+  && if [ ! -f "${BITNAMI_EXTDIR}/repmgr.control" ]; then \
+       echo "repmgr extension files missing after install; pg_share=${PG_SHARE}" >&2; \
+       find /opt/bitnami/postgresql -name repmgr.control 2>/dev/null || true; \
+       exit 1; \
+     fi \
+  && find /opt/bitnami/postgresql/share -type d -name extension 2>/dev/null | while read -r extdir; do \
+       [ "$extdir" = "${BITNAMI_EXTDIR}" ] && continue; \
+       cp -a "${BITNAMI_EXTDIR}/repmgr.control" "${extdir}/"; \
+       for f in "${BITNAMI_EXTDIR}"/repmgr--*.sql; do \
+         [ -f "$f" ] && cp -a "$f" "${extdir}/"; \
+       done; \
+     done \
+  && chown -R 1001:1001 /opt/bitnami/postgresql/bin/repmgr /opt/bitnami/postgresql/bin/repmgrd \
+      "$(/opt/bitnami/postgresql/bin/pg_config --pkglibdir)" \
+      "${BITNAMI_EXTDIR}" \
+      "$(/opt/bitnami/postgresql/bin/pg_config --sharedir)/extension" \
+  && cd / && rm -rf "/tmp/repmgr-${REPMGR_VERSION}" \
+  && apt-get purge -y build-essential flex bison libcurl4-openssl-dev liblz4-dev libedit-dev \
+  && apt-get install -y --no-install-recommends liblz4-1 libedit2 libjson-c5 \
+  && apt-get autoremove -y \
+  && install -d -m 0755 /opt/bitnami/mcac-nss \
+  && test -f /opt/bitnami/common/lib/libnss_wrapper.so \
+  && umask 022 \
+  && printf '%s\n' \
+       'postgres:x:1001:0:PostgreSQL:/opt/bitnami/postgresql:/bin/bash' \
+       'root:x:0:0:root:/root:/bin/bash' \
+       > /opt/bitnami/mcac-nss/passwd \
+  && printf '%s\n' 'root:x:0:' 'postgres:x:1001:' > /opt/bitnami/mcac-nss/group \
+  && test -s /opt/bitnami/mcac-nss/passwd \
+  && test -s /opt/bitnami/mcac-nss/group \
+  && rm -rf /var/lib/apt/lists/*
+
+# repmgr uses getpwuid(3). Some clusters run UID 1001 with no passwd row (whoami / repmgr fail).
+# Force exactly one line for uid 1001 (do not rely on grep: base image layouts vary).
+RUN set -e; \
+  grep -v '^[^:]*:[^:]*:1001:' /etc/passwd > /tmp/passwd.new \
+  && mv /tmp/passwd.new /etc/passwd \
+  && echo 'postgres:x:1001:0:PostgreSQL:/opt/bitnami/postgresql:/bin/bash' >> /etc/passwd \
+  && test -n "$(getent passwd 1001)" \
+  && getent passwd 1001 | grep -q '^postgres:'
+
+# Prefer libc passwd/group files only; systemd/compat NSS in slim containers can make getpwuid(1001)
+# fail even when /etc/passwd is correct.
+RUN set -e; \
+  for k in passwd group shadow gshadow; do \
+    if grep -q "^${k}:" /etc/nsswitch.conf; then \
+      sed -i "s/^${k}:.*/${k}: files/" /etc/nsswitch.conf; \
+    fi; \
+  done
+
+# Default PATH for non-interactive `sh -c` / kubectl exec often omits /opt/bitnami/postgresql/bin.
+RUN ln -sf /opt/bitnami/postgresql/bin/repmgr /usr/local/bin/repmgr \
+  && ln -sf /opt/bitnami/postgresql/bin/repmgrd /usr/local/bin/repmgrd
+
+ENV PATH="/opt/bitnami/postgresql/bin:/opt/bitnami/common/bin:${PATH}"
+
+# nss_wrapper paths (files created in the repmgr RUN above, same layer as the binaries).
+ENV NSS_WRAPPER_LIB=/opt/bitnami/common/lib/libnss_wrapper.so
+ENV LD_PRELOAD=/opt/bitnami/common/lib/libnss_wrapper.so
+ENV NSS_WRAPPER_PASSWD=/opt/bitnami/mcac-nss/passwd
+ENV NSS_WRAPPER_GROUP=/opt/bitnami/mcac-nss/group
+
+# WAL archive helper (archive_command set in conf.d — not via POSTGRESQL_EXTRA_FLAGS; Bitnami splits flags on spaces, breaking mkdir -p / test -f).
+# K8s init writes archive_command to this path (must stay in sync with gen_demo_hub_k8s._postgres_ha_init_containers).
+COPY mcac-wal-archive.sh /opt/bitnami/scripts/mcac-wal-archive.sh
+RUN chmod 0755 /opt/bitnami/scripts/mcac-wal-archive.sh && chown 1001:0 /opt/bitnami/scripts/mcac-wal-archive.sh
+
+# Tiny vi/vim for kubectl exec debugging (optional).
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends vim-tiny \
+  && rm -rf /var/lib/apt/lists/*
+
+# repmgr installs into Bitnami PostgreSQL bin / lib via PGXS
+USER postgres

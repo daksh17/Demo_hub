@@ -6,6 +6,8 @@ Docker Compose for this stack uses **`name: demo-hub`** in [`../../docker-compos
 
 If you are new to Kubernetes, read **[Kubernetes basics (for this demo)](#kubernetes-basics-for-this-demo)** first, then **[Basic diagnostics](#basic-diagnostics)** when something fails.
 
+**One command (stack + data bootstrap + all six Kafka Connect connectors):** from **`dashboards/demo`**, run **[`../../demo-start-hub.sh`](../../demo-start-hub.sh)** after custom images are built (Quick start §1). Uses a short-lived **`kubectl port-forward`** to Connect **:8083** and runs **[`register-all-connectors.sh`](../docker/kafka-connect-register/register-all-connectors.sh)** with **`DEMO_HUB_K8S=1`** (includes idempotent MSSQL schema apply). Options: **`REGEN=1`**, **`./demo-start-hub.sh --no-connectors`**.
+
 ---
 
 ## Quick start (step by step)
@@ -20,10 +22,14 @@ The cluster **cannot pull** these names from Docker Hub. Build them with Docker 
 |-------|------|-----------------|
 | **`mcac-demo/mcac-init:local`** | Cassandra **initContainer** copies the MCAC agent into the ring pods (`imagePullPolicy: Never`) | [`deploy/k8s/scripts/build-mcac-init-image.sh`](scripts/build-mcac-init-image.sh) |
 | **`mcac-demo/hub-demo-ui:latest`** | Hub FastAPI UI | `docker build -t mcac-demo/hub-demo-ui:latest -f deploy/docker/realtime-orders-search-hub/demo-ui/Dockerfile deploy/docker/realtime-orders-search-hub/demo-ui` |
-| **`mcac-demo/kafka-connect:2.7.3-mongo-sink`** | Kafka Connect (Debezium + Mongo sink) | `docker build -t mcac-demo/kafka-connect:2.7.3-mongo-sink -f deploy/docker/mongo-kafka/Dockerfile.connect deploy/docker/mongo-kafka` |
+| **`mcac-demo/kafka-connect:2.7.3-mongo-sink`** | Kafka Connect (Debezium + Mongo sink + SQL Server connector, same [`Dockerfile.connect`](../docker/mongo-kafka/Dockerfile.connect)) | `docker build -t mcac-demo/kafka-connect:2.7.3-mongo-sink -f deploy/docker/mongo-kafka/Dockerfile.connect deploy/docker/mongo-kafka` |
+| **`mcac-demo/mssql-tools:22.04`** | **`mssql-demo-bootstrap`** Job (`sqlcmd`, schema + `register-mssql-connectors.sh`) | [`deploy/k8s/scripts/build-mssql-tools-image.sh`](scripts/build-mssql-tools-image.sh) |
 | **`demo-hub/nodetool-exporter:latest`** | Scrapes `nodetool` metrics | `docker build -t demo-hub/nodetool-exporter:latest -f deploy/docker/nodetool-exporter/Dockerfile deploy/docker/nodetool-exporter` |
+| **`mcac-demo/postgresql-repmgr:16.6.0`** | Bitnami-style Postgres + repmgr (primary/replicas) | See **`build-all-custom-images.sh`** step 6 |
 
-**One command** (runs all four):
+**Public images** (no local build): **`mcr.microsoft.com/mssql/server:2022-CU14-ubuntu-22.04`** (publisher + subscriber), **`awaragi/prometheus-mssql-exporter`**.
+
+**One command** (runs all custom builds):
 
 ```bash
 cd /path/to/mcac-demo-hub/dashboards/demo
@@ -34,7 +40,9 @@ chmod +x deploy/k8s/scripts/build-all-custom-images.sh
 After changing Dockerfiles or hub code, rebuild and roll out, for example:
 
 ```bash
-kubectl rollout restart deployment/kafka-connect deployment/hub-demo-ui deployment/nodetool-exporter statefulset/cassandra -n demo-hub
+kubectl rollout restart deployment/kafka-connect deployment/hub-demo-ui deployment/nodetool-exporter \
+  deployment/mssql-publisher deployment/mssql-subscriber deployment/mssql-exporter-publisher deployment/mssql-exporter-subscriber \
+  statefulset/cassandra -n demo-hub
 ```
 
 ### 2. Generate manifests (if you edit the generator or Prometheus/Grafana assets)
@@ -113,16 +121,26 @@ Alternative: **`./deploy/k8s/scripts/demo-hub.sh port-forward`** (waits for Depl
   - **Exec** (no forward): `kubectl exec -it -n demo-hub cassandra-0 -c cassandra -- cqlsh localhost 9042`
   - **NodePort** (DBeaver / GUI): `kubectl apply -f deploy/k8s/optional-cassandra-0-cql-nodeport.yaml` → connect to **`<node-ip>:30942`** (see [optional-cassandra-0-cql-nodeport.yaml](optional-cassandra-0-cql-nodeport.yaml)); delete the Service when finished if you do not want it permanently.
 
-### 6. Kafka Connect connectors (not auto-registered on K8s)
+### 6. Kafka Connect connectors (Postgres + Mongo manual on K8s; MSSQL via Job or script)
 
 After **`LOCAL_KAFKA_CONNECT_PORT`** is reachable (default **8083**):
+
+**Postgres + Mongo only (four connectors):**
 
 ```bash
 cd /path/to/mcac-demo-hub/dashboards/demo
 DEMO_HUB_K8S=1 ./deploy/docker/kafka-connect-register/register-all.sh http://127.0.0.1:8083
 ```
 
-**`DEMO_HUB_K8S=1`** sets the Debezium Postgres connector’s schema-history bootstrap to **`kafka:9092`** (Compose uses **`kafka:29092`**). See [`deploy/docker/kafka-connect-register/register-all.sh`](../docker/kafka-connect-register/register-all.sh).
+**All six (adds SQL Server Debezium + JDBC sink)** — same port-forward; MSSQL schema must exist (e.g. **`mssql-demo-bootstrap`** completed):
+
+```bash
+DEMO_HUB_K8S=1 ./deploy/docker/kafka-connect-register/register-all-connectors.sh http://127.0.0.1:8083
+```
+
+**Resume** existing connectors without re-registering: [`resume-kafka-connectors.sh`](../docker/kafka-connect-register/resume-kafka-connectors.sh).
+
+**`DEMO_HUB_K8S=1`** sets Debezium schema-history bootstrap to **`kafka:9092`** (Compose uses **`kafka:29092`**). See [`register-all.sh`](../docker/kafka-connect-register/register-all.sh) and [`register-all-connectors.sh`](../docker/kafka-connect-register/register-all-connectors.sh).
 
 ### HashiCorp Vault (demo secrets + connector fields)
 
@@ -378,6 +396,7 @@ See **[Troubleshooting](#troubleshooting)** for stack-specific issues.
 | `50-redis.yaml` | Redis + redis-exporter (Redis password from Secret) |
 | `60-mongo-sharded.yaml` | Config servers, shard `mongod`s, mongos (same DNS names as Compose) |
 | `61-mongo-bootstrap-job.yaml` | Job: sharded cluster init + collections |
+| `62-mssql.yaml` | SQL Server **publisher** + **subscriber** (Deployments), **mssql-exporter-***, ConfigMap + **mssql-demo-bootstrap** Job (schema, optional replication try, Debezium/JDBC registration) |
 | `70-kafka-connect.yaml` | Kafka Connect |
 | `80-exporters.yaml` | Postgres exporters, kafka-exporter, mongodb-exporter |
 | `90-opensearch.yaml` | OpenSearch (+ ConfigMap for `opensearch.yml`), Dashboards, elasticsearch-exporter |
@@ -389,7 +408,7 @@ See **[Troubleshooting](#troubleshooting)** for stack-specific issues.
 
 Labels:
 
-- **`demo-hub.io/group`**: `cassandra-ring`, `postgres-ha`, `mongo-config-servers`, `mongo-shards`, `mongo-mongos`, `kafka`, `observability`, `opensearch`, …
+- **`demo-hub.io/group`**: `cassandra-ring`, `postgres-ha`, `mongo-config-servers`, `mongo-shards`, `mongo-mongos`, `kafka`, `mssql`, `observability`, `opensearch`, …
 - **`app.kubernetes.io/part-of: demo-hub`**
 
 **Regenerate:**
@@ -489,7 +508,7 @@ chmod +x deploy/k8s/scripts/apply-data-bootstrap.sh
 ./deploy/k8s/scripts/apply-data-bootstrap.sh
 ```
 
-Or apply `generated/45-postgres-bootstrap-job.yaml`, `35-cassandra-schema-job.yaml`, and `61-mongo-bootstrap-job.yaml` manually and `kubectl wait` for each Job to complete. To re-run a Job after failure, `kubectl delete job -n demo-hub <job-name>` then apply again (Postgres SQL is mostly idempotent; `CREATE USER` / `CREATE PUBLICATION` may need a fresh DB or hand-edited SQL on repeat).
+Or apply `generated/45-postgres-bootstrap-job.yaml`, `35-cassandra-schema-job.yaml`, `61-mongo-bootstrap-job.yaml`, and (after **Kafka Connect** is Ready) `62-mssql.yaml` for the **mssql-demo-bootstrap** Job — or use **`apply-data-bootstrap.sh`**, which waits for Connect before MSSQL connector registration. To re-run a Job after failure, `kubectl delete job -n demo-hub <job-name>` then apply again (Postgres SQL is mostly idempotent; `CREATE USER` / `CREATE PUBLICATION` may need a fresh DB or hand-edited SQL on repeat).
 
 **Images — custom builds (not on Docker Hub):** Several workloads use **`mcac-demo/*`** and **`demo-hub/nodetool-exporter`** — the cluster cannot pull them until you **build locally** (same sources as Docker Compose). Use the **one-shot** script from `dashboards/demo`:
 
@@ -498,11 +517,11 @@ chmod +x deploy/k8s/scripts/build-all-custom-images.sh
 ./deploy/k8s/scripts/build-all-custom-images.sh
 ```
 
-That builds: **`mcac-demo/mcac-init:local`** (Cassandra MCAC initContainer, **`imagePullPolicy: Never`**), **`mcac-demo/hub-demo-ui:latest`**, **`mcac-demo/kafka-connect:2.7.3-mongo-sink`**, **`demo-hub/nodetool-exporter:latest`**. Then restart failing Deployments / StatefulSet, e.g. `kubectl rollout restart deployment/kafka-connect deployment/hub-demo-ui deployment/nodetool-exporter statefulset/cassandra -n demo-hub`. **kind / minikube:** load each image after build (`kind load docker-image …` — see script footer). **OrbStack / Docker Desktop:** the Kubernetes node usually shares the local Docker image store after `docker build`.
+That builds: **`mcac-demo/mcac-init:local`** (Cassandra MCAC initContainer, **`imagePullPolicy: Never`**), **`mcac-demo/hub-demo-ui:latest`**, **`mcac-demo/kafka-connect:2.7.3-mongo-sink`**, **`mcac-demo/mssql-tools:22.04`**, **`demo-hub/nodetool-exporter:latest`**, **`mcac-demo/postgresql-repmgr:16.6.0`** (Bitnami PostgreSQL 16 + **repmgr** CLI/extension — see [`../docker/postgres-kafka/Dockerfile.repmgr`](../docker/postgres-kafka/Dockerfile.repmgr)). Then restart failing Deployments / StatefulSet, e.g. `kubectl rollout restart deployment/kafka-connect deployment/hub-demo-ui deployment/nodetool-exporter deployment/mssql-publisher deployment/mssql-subscriber deployment/mssql-exporter-publisher deployment/mssql-exporter-subscriber statefulset/cassandra -n demo-hub` (and **`deployment/postgresql-primary`** / replicas if Postgres image was missing). **kind / minikube:** load each image after build (`kind load docker-image …` — see script footer). **OrbStack / Docker Desktop:** the Kubernetes node usually shares the local Docker image store after `docker build`.
 
 **Prometheus** uses the public image **`prom/prometheus:v2.17.1`** — **CrashLoopBackOff** is not an image pull issue; see [Troubleshooting](#troubleshooting) (`kubectl logs deploy/prometheus -n demo-hub`).
 
-**PostgreSQL (Bitnami):** Generated manifests use a **pinned** image on **`docker.io/bitnamilegacy/postgresql`** (see `POSTGRESQL_IMAGE` in `gen_demo_hub_k8s.py`). Unpinned tags like `docker.io/bitnami/postgresql:16` may return **manifest unknown** on Docker Hub; if you see **ImagePullBackOff** on `postgresql-*`, regenerate and re-apply, or bump the pin to a current tag from [bitnamilegacy/postgresql tags](https://hub.docker.com/r/bitnamilegacy/postgresql/tags).
+**PostgreSQL (Bitnami + repmgr):** Generated manifests use **`mcac-demo/postgresql-repmgr:16.6.0`** — a local build from **`docker.io/bitnamilegacy/postgresql:16.6.0-debian-12-r2`** with **repmgr** (see `POSTGRESQL_IMAGE` in `gen_demo_hub_k8s.py` and `Dockerfile.repmgr`). It is **not** on Docker Hub; run **`build-all-custom-images.sh`** or `docker compose build postgresql-primary` from `dashboards/demo`, then **`kind load docker-image mcac-demo/postgresql-repmgr:16.6.0`** (or push to your registry and retag). **`postgres-demo-bootstrap`** creates the **`repmgr`** database and extension on the primary.
 
 **Nodetool-exporter:** Compose now tags the build as **`demo-hub/nodetool-exporter:latest`** (see `nodetool-exporter` in [`../docker-compose.yml`](../docker-compose.yml)). After `kubectl apply`, if the pod is **ImagePullBackOff**, build and load:
 
@@ -539,7 +558,10 @@ python3 scripts/gen_demo_hub_pods.py
 | Symptom | Typical cause |
 |--------|----------------|
 | **`demo-hub.sh` / `apply-data-bootstrap.sh` stuck** on “Waiting for PostgreSQL primary…” | `kubectl rollout status` waits until the **primary pod is Ready**. If the pod is **Pending** (disk-pressure, insufficient CPU/RAM) or **CrashLoop** / **ImagePullBackOff**, this blocks until timeout (~7 min). Run: `kubectl get pods -n demo-hub -l app.kubernetes.io/name=postgresql-primary`; `kubectl describe pod -n demo-hub -l app.kubernetes.io/name=postgresql-primary` and read **Events**. Fix node disk/resources or image issues first. |
-| **PostgreSQL `ErrImagePull` / `manifest unknown`** for `bitnami/postgresql:16` | Docker Hub may not publish that tag anymore. Regenerate manifests (`python3 deploy/k8s/scripts/gen_demo_hub_k8s.py`) so images use **`bitnamilegacy/postgresql`** with a pinned tag, then `kubectl apply -f deploy/k8s/generated/all.yaml` and restart the deployments. |
+| **PostgreSQL `ErrImagePull` on `mcac-demo/postgresql-repmgr:16.6.0`** | Build the image (`./deploy/k8s/scripts/build-all-custom-images.sh` step 6/6, or `docker build -f deploy/docker/postgres-kafka/Dockerfile.repmgr …`), then load into the cluster (`kind load docker-image mcac-demo/postgresql-repmgr:16.6.0`) or push to a registry the nodes can pull. Restart **`postgresql-primary`** and replicas. |
+| **`mssql-demo-bootstrap` ImagePullBackOff** / **ErrImageNeverPull** (`mcac-demo/mssql-tools:22.04`) | This tag is **not** on a public registry. Build [`scripts/build-mssql-tools-image.sh`](scripts/build-mssql-tools-image.sh) (or **`build-all-custom-images.sh`**) with the **same Docker/OrbStack** your cluster uses. **OrbStack** K8s normally sees locally built images immediately; **kind** needs `kind load docker-image mcac-demo/mssql-tools:22.04`. The Job uses **`imagePullPolicy: Never`** so kubelet does not try Docker Hub. `kubectl delete job mssql-demo-bootstrap -n demo-hub` → `kubectl apply -f generated/62-mssql.yaml` (or **`apply-data-bootstrap.sh`**). |
+| **Publisher has no `demo` DB** (verify script lists only master/model/msdb/tempdb) | Schema init never ran or the bootstrap Job failed early. Run [`scripts/apply-mssql-schema-k8s.sh`](scripts/apply-mssql-schema-k8s.sh) from **`dashboards/demo`**, then [`scripts/verify-mssql-publisher-demo.sh`](scripts/verify-mssql-publisher-demo.sh) — **`demo`** should appear. Re-register MSSQL connectors (`register-mssql-connectors.sh` with **`DEMO_HUB_K8S=1`** and port-forward). |
+| **SQL Server pods CrashLoop / wrong platform** | Image is **`linux/amd64`**. On **Apple Silicon** clusters without emulation, schedule on **amd64** nodes or use a cluster that runs x86_64 SQL Server. **`mssql-publisher` / `mssql-subscriber`** need ~**2–4Gi** memory per [`62-mssql.yaml`](generated/62-mssql.yaml) limits. |
 | **ErrImagePull** / **ImagePullBackOff** (nodetool-exporter) | Not on a public registry — build and load: **`./deploy/k8s/scripts/build-load-nodetool-exporter.sh`** (or `docker compose build nodetool-exporter` then `kind load docker-image demo-hub/nodetool-exporter:latest`). |
 | **Kafka / kafka-exporter CrashLoop** | Stack uses **Bitnami Legacy** Kafka + ZooKeeper (`docker.io/bitnamilegacy/kafka`, `bitnamilegacy/zookeeper`) — same **`kafka:9092`** bootstrap as before. Re-apply `generated/20-zookeeper-kafka.yaml`, then **`kubectl delete pod -n demo-hub -l app.kubernetes.io/name=kafka`** (stuck rollouts can leave two Kafka ReplicaSets). Ensure nodes can **pull** `docker.io/bitnamilegacy/*`. |
 | **hub-demo-ui ErrImagePull** / **ImagePullBackOff** | Image **`mcac-demo/hub-demo-ui:latest`** is local-only — run **`./deploy/k8s/scripts/build-all-custom-images.sh`** (or build that Dockerfile under `deploy/docker/realtime-orders-search-hub/demo-ui`), then `kubectl rollout restart deploy/hub-demo-ui -n demo-hub`. |

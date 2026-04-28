@@ -22,6 +22,177 @@ stringData:
   demo-user-password: demopass
   hub-postgres-dsn: postgresql://demo:demopass@postgresql-primary:5432/demo
   hub-redis-url: redis://:demoredispass@redis:6379/0
+  mssql-sa-password: Demo_hub_Mssql_2025!
+---
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vault
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/name: vault
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: vault
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vault
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/name: vault
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: vault
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+        app.kubernetes.io/name: vault
+        app.kubernetes.io/part-of: demo-hub
+        demo-hub.io/group: vault
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: vault
+        app.kubernetes.io/part-of: demo-hub
+        demo-hub.io/group: vault
+    spec:
+      serviceAccountName: vault
+      containers:
+        - name: vault
+          image: hashicorp/vault:1.15.6
+          imagePullPolicy: IfNotPresent
+          args:
+            - server
+            - -dev
+            - -dev-listen-address=0.0.0.0:8200
+            - -dev-root-token-id=demo-hub-dev-root
+          env:
+            - name: VAULT_API_ADDR
+              value: "http://0.0.0.0:8200"
+          ports:
+            - name: http
+              containerPort: 8200
+          securityContext:
+            capabilities:
+              add:
+                - IPC_LOCK
+          readinessProbe:
+            httpGet:
+              path: /v1/sys/health
+              port: http
+              scheme: HTTP
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /v1/sys/health
+              port: http
+              scheme: HTTP
+            initialDelaySeconds: 10
+            periodSeconds: 15
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: vault
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/name: vault
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: vault
+spec:
+  type: ClusterIP
+  selector:
+        app.kubernetes.io/name: vault
+        app.kubernetes.io/part-of: demo-hub
+        demo-hub.io/group: vault
+  ports:
+    - name: http
+      port: 8200
+      targetPort: http
+---
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vault-demo-hub-seed
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/name: vault
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: vault
+spec:
+  ttlSecondsAfterFinished: 86400
+  backoffLimit: 8
+  activeDeadlineSeconds: 600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: vault
+        app.kubernetes.io/part-of: demo-hub
+        demo-hub.io/group: vault
+    spec:
+      restartPolicy: Never
+      initContainers:
+        - name: wait-vault
+          image: busybox:1.36
+          command:
+            - /bin/sh
+            - -c
+            - |
+              for i in $(seq 1 90); do
+                if wget -q -O- http://vault.demo-hub.svc.cluster.local:8200/v1/sys/health >/dev/null 2>&1; then
+                  exit 0
+                fi
+                sleep 2
+              done
+              echo "timeout waiting for Vault" >&2
+              exit 1
+      containers:
+        - name: seed
+          image: hashicorp/vault:1.15.6
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: VAULT_ADDR
+              value: "http://vault.demo-hub.svc.cluster.local:8200"
+            - name: VAULT_TOKEN
+              value: "demo-hub-dev-root"
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eux
+              export VAULT_ADDR=http://vault.demo-hub.svc.cluster.local:8200
+              export VAULT_TOKEN=demo-hub-dev-root
+              vault kv put secret/demo-hub/credentials \
+                          postgresql-password=postgres \
+                          postgresql-replication-password=replicatorpass \
+                          redis-password=demoredispass \
+                          demo-user-password=demopass \
+                          hub-postgres-dsn=postgresql://demo:demopass@postgresql-primary:5432/demo \
+                          hub-redis-url=redis://:demoredispass@redis:6379/0 \
+                          mssql-sa-password='Demo_hub_Mssql_2025!'
+              vault kv put secret/demo-hub/kafka-connect/pg-source \
+                          database.hostname=postgresql-primary \
+                          database.port=5432 \
+                          database.user=replicator \
+                          database.password=replicatorpass \
+                          database.dbname=demo
+              vault kv put secret/demo-hub/kafka-connect/jdbc-sink \
+                          connection.url=jdbc:postgresql://postgresql-primary:5432/demo \
+                          connection.username=demo \
+                          connection.password=demopass
+              vault kv put secret/demo-hub/kafka-connect/mongo-source \
+                          mongodb.connection.string=mongodb://mongo-mongos1:27017
+              vault kv put secret/demo-hub/kafka-connect/mongo-sink \
+                          connection.uri=mongodb://mongo-mongos1:27017 \
+                          database=demo \
+                          collection=demo_items_from_kafka
+              echo "Vault KV seed complete."
 ---
 
 apiVersion: v1
@@ -399,6 +570,24 @@ data:
               - opensearch-exporter:9114
             labels:
               os_cluster: demo
+
+      # SQL Server (awaragi/prometheus-mssql-exporter; one target per instance on demo_net)
+      - job_name: "mssql_demo"
+        scrape_interval: 30s
+        scrape_timeout: 25s
+        metrics_path: /metrics
+        scheme: http
+        static_configs:
+          - targets:
+              - mssql-exporter-publisher:4000
+            labels:
+              mssql_role: publisher
+              mssql_cluster: demo-hub
+          - targets:
+              - mssql-exporter-subscriber:4000
+            labels:
+              mssql_role: subscriber
+              mssql_cluster: demo-hub
 ---
 
 apiVersion: v1
@@ -3052,6 +3241,1594 @@ data:
 apiVersion: v1
 kind: ConfigMap
 metadata:
+  name: grafana-db-mongodb-overview-percona-demo-hub-json
+  namespace: demo-hub
+  labels:
+    demo-hub.io/group: observability
+    app.kubernetes.io/part-of: demo-hub
+data:
+  mongodb-overview-percona-demo-hub.json: |
+    {
+      "annotations": {
+        "list": [
+          {
+            "builtIn": 1,
+            "datasource": {
+              "type": "datasource",
+              "uid": "grafana"
+            },
+            "enable": true,
+            "hide": false,
+            "iconColor": "#e0752d",
+            "limit": 100,
+            "name": "PMM Annotations",
+            "showIn": 0,
+            "tags": [
+              "pmm_annotation"
+            ],
+            "type": "tags"
+          }
+        ]
+      },
+      "description": "Percona MongoDB Overview adapted for mcac-demo-hub Prometheus scrape labels: job=mongodb, mongo_topology=sharded, mongo_cluster=tictactoe. Regenerate from grafana.com/api/dashboards/20192/revisions/<n>/download as needed. See dashboards/grafana/scripts/adapt-percona-mongodb-overview-demo-hub.py.",
+      "editable": true,
+      "fiscalYearStartMonth": 0,
+      "gnetId": null,
+      "graphTooltip": 1,
+      "id": null,
+      "links": [],
+      "liveNow": false,
+      "panels": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "description": "Shows how many times a command is executed per second on average during the selected interval.",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 20,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "red",
+                    "value": 80
+                  }
+                ]
+              },
+              "unit": "ops"
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byValue",
+                  "options": {
+                    "op": "gte",
+                    "reducer": "allIsZero",
+                    "value": 0
+                  }
+                },
+                "properties": [
+                  {
+                    "id": "custom.hideFrom",
+                    "value": {
+                      "legend": true,
+                      "tooltip": true,
+                      "viz": false
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 24,
+            "x": 0,
+            "y": 0
+          },
+          "id": 15,
+          "links": [],
+          "options": {
+            "legend": {
+              "calcs": [
+                "mean",
+                "max",
+                "min"
+              ],
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "none"
+            }
+          },
+          "pluginVersion": "10.1.5",
+          "targets": [
+            {
+              "datasource": {
+                "uid": "$datasource"
+              },
+              "editorMode": "code",
+              "expr": "rate(mongodb_ss_opcounters{job=\"mongodb\",mongo_topology=\"sharded\",mongo_cluster=~\"$cluster\",instance=\"$host\", legacy_op_type!=\"command\"}[$interval])",
+              "format": "time_series",
+              "hide": false,
+              "interval": "$interval",
+              "intervalFactor": 1,
+              "legendFormat": "{{legacy_op_type}}",
+              "range": true,
+              "refId": "J",
+              "step": 300
+            },
+            {
+              "datasource": {
+                "uid": "$datasource"
+              },
+              "editorMode": "code",
+              "expr": "rate(mongodb_ss_opcountersRepl{job=\"mongodb\",mongo_topology=\"sharded\",mongo_cluster=~\"$cluster\",instance=\"$host\", legacy_op_type!~\"(command|query|getmore)\"}[$interval])",
+              "format": "time_series",
+              "hide": false,
+              "interval": "$interval",
+              "intervalFactor": 1,
+              "legendFormat": "repl_{{legacy_op_type}}",
+              "range": true,
+              "refId": "A",
+              "step": 300
+            },
+            {
+              "datasource": {
+                "uid": "$datasource"
+              },
+              "editorMode": "code",
+              "expr": "rate(mongodb_ss_opcounters_deprecated_delete{job=\"mongodb\",mongo_topology=\"sharded\",mongo_cluster=~\"$cluster\",instance=\"$host\"}[$interval])",
+              "format": "time_series",
+              "hide": false,
+              "interval": "$interval",
+              "intervalFactor": 1,
+              "legendFormat": "ttl_delete",
+              "range": true,
+              "refId": "B",
+              "step": 300
+            }
+          ],
+          "title": "Command Operations",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "description": "Keep in mind the hard limit on the maximum number of connections set by your distribution.",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 20,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "red",
+                    "value": 80
+                  }
+                ]
+              },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 12,
+            "x": 0,
+            "y": 7
+          },
+          "id": 38,
+          "links": [],
+          "options": {
+            "legend": {
+              "calcs": [
+                "mean",
+                "max",
+                "min"
+              ],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "none"
+            }
+          },
+          "pluginVersion": "10.1.5",
+          "targets": [
+            {
+              "datasource": {
+                "uid": "$datasource"
+              },
+              "editorMode": "code",
+              "expr": "mongodb_ss_connections{job=\"mongodb\",mongo_topology=\"sharded\",mongo_cluster=~\"$cluster\",instance=\"$host\", conn_type=\"current\"}",
+              "format": "time_series",
+              "hide": false,
+              "interval": "$interval",
+              "intervalFactor": 1,
+              "legendFormat": "Connections",
+              "range": true,
+              "refId": "J",
+              "step": 300
+            }
+          ],
+          "title": "Connections",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "description": "Helps identify why connections are increasing. Shows active cursors compared to cursors being automatically killed after 10 minutes due to an application not closing the connection.",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 20,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "red",
+                    "value": 80
+                  }
+                ]
+              },
+              "unit": "short"
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byValue",
+                  "options": {
+                    "op": "gte",
+                    "reducer": "allIsZero",
+                    "value": 0
+                  }
+                },
+                "properties": [
+                  {
+                    "id": "custom.hideFrom",
+                    "value": {
+                      "legend": true,
+                      "tooltip": true,
+                      "viz": false
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 12,
+            "x": 12,
+            "y": 7
+          },
+          "id": 25,
+          "links": [],
+          "options": {
+            "legend": {
+              "calcs": [
+                "mean",
+                "max",
+                "min"
+              ],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "none"
+            }
+          },
+          "pluginVersion": "10.1.5",
+          "targets": [
+            {
+              "datasource": {
+                "uid": "$datasource"
+              },
+              "editorMode": "code",
+              "expr": "mongodb_ss_metrics_cursor_open{job=\"mongodb\",mongo_topology=\"sharded\",mongo_cluster=~\"$cluster\",instance=\"$host\"}",
+              "format": "time_series",
+              "hide": false,
+              "interval": "$interval",
+              "intervalFactor": 1,
+              "legendFormat": "{{csr_type}}",
+              "range": true,
+              "refId": "J",
+              "step": 300
+            }
+          ],
+          "title": "Cursors",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "description": "When used in combination with 'Command Operations', this graph can help identify write amplification. For example, when one insert or update command actually inserts or updates hundreds, thousands, or even millions of documents.",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 20,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "red",
+                    "value": 80
+                  }
+                ]
+              },
+              "unit": "ops"
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byValue",
+                  "options": {
+                    "op": "gte",
+                    "reducer": "allIsZero",
+                    "value": 0
+                  }
+                },
+                "properties": [
+                  {
+                    "id": "custom.hideFrom",
+                    "value": {
+                      "legend": true,
+                      "tooltip": true,
+                      "viz": false
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 12,
+            "x": 0,
+            "y": 14
+          },
+          "id": 36,
+          "links": [],
+          "options": {
+            "legend": {
+              "calcs": [
+                "mean",
+                "max",
+                "min"
+              ],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "none"
+            }
+          },
+          "pluginVersion": "10.1.5",
+          "targets": [
+            {
+              "datasource": {
+                "uid": "$datasource"
+              },
+              "editorMode": "code",
+              "expr": "rate(mongodb_ss_metrics_document{job=\"mongodb\",mongo_topology=\"sharded\",mongo_cluster=~\"$cluster\",instance=\"$host\"}[$interval])",
+              "format": "time_series",
+              "hide": false,
+              "interval": "$interval",
+              "intervalFactor": 1,
+              "legendFormat": "{{doc_op_type}}",
+              "range": true,
+              "refId": "J",
+              "step": 300
+            }
+          ],
+          "title": "Document Operations",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "description": "Any number of queued operations for long periods of time is an indication of possible issues. Find the cause and fix it before requests get stuck in the queue.",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 20,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "red",
+                    "value": 80
+                  }
+                ]
+              },
+              "unit": "ops"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 12,
+            "x": 12,
+            "y": 14
+          },
+          "id": 40,
+          "links": [],
+          "options": {
+            "legend": {
+              "calcs": [
+                "mean",
+                "max",
+                "min"
+              ],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "none"
+            }
+          },
+          "pluginVersion": "10.1.5",
+          "targets": [
+            {
+              "datasource": {
+                "uid": "$datasource"
+              },
+              "editorMode": "code",
+              "expr": "mongodb_ss_globalLock_currentQueue{job=\"mongodb\",mongo_topology=\"sharded\",mongo_cluster=~\"$cluster\",instance=\"$host\"}",
+              "format": "time_series",
+              "hide": false,
+              "interval": "$interval",
+              "intervalFactor": 1,
+              "legendFormat": "{{count_type}}",
+              "range": true,
+              "refId": "J",
+              "step": 300
+            }
+          ],
+          "title": "Queued Operations",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 20,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "red",
+                    "value": 80
+                  }
+                ]
+              },
+              "unit": "percentunit"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 12,
+            "x": 0,
+            "y": 21
+          },
+          "id": 63,
+          "links": [],
+          "options": {
+            "legend": {
+              "calcs": [
+                "mean",
+                "max",
+                "min"
+              ],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "none"
+            }
+          },
+          "pluginVersion": "10.1.5",
+          "targets": [
+            {
+              "datasource": {
+                "uid": "$datasource"
+              },
+              "editorMode": "code",
+              "expr": "sum(increase(mongodb_ss_metrics_queryExecutor_scanned{job=\"mongodb\",mongo_topology=\"sharded\",mongo_cluster=~\"$cluster\",instance=\"$host\"}[5m]))/sum(increase(mongodb_ss_metrics_document{job=\"mongodb\",mongo_topology=\"sharded\",mongo_cluster=~\"$cluster\",instance=\"$host\", doc_op_type=\"returned\"}[5m]))",
+              "format": "time_series",
+              "hide": false,
+              "interval": "$interval",
+              "intervalFactor": 1,
+              "legendFormat": "Document",
+              "range": true,
+              "refId": "J",
+              "step": 300
+            },
+            {
+              "datasource": {
+                "uid": "$datasource"
+              },
+              "expr": "sum(increase(mongodb_mongod_metrics_query_executor_total{job=\"mongodb\",mongo_topology=\"sharded\",mongo_cluster=~\"$cluster\",instance=\"$host\", state=\"scanned\"}[5m]))/sum(increase(mongodb_mongod_metrics_document_total{job=\"mongodb\",mongo_topology=\"sharded\",mongo_cluster=~\"$cluster\",instance=\"$host\", state=\"returned\"}[5m]))",
+              "format": "time_series",
+              "hide": false,
+              "interval": "$interval",
+              "intervalFactor": 1,
+              "legendFormat": "Index",
+              "refId": "A",
+              "step": 300
+            }
+          ],
+          "title": "Query Efficiency",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 20,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "red",
+                    "value": 80
+                  }
+                ]
+              },
+              "unit": "ops"
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byValue",
+                  "options": {
+                    "op": "gte",
+                    "reducer": "allIsZero",
+                    "value": 0
+                  }
+                },
+                "properties": [
+                  {
+                    "id": "custom.hideFrom",
+                    "value": {
+                      "legend": true,
+                      "tooltip": true,
+                      "viz": false
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 12,
+            "x": 12,
+            "y": 21
+          },
+          "id": 64,
+          "links": [],
+          "options": {
+            "legend": {
+              "calcs": [
+                "mean",
+                "max",
+                "min"
+              ],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "none"
+            }
+          },
+          "pluginVersion": "10.1.5",
+          "targets": [
+            {
+              "datasource": {
+                "uid": "$datasource"
+              },
+              "editorMode": "code",
+              "expr": "rate(mongodb_ss_metrics_queryExecutor_scanned{job=\"mongodb\",mongo_topology=\"sharded\",mongo_cluster=~\"$cluster\",instance=\"$host\"}[$interval]) or irate(mongodb_ss_metrics_queryExecutor_scanned{job=\"mongodb\",mongo_topology=\"sharded\",mongo_cluster=~\"$cluster\",instance=\"$host\"}[5m])",
+              "format": "time_series",
+              "interval": "$interval",
+              "intervalFactor": 1,
+              "legendFormat": "scanned",
+              "metric": "",
+              "range": true,
+              "refId": "A",
+              "step": 300
+            },
+            {
+              "datasource": {
+                "uid": "$datasource"
+              },
+              "editorMode": "code",
+              "expr": "rate(mongodb_ss_metrics_record_moves{job=\"mongodb\",mongo_topology=\"sharded\",mongo_cluster=~\"$cluster\",instance=\"$host\"}[$interval]) or irate(mongodb_ss_metrics_record_moves{job=\"mongodb\",mongo_topology=\"sharded\",mongo_cluster=~\"$cluster\",instance=\"$host\"}[5m])",
+              "format": "time_series",
+              "interval": "$interval",
+              "intervalFactor": 1,
+              "legendFormat": "moved",
+              "range": true,
+              "refId": "B",
+              "step": 300
+            }
+          ],
+          "title": "Scanned and Moved Objects",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "description": "This is useful for write-heavy workloads to understand how long it takes to verify writes and how many concurrent writes are occurring.",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 20,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "red",
+                    "value": 80
+                  }
+                ]
+              },
+              "unit": "ms"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 12,
+            "x": 0,
+            "y": 28
+          },
+          "id": 41,
+          "links": [],
+          "options": {
+            "legend": {
+              "calcs": [
+                "mean",
+                "max",
+                "min"
+              ],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "none"
+            }
+          },
+          "pluginVersion": "10.1.5",
+          "targets": [
+            {
+              "datasource": {
+                "uid": "$datasource"
+              },
+              "editorMode": "code",
+              "expr": "rate(mongodb_ss_metrics_commands_getLastError_total{job=\"mongodb\",mongo_topology=\"sharded\",mongo_cluster=~\"$cluster\",instance=\"$host\"}[$interval]) or \nirate(mongodb_ss_metrics_commands_getLastError_total{job=\"mongodb\",mongo_topology=\"sharded\",mongo_cluster=~\"$cluster\",instance=\"$host\"}[5m])",
+              "format": "time_series",
+              "hide": false,
+              "interval": "$interval",
+              "intervalFactor": 1,
+              "legendFormat": "Write Wait Time",
+              "range": true,
+              "refId": "J",
+              "step": 300
+            }
+          ],
+          "title": "getLastError Write Time",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "description": "This is useful for write-heavy workloads to understand how long it takes to verify writes and how many concurrent writes are occurring.",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 20,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "red",
+                    "value": 80
+                  }
+                ]
+              },
+              "unit": "ops"
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byValue",
+                  "options": {
+                    "op": "gte",
+                    "reducer": "allIsZero",
+                    "value": 0
+                  }
+                },
+                "properties": [
+                  {
+                    "id": "custom.hideFrom",
+                    "value": {
+                      "legend": true,
+                      "tooltip": true,
+                      "viz": false
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 12,
+            "x": 12,
+            "y": 28
+          },
+          "id": 62,
+          "links": [],
+          "options": {
+            "legend": {
+              "calcs": [
+                "mean",
+                "max",
+                "min"
+              ],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "none"
+            }
+          },
+          "pluginVersion": "10.1.5",
+          "targets": [
+            {
+              "datasource": {
+                "uid": "$datasource"
+              },
+              "editorMode": "code",
+              "expr": "rate(mongodb_ss_metrics_getLastError_wtime_totalMillis{job=\"mongodb\",mongo_topology=\"sharded\",mongo_cluster=~\"$cluster\",instance=\"$host\"}[$interval]) or \nirate(mongodb_ss_metrics_getLastError_wtime_totalMillis{job=\"mongodb\",mongo_topology=\"sharded\",mongo_cluster=~\"$cluster\",instance=\"$host\"}[5m])",
+              "format": "time_series",
+              "hide": false,
+              "interval": "$interval",
+              "intervalFactor": 1,
+              "legendFormat": "Total",
+              "range": true,
+              "refId": "J",
+              "step": 300
+            },
+            {
+              "datasource": {
+                "uid": "$datasource"
+              },
+              "editorMode": "code",
+              "expr": "rate(mongodb_ss_metrics_getLastError_wtimeouts{job=\"mongodb\",mongo_topology=\"sharded\",mongo_cluster=~\"$cluster\",instance=\"$host\"}[$interval]) or\nirate(mongodb_ss_metrics_getLastError_wtimeouts{job=\"mongodb\",mongo_topology=\"sharded\",mongo_cluster=~\"$cluster\",instance=\"$host\"}[5m])",
+              "format": "time_series",
+              "hide": false,
+              "interval": "$interval",
+              "intervalFactor": 1,
+              "legendFormat": "Timeouts",
+              "range": true,
+              "refId": "A",
+              "step": 300
+            }
+          ],
+          "title": "getLastError Write Operations",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "description": "Asserts are not important by themselves, but you can correlate spikes with other graphs.",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 20,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "red",
+                    "value": 80
+                  }
+                ]
+              },
+              "unit": "short"
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byValue",
+                  "options": {
+                    "op": "gte",
+                    "reducer": "allIsZero",
+                    "value": 0
+                  }
+                },
+                "properties": [
+                  {
+                    "id": "custom.hideFrom",
+                    "value": {
+                      "legend": true,
+                      "tooltip": true,
+                      "viz": false
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 12,
+            "x": 0,
+            "y": 35
+          },
+          "id": 37,
+          "links": [],
+          "options": {
+            "legend": {
+              "calcs": [
+                "mean",
+                "max",
+                "min"
+              ],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "none"
+            }
+          },
+          "pluginVersion": "10.1.5",
+          "targets": [
+            {
+              "datasource": {
+                "uid": "$datasource"
+              },
+              "editorMode": "code",
+              "expr": "rate(mongodb_ss_asserts{job=\"mongodb\",mongo_topology=\"sharded\",mongo_cluster=~\"$cluster\",instance=\"$host\"}[$interval]) or \nirate(mongodb_ss_asserts{job=\"mongodb\",mongo_topology=\"sharded\",mongo_cluster=~\"$cluster\",instance=\"$host\"}[5m])",
+              "format": "time_series",
+              "hide": false,
+              "interval": "$interval",
+              "intervalFactor": 1,
+              "legendFormat": "{{assert_type}}",
+              "range": true,
+              "refId": "J",
+              "step": 300
+            }
+          ],
+          "title": "Assert Events",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "description": "Page faults indicate that requests are processed from disk either because an index is missing or there is not enough memory for the data set. Consider increasing memory or sharding out.",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 20,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "red",
+                    "value": 80
+                  }
+                ]
+              },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 12,
+            "x": 12,
+            "y": 35
+          },
+          "id": 39,
+          "links": [],
+          "options": {
+            "legend": {
+              "calcs": [
+                "mean",
+                "max",
+                "min"
+              ],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "none"
+            }
+          },
+          "pluginVersion": "10.1.5",
+          "targets": [
+            {
+              "datasource": {
+                "uid": "$datasource"
+              },
+              "editorMode": "code",
+              "expr": "rate(mongodb_ss_extra_info_page_faults{job=\"mongodb\",mongo_topology=\"sharded\",mongo_cluster=~\"$cluster\",instance=\"$host\"}[$interval]) or \nirate(mongodb_ss_extra_info_page_faults{job=\"mongodb\",mongo_topology=\"sharded\",mongo_cluster=~\"$cluster\",instance=\"$host\"}[5m])",
+              "format": "time_series",
+              "hide": false,
+              "interval": "$interval",
+              "intervalFactor": 1,
+              "legendFormat": "Faults",
+              "range": true,
+              "refId": "J",
+              "step": 300
+            }
+          ],
+          "title": "Page Faults",
+          "type": "timeseries"
+        }
+      ],
+      "refresh": "1m",
+      "schemaVersion": 38,
+      "style": "dark",
+      "tags": [
+        "MongoDB",
+        "Percona",
+        "demo-hub"
+      ],
+      "templating": {
+        "list": [
+          {
+            "allFormat": "glob",
+            "auto": true,
+            "auto_count": 200,
+            "auto_min": "1s",
+            "current": {
+              "selected": false,
+              "text": "auto",
+              "value": "$__auto_interval_interval"
+            },
+            "datasource": "$datasource",
+            "hide": 0,
+            "includeAll": false,
+            "label": "Interval",
+            "multi": false,
+            "multiFormat": "glob",
+            "name": "interval",
+            "options": [
+              {
+                "selected": true,
+                "text": "auto",
+                "value": "$__auto_interval_interval"
+              },
+              {
+                "selected": false,
+                "text": "1s",
+                "value": "1s"
+              },
+              {
+                "selected": false,
+                "text": "5s",
+                "value": "5s"
+              },
+              {
+                "selected": false,
+                "text": "1m",
+                "value": "1m"
+              },
+              {
+                "selected": false,
+                "text": "5m",
+                "value": "5m"
+              },
+              {
+                "selected": false,
+                "text": "1h",
+                "value": "1h"
+              },
+              {
+                "selected": false,
+                "text": "6h",
+                "value": "6h"
+              },
+              {
+                "selected": false,
+                "text": "1d",
+                "value": "1d"
+              }
+            ],
+            "query": "1s,5s,1m,5m,1h,6h,1d",
+            "refresh": 2,
+            "skipUrlSync": false,
+            "type": "interval"
+          },
+          {
+            "allFormat": "blob",
+            "allValue": ".*",
+            "current": {
+              "selected": true,
+              "text": "tictactoe",
+              "value": "tictactoe"
+            },
+            "datasource": {
+              "uid": "$datasource"
+            },
+            "definition": "",
+            "hide": 0,
+            "includeAll": true,
+            "label": "Mongo cluster",
+            "multi": false,
+            "multiFormat": "glob",
+            "name": "cluster",
+            "options": [],
+            "query": "label_values(mongodb_up{job=\"mongodb\",mongo_topology=\"sharded\"}, mongo_cluster)",
+            "refresh": 1,
+            "regex": "",
+            "skipUrlSync": false,
+            "sort": 1,
+            "type": "query",
+            "useTags": false
+          },
+          {
+            "allFormat": "glob",
+            "current": {},
+            "datasource": {
+              "uid": "$datasource"
+            },
+            "definition": "",
+            "hide": 0,
+            "includeAll": false,
+            "label": "Exporter instance",
+            "multi": false,
+            "multiFormat": "glob",
+            "name": "host",
+            "options": [],
+            "query": "label_values(mongodb_up{job=\"mongodb\",mongo_topology=\"sharded\",mongo_cluster=~\"$cluster\"}, instance)",
+            "refresh": 1,
+            "regex": "",
+            "skipUrlSync": false,
+            "sort": 1,
+            "tagsQuery": "",
+            "type": "query",
+            "useTags": false
+          },
+          {
+            "current": {
+              "selected": true,
+              "text": "prometheus",
+              "value": "prometheus"
+            },
+            "hide": 0,
+            "includeAll": false,
+            "label": "Datasource",
+            "multi": false,
+            "name": "datasource",
+            "options": [],
+            "query": "prometheus",
+            "queryValue": "",
+            "refresh": 1,
+            "regex": "",
+            "skipUrlSync": false,
+            "type": "datasource"
+          }
+        ]
+      },
+      "time": {
+        "from": "now-12h",
+        "to": "now"
+      },
+      "timepicker": {
+        "hidden": false,
+        "now": true,
+        "refresh_intervals": [
+          "5s",
+          "10s",
+          "30s",
+          "1m",
+          "5m",
+          "15m",
+          "30m",
+          "1h",
+          "2h",
+          "1d"
+        ],
+        "time_options": [
+          "5m",
+          "15m",
+          "1h",
+          "6h",
+          "12h",
+          "24h",
+          "2d",
+          "7d",
+          "30d"
+        ]
+      },
+      "timezone": "browser",
+      "title": "MongoDB Overview (Percona, demo-hub labels)",
+      "uid": "mongodb-overview-demo-hub",
+      "version": 10,
+      "weekStart": ""
+    }
+---
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
   name: grafana-db-mongodb-tictactoe-detailed-json
   namespace: demo-hub
   labels:
@@ -4293,6 +6070,275 @@ data:
       "timezone": "browser",
       "title": "MongoDB tic/tac/toe sharded \u2014 detailed",
       "uid": "mongo-tictactoe-detailed",
+      "version": 1
+    }
+---
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-db-mssql-demo-overview-json
+  namespace: demo-hub
+  labels:
+    demo-hub.io/group: observability
+    app.kubernetes.io/part-of: demo-hub
+data:
+  mssql-demo-overview.json: |
+    {
+      "annotations": { "list": [] },
+      "description": "SQL Server 2022 demo instances (publisher + subscriber) via awaragi/prometheus-mssql-exporter. Job label mssql_demo; use legend for role (publisher vs subscriber).",
+      "editable": true,
+      "gnetId": null,
+      "graphTooltip": 1,
+      "hideControls": false,
+      "id": null,
+      "links": [],
+      "refresh": "30s",
+      "rows": [
+        {
+          "collapse": false,
+          "collapsed": false,
+          "height": "300px",
+          "panels": [
+            {
+              "aliasColors": {},
+              "bars": false,
+              "dashLength": 10,
+              "dashes": false,
+              "datasource": "$PROMETHEUS_DS",
+              "fill": 1,
+              "fillGradient": 0,
+              "gridPos": { "h": 8, "w": 8, "x": 0, "y": 0 },
+              "id": 701,
+              "legend": { "alignAsTable": true, "avg": false, "current": true, "max": true, "min": false, "show": true, "values": true },
+              "lines": true,
+              "linewidth": 1,
+              "nullPointMode": "null",
+              "percentage": false,
+              "pointradius": 2,
+              "points": false,
+              "renderer": "flot",
+              "seriesOverrides": [],
+              "spaceLength": 10,
+              "stack": false,
+              "steppedLine": false,
+              "targets": [
+                {
+                  "expr": "mssql_up{job=\"mssql_demo\"}",
+                  "format": "time_series",
+                  "intervalFactor": 2,
+                  "legendFormat": "{{mssql_role}} / {{instance}}",
+                  "refId": "A"
+                }
+              ],
+              "thresholds": [],
+              "title": "mssql_up (scrape health)",
+              "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+              "type": "graph",
+              "xaxis": { "mode": "time", "show": true, "values": [] },
+              "yaxes": [
+                { "format": "short", "logBase": 1, "max": 1, "min": 0, "show": true },
+                { "format": "short", "logBase": 1, "show": false }
+              ]
+            },
+            {
+              "aliasColors": {},
+              "bars": false,
+              "dashLength": 10,
+              "dashes": false,
+              "datasource": "$PROMETHEUS_DS",
+              "fill": 1,
+              "fillGradient": 0,
+              "gridPos": { "h": 8, "w": 8, "x": 8, "y": 0 },
+              "id": 702,
+              "legend": { "alignAsTable": true, "avg": false, "current": true, "max": true, "min": false, "show": true, "values": true },
+              "lines": true,
+              "linewidth": 1,
+              "nullPointMode": "null",
+              "percentage": false,
+              "pointradius": 2,
+              "points": false,
+              "renderer": "flot",
+              "seriesOverrides": [],
+              "spaceLength": 10,
+              "stack": false,
+              "steppedLine": false,
+              "targets": [
+                {
+                  "expr": "sum by (mssql_role, database, state) (mssql_connections{job=\"mssql_demo\"})",
+                  "format": "time_series",
+                  "intervalFactor": 2,
+                  "legendFormat": "{{mssql_role}} {{database}} {{state}}",
+                  "refId": "A"
+                }
+              ],
+              "thresholds": [],
+              "title": "Active connections (mssql_connections)",
+              "tooltip": { "shared": true, "sort": 2, "value_type": "individual" },
+              "type": "graph",
+              "xaxis": { "mode": "time", "show": true, "values": [] },
+              "yaxes": [
+                { "format": "short", "logBase": 1, "min": 0, "show": true },
+                { "format": "short", "logBase": 1, "show": false }
+              ]
+            },
+            {
+              "aliasColors": {},
+              "bars": false,
+              "dashLength": 10,
+              "dashes": false,
+              "datasource": "$PROMETHEUS_DS",
+              "fill": 1,
+              "fillGradient": 0,
+              "gridPos": { "h": 8, "w": 8, "x": 16, "y": 0 },
+              "id": 703,
+              "legend": { "alignAsTable": true, "avg": true, "current": true, "max": true, "min": false, "show": true, "values": true },
+              "lines": true,
+              "linewidth": 1,
+              "nullPointMode": "null",
+              "percentage": false,
+              "pointradius": 2,
+              "points": false,
+              "renderer": "flot",
+              "seriesOverrides": [],
+              "spaceLength": 10,
+              "stack": false,
+              "steppedLine": false,
+              "targets": [
+                {
+                  "expr": "mssql_batch_requests{job=\"mssql_demo\"}",
+                  "format": "time_series",
+                  "intervalFactor": 2,
+                  "legendFormat": "{{mssql_role}} batch req / s (exporter)",
+                  "refId": "A"
+                }
+              ],
+              "thresholds": [],
+              "title": "Batch requests / sec (rate)",
+              "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+              "type": "graph",
+              "xaxis": { "mode": "time", "show": true, "values": [] },
+              "yaxes": [
+                { "format": "short", "logBase": 1, "min": 0, "show": true },
+                { "format": "short", "logBase": 1, "show": false }
+              ]
+            },
+            {
+              "aliasColors": {},
+              "bars": false,
+              "dashLength": 10,
+              "dashes": false,
+              "datasource": "$PROMETHEUS_DS",
+              "fill": 1,
+              "fillGradient": 0,
+              "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+              "id": 704,
+              "legend": { "alignAsTable": true, "avg": false, "current": true, "max": true, "min": false, "show": true, "values": true },
+              "lines": true,
+              "linewidth": 1,
+              "nullPointMode": "null",
+              "percentage": false,
+              "pointradius": 2,
+              "points": false,
+              "renderer": "flot",
+              "seriesOverrides": [],
+              "spaceLength": 10,
+              "stack": false,
+              "steppedLine": false,
+              "targets": [
+                {
+                  "expr": "mssql_memory_utilization_percentage{job=\"mssql_demo\"}",
+                  "format": "time_series",
+                  "intervalFactor": 2,
+                  "legendFormat": "{{mssql_role}} memory %",
+                  "refId": "A"
+                }
+              ],
+              "thresholds": [],
+              "title": "SQL Server memory utilization %",
+              "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+              "type": "graph",
+              "xaxis": { "mode": "time", "show": true, "values": [] },
+              "yaxes": [
+                { "format": "percent", "logBase": 1, "max": 100, "min": 0, "show": true },
+                { "format": "short", "logBase": 1, "show": false }
+              ]
+            },
+            {
+              "aliasColors": {},
+              "bars": false,
+              "dashLength": 10,
+              "dashes": false,
+              "datasource": "$PROMETHEUS_DS",
+              "fill": 1,
+              "fillGradient": 0,
+              "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+              "id": 705,
+              "legend": { "alignAsTable": true, "avg": false, "current": true, "max": true, "min": false, "show": true, "values": true },
+              "lines": true,
+              "linewidth": 1,
+              "nullPointMode": "null",
+              "percentage": false,
+              "pointradius": 2,
+              "points": false,
+              "renderer": "flot",
+              "seriesOverrides": [],
+              "spaceLength": 10,
+              "stack": false,
+              "steppedLine": false,
+              "targets": [
+                {
+                  "expr": "mssql_page_life_expectancy{job=\"mssql_demo\"}",
+                  "format": "time_series",
+                  "intervalFactor": 2,
+                  "legendFormat": "{{mssql_role}} PLE (s)",
+                  "refId": "A"
+                }
+              ],
+              "thresholds": [],
+              "title": "Buffer pool page life expectancy",
+              "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+              "type": "graph",
+              "xaxis": { "mode": "time", "show": true, "values": [] },
+              "yaxes": [
+                { "format": "short", "logBase": 1, "min": 0, "show": true },
+                { "format": "short", "logBase": 1, "show": true }
+              ]
+            }
+          ],
+          "repeat": null,
+          "showTitle": true,
+          "title": "SQL Server (demo hub, prometheus-mssql-exporter)",
+          "titleSize": "h6",
+          "type": "row"
+        }
+      ],
+      "schemaVersion": 14,
+      "style": "dark",
+      "tags": ["mssql", "sql-server", "demo"],
+      "templating": {
+        "list": [
+          {
+            "current": { "text": "prometheus", "value": "prometheus" },
+            "hide": 2,
+            "label": null,
+            "name": "PROMETHEUS_DS",
+            "options": [],
+            "query": "prometheus",
+            "refresh": 1,
+            "regex": "",
+            "type": "datasource"
+          }
+        ]
+      },
+      "time": { "from": "now-1h", "to": "now" },
+      "timepicker": {
+        "refresh_intervals": ["5s", "10s", "30s", "1m", "5m", "15m", "30m", "1h"],
+        "time_options": ["5m", "15m", "1h", "6h", "12h", "24h"]
+      },
+      "timezone": "browser",
+      "title": "SQL Server (demo hub)",
+      "uid": "demo-mssql",
       "version": 1
     }
 ---
@@ -14853,10 +16899,20 @@ spec:
                     - key: "kafka-cluster-overview.json"
                       path: "kafka-cluster-overview.json"
               - configMap:
+                  name: grafana-db-mongodb-overview-percona-demo-hub-json
+                  items:
+                    - key: "mongodb-overview-percona-demo-hub.json"
+                      path: "mongodb-overview-percona-demo-hub.json"
+              - configMap:
                   name: grafana-db-mongodb-tictactoe-detailed-json
                   items:
                     - key: "mongodb-tictactoe-detailed.json"
                       path: "mongodb-tictactoe-detailed.json"
+              - configMap:
+                  name: grafana-db-mssql-demo-overview-json
+                  items:
+                    - key: "mssql-demo-overview.json"
+                      path: "mssql-demo-overview.json"
               - configMap:
                   name: grafana-db-opensearch-demo-overview-json
                   items:
@@ -15557,9 +17613,43 @@ spec:
         app.kubernetes.io/part-of: demo-hub
         demo-hub.io/group: postgres-ha
     spec:
+      initContainers:
+        - name: assert-repmgr-extension
+          image: mcac-demo/postgresql-repmgr:16.6.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              f=/opt/bitnami/postgresql/share/extension/repmgr.control
+              if [ ! -f "$f" ]; then
+                echo "Missing $f in image mcac-demo/postgresql-repmgr:16.6.0." >&2
+                echo "Rebuild: docker build --no-cache -t mcac-demo/postgresql-repmgr:16.6.0 -f deploy/docker/postgres-kafka/Dockerfile.repmgr deploy/docker/postgres-kafka" >&2
+                exit 1
+              fi
+        - name: mcac-wal-archive-conf
+          image: mcac-demo/postgresql-repmgr:16.6.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MCAC_ARCHIVE_MODE
+              value: "on"
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              conf_dir=/bitnami/postgresql/conf/conf.d
+              mkdir -p "$conf_dir"
+              printf '%s\n' "archive_mode = ${MCAC_ARCHIVE_MODE}" \
+                "archive_command = '/opt/bitnami/scripts/mcac-wal-archive.sh %p %f'" \
+                > "$conf_dir/99-mcac-archive.conf"
+          volumeMounts:
+            - name: data
+              mountPath: /bitnami/postgresql
       containers:
         - name: postgresql-primary
-          image: docker.io/bitnamilegacy/postgresql:16.6.0-debian-12-r2
+          image: mcac-demo/postgresql-repmgr:16.6.0
           imagePullPolicy: IfNotPresent
           env:
             - name: POSTGRESQL_REPLICATION_MODE
@@ -15571,7 +17661,7 @@ spec:
             - name: POSTGRESQL_DATABASE
               value: "demo"
             - name: POSTGRESQL_SHARED_PRELOAD_LIBRARIES
-              value: "pgaudit,pg_stat_statements"
+              value: "repmgr,pgaudit,pg_stat_statements"
             - name: POSTGRESQL_EXTRA_FLAGS
               value: "-c wal_level=logical -c max_replication_slots=8 -c max_wal_senders=8 -c pg_stat_statements.max=10000 -c pg_stat_statements.track=all"
             - name: POSTGRESQL_REPLICATION_PASSWORD
@@ -15635,9 +17725,43 @@ spec:
         app.kubernetes.io/part-of: demo-hub
         demo-hub.io/group: postgres-ha
     spec:
+      initContainers:
+        - name: assert-repmgr-extension
+          image: mcac-demo/postgresql-repmgr:16.6.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              f=/opt/bitnami/postgresql/share/extension/repmgr.control
+              if [ ! -f "$f" ]; then
+                echo "Missing $f in image mcac-demo/postgresql-repmgr:16.6.0." >&2
+                echo "Rebuild: docker build --no-cache -t mcac-demo/postgresql-repmgr:16.6.0 -f deploy/docker/postgres-kafka/Dockerfile.repmgr deploy/docker/postgres-kafka" >&2
+                exit 1
+              fi
+        - name: mcac-wal-archive-conf
+          image: mcac-demo/postgresql-repmgr:16.6.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MCAC_ARCHIVE_MODE
+              value: "always"
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              conf_dir=/bitnami/postgresql/conf/conf.d
+              mkdir -p "$conf_dir"
+              printf '%s\n' "archive_mode = ${MCAC_ARCHIVE_MODE}" \
+                "archive_command = '/opt/bitnami/scripts/mcac-wal-archive.sh %p %f'" \
+                > "$conf_dir/99-mcac-archive.conf"
+          volumeMounts:
+            - name: data
+              mountPath: /bitnami/postgresql
       containers:
         - name: postgresql-replica-1
-          image: docker.io/bitnamilegacy/postgresql:16.6.0-debian-12-r2
+          image: mcac-demo/postgresql-repmgr:16.6.0
           imagePullPolicy: IfNotPresent
           env:
             - name: POSTGRESQL_REPLICATION_MODE
@@ -15649,9 +17773,9 @@ spec:
             - name: POSTGRESQL_MASTER_PORT_NUMBER
               value: "5432"
             - name: POSTGRESQL_SHARED_PRELOAD_LIBRARIES
-              value: "pgaudit,pg_stat_statements"
+              value: "repmgr,pgaudit,pg_stat_statements"
             - name: POSTGRESQL_EXTRA_FLAGS
-              value: "-c primary_slot_name=pgdemo_phys_replica_1 -c pg_stat_statements.max=10000 -c pg_stat_statements.track=all"
+              value: "-c wal_level=replica -c primary_slot_name=pgdemo_phys_replica_1 -c pg_stat_statements.max=10000 -c pg_stat_statements.track=all"
             - name: POSTGRESQL_REPLICATION_PASSWORD
               valueFrom:
                 secretKeyRef:
@@ -15713,9 +17837,43 @@ spec:
         app.kubernetes.io/part-of: demo-hub
         demo-hub.io/group: postgres-ha
     spec:
+      initContainers:
+        - name: assert-repmgr-extension
+          image: mcac-demo/postgresql-repmgr:16.6.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              f=/opt/bitnami/postgresql/share/extension/repmgr.control
+              if [ ! -f "$f" ]; then
+                echo "Missing $f in image mcac-demo/postgresql-repmgr:16.6.0." >&2
+                echo "Rebuild: docker build --no-cache -t mcac-demo/postgresql-repmgr:16.6.0 -f deploy/docker/postgres-kafka/Dockerfile.repmgr deploy/docker/postgres-kafka" >&2
+                exit 1
+              fi
+        - name: mcac-wal-archive-conf
+          image: mcac-demo/postgresql-repmgr:16.6.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MCAC_ARCHIVE_MODE
+              value: "always"
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              conf_dir=/bitnami/postgresql/conf/conf.d
+              mkdir -p "$conf_dir"
+              printf '%s\n' "archive_mode = ${MCAC_ARCHIVE_MODE}" \
+                "archive_command = '/opt/bitnami/scripts/mcac-wal-archive.sh %p %f'" \
+                > "$conf_dir/99-mcac-archive.conf"
+          volumeMounts:
+            - name: data
+              mountPath: /bitnami/postgresql
       containers:
         - name: postgresql-replica-2
-          image: docker.io/bitnamilegacy/postgresql:16.6.0-debian-12-r2
+          image: mcac-demo/postgresql-repmgr:16.6.0
           imagePullPolicy: IfNotPresent
           env:
             - name: POSTGRESQL_REPLICATION_MODE
@@ -15727,9 +17885,9 @@ spec:
             - name: POSTGRESQL_MASTER_PORT_NUMBER
               value: "5432"
             - name: POSTGRESQL_SHARED_PRELOAD_LIBRARIES
-              value: "pgaudit,pg_stat_statements"
+              value: "repmgr,pgaudit,pg_stat_statements"
             - name: POSTGRESQL_EXTRA_FLAGS
-              value: "-c primary_slot_name=pgdemo_phys_replica_2 -c pg_stat_statements.max=10000 -c pg_stat_statements.track=all"
+              value: "-c wal_level=replica -c primary_slot_name=pgdemo_phys_replica_2 -c pg_stat_statements.max=10000 -c pg_stat_statements.track=all"
             - name: POSTGRESQL_REPLICATION_PASSWORD
               valueFrom:
                 secretKeyRef:
@@ -15791,6 +17949,10 @@ data:
     psql -h "$PGHOST" -U replicator -d postgres -v ON_ERROR_STOP=1 -f /scripts/ensure-physical-replication-slots.sql
     export PGPASSWORD=postgres
     psql -h "$PGHOST" -U postgres -d postgres -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements;"
+    if ! psql -h "$PGHOST" -U postgres -d postgres -v ON_ERROR_STOP=1 -tc "SELECT 1 FROM pg_database WHERE datname = 'repmgr'" | grep -q 1; then
+      psql -h "$PGHOST" -U postgres -d postgres -v ON_ERROR_STOP=1 -c "CREATE DATABASE repmgr;"
+    fi
+    psql -h "$PGHOST" -U postgres -d repmgr -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS repmgr;"
     psql -h "$PGHOST" -U postgres -d demo -v ON_ERROR_STOP=1 -f /scripts/04-scenario-hub-schema-indexes.sql
     echo "postgres bootstrap done."
 
@@ -15804,7 +17966,14 @@ data:
     GRANT CONNECT ON DATABASE demo TO replicator;
     GRANT USAGE ON SCHEMA public TO replicator;
     
-    CREATE USER demo WITH PASSWORD 'demopass';
+    -- Idempotent for K8s bootstrap re-runs (job retries / re-apply after partial success).
+    DO $$
+    BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'demo') THEN
+        CREATE ROLE demo WITH LOGIN PASSWORD 'demopass';
+      END IF;
+    END
+    $$;
     GRANT CONNECT ON DATABASE demo TO demo;
     GRANT USAGE, CREATE ON SCHEMA public TO demo;
     GRANT pg_monitor TO demo;
@@ -15825,7 +17994,10 @@ data:
     ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public GRANT SELECT ON TABLES TO replicator;
     ALTER DEFAULT PRIVILEGES FOR ROLE demo IN SCHEMA public GRANT SELECT ON TABLES TO replicator;
     
-    CREATE PUBLICATION dbz_publication FOR TABLE public.demo_items;
+    -- Idempotent bootstrap re-runs; requires psql (\gexec). IF NOT EXISTS for publications needs PG 15+.
+    SELECT 'CREATE PUBLICATION dbz_publication FOR TABLE public.demo_items'
+    WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_publication WHERE pubname = 'dbz_publication')
+    \gexec
     
     -- Seed rows for demos and Grafana/Prometheus smoke tests (CDC will see these on fresh volumes).
     INSERT INTO demo_items (name) VALUES
@@ -15946,7 +18118,7 @@ spec:
       restartPolicy: Never
       containers:
         - name: run
-          image: docker.io/bitnamilegacy/postgresql:16.6.0-debian-12-r2
+          image: mcac-demo/postgresql-repmgr:16.6.0
           imagePullPolicy: IfNotPresent
           command:
             - "/bin/bash"
@@ -16822,10 +18994,210 @@ data:
     
     mongosh "mongodb://mongo-mongos1:27017" --quiet --eval '
     const admin = db.getSiblingDB("admin");
+    const shards = [
+      { id: "tic", conn: "mongo-shard-tic:27017" },
+      { id: "tac", conn: "mongo-shard-tac:27017" },
+      { id: "toe", conn: "mongo-shard-toe:27017" }
+    ];
     function hasShard(id) {
       const r = admin.runCommand({ listShards: 1 });
       if (!r.shards) return false;
       return r.shards.some(s => s._id === id);
+    }
+    function shardIdentityPresent(conn) {
+      try {
+        const uri = "mongodb://" + conn;
+        const m = new Mongo(uri);
+        const doc = m.getDB("config").getCollection("shardIdentity").findOne();
+        return doc !== null;
+      } catch (e) {
+        print("shardIdentity check " + conn + ": " + e.message);
+        return false;
+      }
+    }
+    function chunkCount(rem) {
+      if (!rem || rem.chunks == null) return 0;
+      const c = rem.chunks;
+      if (typeof c === "number") return c;
+      try {
+        return parseInt(c.toString(), 10);
+      } catch (e) {
+        return 0;
+      }
+    }
+    function ensureBalancerRunning() {
+      const bs = admin.runCommand({ balancerStart: 1 });
+      if (bs.ok !== 1) {
+        printjson(bs);
+      }
+    }
+    function listNonDrainingPeerIds(excludeId) {
+      const r = admin.runCommand({ listShards: 1 });
+      const out = [];
+      for (const s of r.shards || []) {
+        if (s._id === excludeId) continue;
+        if (s.draining === true) {
+          print("listNonDrainingPeerIds: skip " + s._id + " (draining)");
+          continue;
+        }
+        out.push(s._id);
+      }
+      return out;
+    }
+    function pickNonDrainingTarget(excludeId) {
+      const candidates = listNonDrainingPeerIds(excludeId);
+      if (candidates.length === 0) {
+        throw new Error(
+          "no non-draining shard for movePrimary/moveChunk; metadata may list multiple draining shards. Delete namespace demo-hub and re-apply for a clean config."
+        );
+      }
+      print("pickNonDrainingTarget: using " + candidates[0]);
+      return candidates[0];
+    }
+    function tryAbortRemoveShard(id) {
+      try {
+        const ab = admin.runCommand({ abortRemoveShard: id });
+        if (ab.ok === 1) {
+          print("abortRemoveShard: ok");
+          printjson(ab);
+        } else {
+          print("abortRemoveShard: " + (ab.errmsg || JSON.stringify(ab)));
+        }
+      } catch (e) {
+        print("abortRemoveShard skipped (unsupported or not applicable): " + e.message);
+      }
+    }
+    function forceMoveChunksOffShard(fromId, toId) {
+      const cfg = db.getSiblingDB("config");
+      const list = cfg.chunks.find({ shard: fromId }).toArray();
+      print("forceMoveChunksOffShard: " + list.length + " chunk(s) on " + fromId + " -> " + toId);
+      for (let i = 0; i < list.length; i++) {
+        const ch = list[i];
+        if (!ch.ns || ch.min == null || ch.max == null) {
+          print("WARN: skip malformed chunk doc at index " + i);
+          continue;
+        }
+        const res = admin.runCommand({ moveChunk: ch.ns, bounds: [ch.min, ch.max], to: toId });
+        if (res.ok !== 1) {
+          print("WARN moveChunk failed for " + ch.ns + ": " + JSON.stringify(res));
+        }
+      }
+    }
+    function forceMoveChunksOffShardWithFallback(fromId) {
+      const targets = listNonDrainingPeerIds(fromId);
+      if (targets.length === 0) {
+        print("forceMoveChunksOffShardWithFallback: no non-draining peers for " + fromId);
+        return;
+      }
+      const cfg = db.getSiblingDB("config");
+      const list = cfg.chunks.find({ shard: fromId }).toArray();
+      print(
+        "forceMoveChunksOffShardWithFallback: " + list.length + " chunk(s) on " + fromId + " try targets " + JSON.stringify(targets)
+      );
+      for (let i = 0; i < list.length; i++) {
+        const ch = list[i];
+        if (!ch.ns || ch.min == null || ch.max == null) continue;
+        let moved = false;
+        for (let ti = 0; ti < targets.length && !moved; ti++) {
+          const res = admin.runCommand({ moveChunk: ch.ns, bounds: [ch.min, ch.max], to: targets[ti] });
+          if (res.ok === 1) {
+            print("moveChunk ok " + ch.ns + " -> " + targets[ti]);
+            moved = true;
+          } else {
+            print("moveChunk fail " + ch.ns + " -> " + targets[ti] + " " + JSON.stringify(res));
+          }
+        }
+        if (!moved) print("WARN: all targets failed for " + ch.ns);
+      }
+    }
+    function recoverStuckDrainingShards() {
+      const r = admin.runCommand({ listShards: 1 });
+      if (!r.shards) return;
+      const draining = r.shards.filter((s) => s.draining === true).map((s) => s._id);
+      if (draining.length === 0) return;
+      print("recoverStuckDrainingShards: found draining=" + JSON.stringify(draining));
+      ensureBalancerRunning();
+      for (const id of draining) {
+        print("recoverStuckDrainingShards: finishing removeShard drain for " + id);
+        tryAbortRemoveShard(id);
+        ensureBalancerRunning();
+        forceMoveChunksOffShardWithFallback(id);
+        const maxRounds = 120;
+        for (let round = 0; round < maxRounds; round++) {
+          forceMoveChunksOffShardWithFallback(id);
+          const rs = admin.runCommand({ removeShard: id });
+          printjson(rs);
+          if (rs.ok !== 1) {
+            print("recoverStuckDrainingShards: removeShard failed for " + id + ", stop recovery (fix cluster or delete ns demo-hub)");
+            break;
+          }
+          if (rs.state === "completed") {
+            print("recoverStuckDrainingShards: removeShard completed for " + id);
+            break;
+          }
+          if (rs.state === "ongoing" && rs.dbsToMove && rs.dbsToMove.length > 0) {
+            const tp = pickNonDrainingTarget(id);
+            for (const dbn of rs.dbsToMove) {
+              print("movePrimary " + dbn + " to " + tp + " (recover drain " + id + ")");
+              const mp = admin.runCommand({ movePrimary: dbn, to: tp });
+              printjson(mp);
+              if (mp.ok !== 1) {
+                print("WARN movePrimary failed: " + JSON.stringify(mp));
+              }
+            }
+          }
+          sleep(4000);
+        }
+      }
+    }
+    function removeShardStale(id) {
+      print("removing stale shard registration " + id + " (config lists shard but mongod has no shardIdentity — e.g. shard pod emptyDir reset)");
+      tryAbortRemoveShard(id);
+      ensureBalancerRunning();
+      forceMoveChunksOffShardWithFallback(id);
+      for (let iter = 1; ; iter++) {
+        if (iter > 720) {
+          throw new Error(
+            "removeShard drain timeout for " + id + " (720 iterations). Chunks may still be migrating; check balancer, shard health, and config.chunks on mongos."
+          );
+        }
+        const r = admin.runCommand({ removeShard: id });
+        printjson(r);
+        if (r.ok !== 1) {
+          throw new Error("removeShard failed for " + id + ": " + JSON.stringify(r));
+        }
+        if (r.state === "completed") break;
+        if (r.state === "ongoing" && r.dbsToMove && r.dbsToMove.length > 0) {
+          ensureBalancerRunning();
+          const targetMp = pickNonDrainingTarget(id);
+          for (const dbn of r.dbsToMove) {
+            print("movePrimary " + dbn + " to " + targetMp + " (draining stale shard " + id + ")");
+            const mp = admin.runCommand({ movePrimary: dbn, to: targetMp });
+            printjson(mp);
+            if (mp.ok !== 1) {
+              throw new Error("movePrimary failed for " + dbn + ": " + JSON.stringify(mp));
+            }
+          }
+          continue;
+        }
+        if (r.state === "ongoing") {
+          const n = chunkCount(r.remaining);
+          ensureBalancerRunning();
+          if (n > 0 && iter > 3 && iter % 12 === 0) {
+            print("re-try forceMoveChunksOffShardWithFallback (iter " + iter + ", chunks remaining ~" + n + ")");
+            forceMoveChunksOffShardWithFallback(id);
+          }
+          const waitMs = n > 0 ? 8000 : 3000;
+          if (n > 0 && iter % 15 === 0) {
+            const bst = admin.runCommand({ balancerStatus: 1 });
+            print("balancerStatus (every ~2m while " + n + " chunks remain): ");
+            printjson(bst);
+          }
+          sleep(waitMs);
+          continue;
+        }
+        sleep(3000);
+      }
     }
     function dropLocalDemoOnShard(conn) {
       try {
@@ -16840,13 +19212,20 @@ data:
         print("pre-clean on " + conn + ": " + e.message);
       }
     }
-    const shards = [
-      { id: "tic", conn: "mongo-shard-tic:27017" },
-      { id: "tac", conn: "mongo-shard-tac:27017" },
-      { id: "toe", conn: "mongo-shard-toe:27017" }
-    ];
+    recoverStuckDrainingShards();
     for (const s of shards) {
-      if (!hasShard(s.id)) {
+      let mustAdd = false;
+      if (hasShard(s.id)) {
+        if (shardIdentityPresent(s.conn)) {
+          print("shard " + s.id + " already present");
+          continue;
+        }
+        removeShardStale(s.id);
+        mustAdd = true;
+      } else {
+        mustAdd = true;
+      }
+      if (mustAdd) {
         dropLocalDemoOnShard(s.conn);
         print("adding shard " + s.id);
         const r = admin.runCommand({ addShard: s.id + "/" + s.conn });
@@ -16854,8 +19233,6 @@ data:
         if (r.ok !== 1) {
           throw new Error("addShard failed for " + s.id + ": " + JSON.stringify(r));
         }
-      } else {
-        print("shard " + s.id + " already present");
       }
     }
     print("done");
@@ -17039,6 +19416,725 @@ spec:
         - name: scripts
           configMap:
             name: mongo-sharded-scripts
+            defaultMode: 0755
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mssql-publisher
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/name: mssql-publisher
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: mssql
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mssql-publisher
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mssql-publisher
+        app.kubernetes.io/part-of: demo-hub
+        demo-hub.io/group: mssql
+    spec:
+      securityContext:
+        fsGroup: 10001
+      containers:
+        - name: mssql-publisher
+          image: mcr.microsoft.com/mssql/server:2022-CU14-ubuntu-22.04
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: ACCEPT_EULA
+              value: "Y"
+            - name: MSSQL_PID
+              value: "Developer"
+            - name: MSSQL_AGENT_ENABLED
+              value: "true"
+            - name: MSSQL_SA_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: mssql-sa-password
+          resources:
+            requests:
+              memory: "2Gi"
+            limits:
+              memory: "4Gi"
+          volumeMounts:
+            - name: data
+              mountPath: /var/opt/mssql
+          ports:
+            - containerPort: 1433
+              name: mssql
+          readinessProbe:
+            tcpSocket:
+              port: 1433
+            initialDelaySeconds: 45
+            periodSeconds: 8
+            timeoutSeconds: 3
+            failureThreshold: 30
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: mssql-publisher
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/name: mssql-publisher
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: mssql
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: mssql-publisher
+  ports:
+    - port: 1433
+      targetPort: 1433
+      name: mssql
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mssql-subscriber
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/name: mssql-subscriber
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: mssql
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mssql-subscriber
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mssql-subscriber
+        app.kubernetes.io/part-of: demo-hub
+        demo-hub.io/group: mssql
+    spec:
+      securityContext:
+        fsGroup: 10001
+      containers:
+        - name: mssql-subscriber
+          image: mcr.microsoft.com/mssql/server:2022-CU14-ubuntu-22.04
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: ACCEPT_EULA
+              value: "Y"
+            - name: MSSQL_PID
+              value: "Developer"
+            - name: MSSQL_AGENT_ENABLED
+              value: "true"
+            - name: MSSQL_SA_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: mssql-sa-password
+          resources:
+            requests:
+              memory: "2Gi"
+            limits:
+              memory: "4Gi"
+          volumeMounts:
+            - name: data
+              mountPath: /var/opt/mssql
+          ports:
+            - containerPort: 1433
+              name: mssql
+          readinessProbe:
+            tcpSocket:
+              port: 1433
+            initialDelaySeconds: 45
+            periodSeconds: 8
+            timeoutSeconds: 3
+            failureThreshold: 30
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: mssql-subscriber
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/name: mssql-subscriber
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: mssql
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: mssql-subscriber
+  ports:
+    - port: 1433
+      targetPort: 1433
+      name: mssql
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mssql-exporter-publisher
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/name: mssql-exporter-publisher
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: mssql
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mssql-exporter-publisher
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mssql-exporter-publisher
+        app.kubernetes.io/part-of: demo-hub
+        demo-hub.io/group: mssql
+    spec:
+      initContainers:
+        - name: wait-mssql
+          image: alpine:3.19
+          command:
+            - /bin/sh
+            - -c
+            - |
+              apk add --no-cache netcat-openbsd >/dev/null
+              for i in $(seq 1 150); do
+                if nc -z -w 2 mssql-publisher.demo-hub.svc.cluster.local 1433 2>/dev/null; then exit 0; fi
+                sleep 2
+              done
+              echo "timeout waiting for mssql-publisher.demo-hub.svc.cluster.local:1433" >&2
+              exit 1
+      containers:
+        - name: mssql-exporter-publisher
+          image: awaragi/prometheus-mssql-exporter:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: SERVER
+              value: "mssql-publisher"
+            - name: PORT
+              value: "1433"
+            - name: USERNAME
+              value: "sa"
+            - name: ENCRYPT
+              value: "true"
+            - name: TRUST_SERVER_CERTIFICATE
+              value: "true"
+            - name: PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: mssql-sa-password
+          ports:
+            - containerPort: 4000
+              name: metrics
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: mssql-exporter-publisher
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/name: mssql-exporter-publisher
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: mssql
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: mssql-exporter-publisher
+  ports:
+    - port: 4000
+      targetPort: 4000
+      name: metrics
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mssql-exporter-subscriber
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/name: mssql-exporter-subscriber
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: mssql
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mssql-exporter-subscriber
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mssql-exporter-subscriber
+        app.kubernetes.io/part-of: demo-hub
+        demo-hub.io/group: mssql
+    spec:
+      initContainers:
+        - name: wait-mssql
+          image: alpine:3.19
+          command:
+            - /bin/sh
+            - -c
+            - |
+              apk add --no-cache netcat-openbsd >/dev/null
+              for i in $(seq 1 150); do
+                if nc -z -w 2 mssql-subscriber.demo-hub.svc.cluster.local 1433 2>/dev/null; then exit 0; fi
+                sleep 2
+              done
+              echo "timeout waiting for mssql-subscriber.demo-hub.svc.cluster.local:1433" >&2
+              exit 1
+      containers:
+        - name: mssql-exporter-subscriber
+          image: awaragi/prometheus-mssql-exporter:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: SERVER
+              value: "mssql-subscriber"
+            - name: PORT
+              value: "1433"
+            - name: USERNAME
+              value: "sa"
+            - name: ENCRYPT
+              value: "true"
+            - name: TRUST_SERVER_CERTIFICATE
+              value: "true"
+            - name: PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: mssql-sa-password
+          ports:
+            - containerPort: 4000
+              name: metrics
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: mssql-exporter-subscriber
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/name: mssql-exporter-subscriber
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: mssql
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: mssql-exporter-subscriber
+  ports:
+    - port: 4000
+      targetPort: 4000
+      name: metrics
+---
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mssql-kafka-scripts
+  namespace: demo-hub
+  labels:
+    demo-hub.io/group: mssql
+    app.kubernetes.io/part-of: demo-hub
+data:
+  chain.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export MSSQL_SA_PASSWORD="${MSSQL_SA_PASSWORD:?}"
+    bash /scripts/init-publisher.sh
+    bash /scripts/init-subscriber.sh
+    bash /scripts/try-replication-bootstrap.sh
+    for i in $(seq 1 180); do
+      if curl -sf "http://kafka-connect:8083/connectors" >/dev/null 2>&1; then
+        echo "kafka-connect ready (attempt $i)" >&2
+        break
+      fi
+      sleep 2
+      if [[ "$i" -eq 180 ]]; then
+        echo "timeout waiting for kafka-connect:8083" >&2
+        exit 1
+      fi
+    done
+    export SCHEMA_HISTORY_KAFKA_BOOTSTRAP="${SCHEMA_HISTORY_KAFKA_BOOTSTRAP:-kafka:9092}"
+    exec bash /scripts/register-mssql-connectors.sh "http://kafka-connect:8083"
+
+  init-publisher.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+    PW="${MSSQL_SA_PASSWORD:?missing MSSQL_SA_PASSWORD}"
+    for i in $(seq 1 60); do
+      if sqlcmd -S mssql-publisher -U sa -P "$PW" -C -Q "SELECT 1" >/dev/null 2>&1; then
+        break
+      fi
+      sleep 2
+    done
+    sqlcmd -S mssql-publisher -U sa -P "$PW" -C -b -i /scripts/01-publisher-schema.sql
+    echo "mssql-publisher schema OK."
+
+  init-subscriber.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+    PW="${MSSQL_SA_PASSWORD:?missing MSSQL_SA_PASSWORD}"
+    for i in $(seq 1 60); do
+      if sqlcmd -S mssql-subscriber -U sa -P "$PW" -C -Q "SELECT 1" >/dev/null 2>&1; then
+        break
+      fi
+      sleep 2
+    done
+    sqlcmd -S mssql-subscriber -U sa -P "$PW" -C -b -i /scripts/02-subscriber-schema.sql
+    echo "mssql-subscriber schema OK."
+
+  try-replication-bootstrap.sh: |
+    #!/usr/bin/env bash
+    # Optional: native transactional replication (often flaky in Docker). Safe to ignore failures.
+    set -u
+    PW="${MSSQL_SA_PASSWORD:?missing MSSQL_SA_PASSWORD}"
+    set +e
+    sqlcmd -S mssql-publisher -U sa -P "$PW" -C -b -i /scripts/05-transactional-replication-bootstrap.sql
+    code=$?
+    set -e
+    if [[ "$code" != 0 ]]; then
+      echo "mssql: transactional replication bootstrap returned $code — continuing without it (CDC+Kafka still works)." >&2
+    fi
+    exit 0
+
+  register-mssql-connectors.sh: |
+    #!/usr/bin/env bash
+    # Debezium SQL Server CDC (publisher) + JDBC sink (subscriber). Requires kafka-connect image with SQL Server plugin.
+    # Usage: ./register-mssql-connectors.sh [http://kafka-connect:8083]
+    set -euo pipefail
+    CONNECT="${1:-http://localhost:8083}"
+    CONNECT="${CONNECT%/}"
+    SCHEMA_HISTORY_KAFKA_BOOTSTRAP="${SCHEMA_HISTORY_KAFKA_BOOTSTRAP:-kafka:29092}"
+    MSSQL_SA_PASSWORD="${MSSQL_SA_PASSWORD:-Demo_hub_Mssql_2025!}"
+    CURL_CONNECT_TIMEOUT="${CURL_CONNECT_TIMEOUT:-5}"
+    CURL_MAX_TIME="${CURL_MAX_TIME:-120}"
+    curl_opts=(--connect-timeout "${CURL_CONNECT_TIMEOUT}" --max-time "${CURL_MAX_TIME}" -sS)
+    
+    remove_connector() {
+      local name="$1" code i
+      code="$(curl "${curl_opts[@]}" -o /dev/null -w '%{http_code}' "$CONNECT/connectors/$name" 2>/dev/null || echo 000)"
+      [[ "$code" == "404" ]] && return 0
+      curl "${curl_opts[@]}" -o /dev/null -X PUT "$CONNECT/connectors/$name/pause" 2>/dev/null || true
+      sleep 2
+      curl "${curl_opts[@]}" -o /dev/null -X DELETE "$CONNECT/connectors/$name" 2>/dev/null || true
+      for i in $(seq 1 90); do
+        code="$(curl "${curl_opts[@]}" -o /dev/null -w '%{http_code}' "$CONNECT/connectors/$name" 2>/dev/null || echo 000)"
+        [[ "$code" == "404" ]] && return 0
+        sleep 1
+      done
+      return 1
+    }
+    
+    post_connector() {
+      local label="$1" tmp resp code
+      tmp="$(mktemp)"
+      cat >"$tmp"
+      resp="$(mktemp)"
+      code="$(curl "${curl_opts[@]}" -o "$resp" -w '%{http_code}' -X POST \
+        -H 'Content-Type: application/json' --data-binary @"$tmp" "$CONNECT/connectors")"
+      rm -f "$tmp"
+      if [[ "$code" != "201" && "$code" != "200" ]]; then
+        echo "Failed to register ${label} (HTTP ${code}). Response:" >&2
+        cat "$resp" >&2
+        rm -f "$resp"
+        return 1
+      fi
+      cat "$resp"
+      echo
+      rm -f "$resp"
+    }
+    
+    echo "Removing existing mssql-source-demo / mssql-jdbc-sink-demo if present..."
+    remove_connector "mssql-jdbc-sink-demo" || true
+    remove_connector "mssql-source-demo" || true
+    
+    mssql_source_ok=0
+    for attempt in $(seq 1 8); do
+      if post_connector "mssql-source-demo" <<JSON
+    {
+      "name": "mssql-source-demo",
+      "config": {
+        "connector.class": "io.debezium.connector.sqlserver.SqlServerConnector",
+        "tasks.max": "1",
+        "database.hostname": "mssql-publisher",
+        "database.port": "1433",
+        "database.user": "sa",
+        "database.password": "${MSSQL_SA_PASSWORD}",
+        "database.names": "demo",
+        "topic.prefix": "demomssql",
+        "table.include.list": "dbo.scenario_catalog_mirror_mssql",
+        "schema.history.internal.kafka.bootstrap.servers": "${SCHEMA_HISTORY_KAFKA_BOOTSTRAP}",
+        "schema.history.internal.kafka.topic": "demomssql.schema-changes.internal",
+        "database.encrypt": "false",
+        "database.trustServerCertificate": "true",
+        "snapshot.mode": "initial",
+        "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+        "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+        "key.converter.schemas.enable": "true",
+        "value.converter.schemas.enable": "true"
+      }
+    }
+    JSON
+      then
+        mssql_source_ok=1
+        break
+      fi
+      if [[ "$attempt" -lt 8 ]]; then
+        echo "mssql-source-demo registration failed (attempt ${attempt}/8); retrying in 15s…" >&2
+        sleep 15
+      fi
+    done
+    if [[ "$mssql_source_ok" -ne 1 ]]; then
+      echo "Cannot register mssql-source-demo. If the error mentions database \"demo\": ensure publisher" >&2
+      echo "has DB demo (mssql-demo-bootstrap / init-publisher) and MSSQL_SA_PASSWORD matches the Secret." >&2
+      echo "K8s: kubectl logs -n demo-hub job/mssql-demo-bootstrap --tail=100" >&2
+      echo "     ./deploy/k8s/scripts/verify-mssql-publisher-demo.sh" >&2
+      exit 1
+    fi
+    
+    echo "Registered mssql-source-demo."
+    
+    post_connector "mssql-jdbc-sink-demo" <<JSON
+    {
+      "name": "mssql-jdbc-sink-demo",
+      "config": {
+        "connector.class": "io.debezium.connector.jdbc.JdbcSinkConnector",
+        "tasks.max": "1",
+        "topics": "demomssql.dbo.scenario_catalog_mirror_mssql",
+        "connection.url": "jdbc:sqlserver://mssql-subscriber:1433;databaseName=demo;encrypt=false;trustServerCertificate=true",
+        "connection.username": "sa",
+        "connection.password": "${MSSQL_SA_PASSWORD}",
+        "dialect.name": "sqlserver",
+        "insert.mode": "upsert",
+        "delete.enabled": "false",
+        "primary.key.mode": "record_key",
+        "primary.key.fields": "id",
+        "table.name.format": "dbo.demo_items_from_kafka_mssql",
+        "auto.create": "false",
+        "schema.evolution": "basic",
+        "quote.identifiers": "false",
+        "transforms": "unwrap",
+        "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
+        "transforms.unwrap.delete.handling.mode": "drop",
+        "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+        "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+        "key.converter.schemas.enable": "true",
+        "value.converter.schemas.enable": "true",
+        "errors.log.enable": "true"
+      }
+    }
+    JSON
+    
+    echo "Registered mssql-jdbc-sink-demo -> mssql-subscriber.demo.dbo.demo_items_from_kafka_mssql"
+    echo "Check: curl -s $CONNECT/connectors"
+
+  01-publisher-schema.sql: |
+    /* Publisher: demo DB, hub mirror table, CDC for Debezium. */
+    IF NOT EXISTS (SELECT * FROM sys.databases WHERE name = N'demo')
+        CREATE DATABASE demo;
+    GO
+    USE demo;
+    GO
+    IF OBJECT_ID(N'dbo.scenario_catalog_mirror_mssql', N'U') IS NULL
+    BEGIN
+        CREATE TABLE dbo.scenario_catalog_mirror_mssql (
+            id INT IDENTITY(1, 1) NOT NULL PRIMARY KEY,
+            sku NVARCHAR(128) NOT NULL UNIQUE,
+            title NVARCHAR(512) NOT NULL,
+            category NVARCHAR(256) NULL,
+            unit_price_cents INT NOT NULL DEFAULT 0,
+            stock_units INT NOT NULL DEFAULT 0,
+            source_mongo_id NVARCHAR(96) NULL,
+            kafka_msg_key NVARCHAR(160) NULL,
+            updated_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+        );
+    END
+    GO
+    /* Hub workload generator (not CDC — avoids noisy Debezium topics). */
+    IF OBJECT_ID(N'dbo.hub_workload_mssql', N'U') IS NULL
+    BEGIN
+        CREATE TABLE dbo.hub_workload_mssql (
+            id BIGINT IDENTITY(1, 1) NOT NULL PRIMARY KEY,
+            run_id NVARCHAR(32) NOT NULL,
+            seq INT NOT NULL,
+            name NVARCHAR(4000) NOT NULL,
+            created_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+            CONSTRAINT UQ_hub_workload_mssql_run_seq UNIQUE (run_id, seq)
+        );
+        CREATE INDEX IX_hub_workload_mssql_run_id ON dbo.hub_workload_mssql (run_id);
+    END
+    GO
+    /* CDC (required for Debezium SQL Server connector). */
+    IF EXISTS (SELECT 1 FROM sys.databases WHERE name = N'demo' AND is_cdc_enabled = 0)
+    BEGIN
+        EXEC sys.sp_cdc_enable_db;
+    END
+    GO
+    USE demo;
+    GO
+    DECLARE @oid INT = OBJECT_ID(N'dbo.scenario_catalog_mirror_mssql');
+    IF @oid IS NOT NULL
+       AND EXISTS (SELECT 1 FROM sys.databases WHERE name = N'demo' AND is_cdc_enabled = 1)
+       AND (SELECT COALESCE(is_tracked_by_cdc, 0) FROM sys.tables WHERE object_id = @oid) = 0
+    BEGIN
+        EXEC sys.sp_cdc_enable_table
+            @source_schema = N'dbo',
+            @source_name = N'scenario_catalog_mirror_mssql',
+            @role_name = NULL,
+            @supports_net_changes = 1;
+    END
+    GO
+
+  02-subscriber-schema.sql: |
+    /* Subscriber: sink table aligned with Debezium unwrap columns (upsert by id). */
+    IF NOT EXISTS (SELECT * FROM sys.databases WHERE name = N'demo')
+        CREATE DATABASE demo;
+    GO
+    USE demo;
+    GO
+    IF OBJECT_ID(N'dbo.demo_items_from_kafka_mssql', N'U') IS NULL
+    BEGIN
+        CREATE TABLE dbo.demo_items_from_kafka_mssql (
+            id INT NOT NULL PRIMARY KEY,
+            sku NVARCHAR(128) NULL,
+            title NVARCHAR(512) NULL,
+            category NVARCHAR(256) NULL,
+            unit_price_cents INT NULL,
+            stock_units INT NULL,
+            source_mongo_id NVARCHAR(96) NULL,
+            kafka_msg_key NVARCHAR(160) NULL,
+            updated_at DATETIME2 NULL
+        );
+    END
+    GO
+
+  05-transactional-replication-bootstrap.sql: |
+    /*
+     * Best-effort transactional replication bootstrap (publisher = distributor).
+     * Docker labs often need @@SERVERNAME / DNS aligned with compose hostnames.
+     * If this fails, Debezium + JDBC sink still work; only native SQL Server replication is skipped.
+     *
+     * Run from sqlcmd connected to PUBLISHER as sa, then SUBSCRIBER steps separately if needed.
+     * See: https://learn.microsoft.com/en-us/sql/linux/sql-server-linux-replication-configure-transactional
+     */
+    SET NOCOUNT ON;
+    USE master;
+    GO
+    
+    DECLARE @dist sysname = CAST(SERVERPROPERTY('MachineName') AS sysname);
+    DECLARE @pwd NVARCHAR(128) = N'ReplDist_DemoHub_2025!';
+    
+    /* Distributor + distribution database (idempotent-ish). */
+    IF NOT EXISTS (SELECT 1 FROM sys.databases WHERE name = N'distribution')
+    BEGIN
+        EXEC sp_adddistributor @distributor = @dist, @password = @pwd;
+        EXEC sp_adddistributiondb
+            @database = N'distribution',
+            @data_folder = N'/var/opt/mssql/data',
+            @log_folder = N'/var/opt/mssql/data',
+            @log_file_size = 2,
+            @min_distretention = 0,
+            @max_distretention = 72,
+            @history_retention = 48;
+    END
+    GO
+    
+    USE demo;
+    GO
+    IF NOT EXISTS (
+        SELECT 1 FROM sys.databases WHERE name = N'demo' AND is_published = 1
+    )
+    BEGIN
+        EXEC sp_replicationdboption @dbname = N'demo', @optname = N'publish', @value = N'true';
+    END
+    GO
+    
+    USE demo;
+    GO
+    IF NOT EXISTS (SELECT 1 FROM syspublications WHERE name = N'demo_hub_pub')
+    BEGIN
+        EXEC sp_addpublication
+            @publication = N'demo_hub_pub',
+            @description = N'demo-hub catalog mirror',
+            @sync_method = N'native',
+            @status = N'active',
+            @allow_push = N'true',
+            @allow_pull = N'true',
+            @independent_agent = N'true';
+    END
+    GO
+    
+    USE demo;
+    GO
+    IF NOT EXISTS (SELECT 1 FROM sysarticles a INNER JOIN syspublications p ON a.pubid = p.pubid WHERE p.name = N'demo_hub_pub' AND a.article = N'scenario_catalog_mirror_mssql')
+    BEGIN
+        EXEC sp_addarticle
+            @publication = N'demo_hub_pub',
+            @article = N'scenario_catalog_mirror_mssql',
+            @source_table = N'scenario_catalog_mirror_mssql',
+            @source_owner = N'dbo',
+            @destination_table = N'scenario_catalog_mirror_mssql',
+            @type = N'logbased';
+    END
+    GO
+---
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mssql-demo-bootstrap
+  namespace: demo-hub
+  labels:
+    demo-hub.io/group: mssql
+    app.kubernetes.io/part-of: demo-hub
+spec:
+  activeDeadlineSeconds: 3600
+  ttlSecondsAfterFinished: 86400
+  backoffLimit: 4
+  template:
+    metadata:
+      labels:
+        demo-hub.io/group: mssql
+        app.kubernetes.io/part-of: demo-hub
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: run
+          image: mcac-demo/mssql-tools:22.04
+          imagePullPolicy: Never
+          command:
+            - "/bin/bash"
+            - "/scripts/chain.sh"
+          env:
+            - name: MSSQL_SA_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: mssql-sa-password
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+      volumes:
+        - name: scripts
+          configMap:
+            name: mssql-kafka-scripts
             defaultMode: 0755
 ---
 
@@ -17643,17 +20739,18 @@ spec:
                   && nc -z -w 3 opensearch.demo-hub.svc.cluster.local 9200 2>/dev/null \
                   && nc -z -w 3 postgresql-primary.demo-hub.svc.cluster.local 5432 2>/dev/null \
                   && nc -z -w 3 cassandra-0.cassandra-headless.demo-hub.svc.cluster.local 9042 2>/dev/null \
-                  && nc -z -w 3 redis.demo-hub.svc.cluster.local 6379 2>/dev/null; then
+                  && nc -z -w 3 redis.demo-hub.svc.cluster.local 6379 2>/dev/null \
+                  && nc -z -w 3 mssql-publisher.demo-hub.svc.cluster.local 1433 2>/dev/null; then
                   echo "wait-hub-deps: all upstream TCP checks OK (attempt $i)" >&2
                   exit 0
                 fi
                 if [ $((i % 15)) -eq 0 ]; then
-                  echo "wait-hub-deps: attempt $i/200 — kafka:9092=$(p kafka.demo-hub.svc.cluster.local 9092) opensearch:9200=$(p opensearch.demo-hub.svc.cluster.local 9200) postgres:5432=$(p postgresql-primary.demo-hub.svc.cluster.local 5432) cassandra-0:9042=$(p cassandra-0.cassandra-headless.demo-hub.svc.cluster.local 9042) redis:6379=$(p redis.demo-hub.svc.cluster.local 6379) (mongos not gated)" >&2
+                  echo "wait-hub-deps: attempt $i/200 — kafka:9092=$(p kafka.demo-hub.svc.cluster.local 9092) opensearch:9200=$(p opensearch.demo-hub.svc.cluster.local 9200) postgres:5432=$(p postgresql-primary.demo-hub.svc.cluster.local 5432) cassandra-0:9042=$(p cassandra-0.cassandra-headless.demo-hub.svc.cluster.local 9042) redis:6379=$(p redis.demo-hub.svc.cluster.local 6379) mssql-publisher:1433=$(p mssql-publisher.demo-hub.svc.cluster.local 1433) (mongos not gated)" >&2
                 fi
                 sleep 2
               done
               echo "timeout waiting for kafka:9092, opensearch:9200, postgresql-primary:5432," >&2
-              echo "  cassandra-0:9042 (headless), redis:6379" >&2
+              echo "  cassandra-0:9042 (headless), redis:6379, mssql-publisher:1433" >&2
               exit 1
       containers:
         - name: hub-demo-ui
@@ -17678,6 +20775,14 @@ spec:
               value: "25"
             - name: CASSANDRA_WORKLOAD_WRITE_RETRIES
               value: "3"
+            - name: MSSQL_HOST
+              value: "mssql-publisher"
+            - name: MSSQL_USER
+              value: "sa"
+            - name: MSSQL_DATABASE
+              value: "demo"
+            - name: MSSQL_ENCRYPT
+              value: "off"
             - name: POSTGRES_DSN
               valueFrom:
                 secretKeyRef:
@@ -17688,6 +20793,11 @@ spec:
                 secretKeyRef:
                   name: demo-hub-credentials
                   key: hub-redis-url
+            - name: MSSQL_SA_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: mssql-sa-password
           ports:
             - containerPort: 8888
               name: http
@@ -17780,6 +20890,16 @@ spec:
                 name: prometheus
                 port:
                   number: 9090
+    - host: vault.demo-hub.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: vault
+                port:
+                  number: 8200
 ---
 
 apiVersion: policy/v1

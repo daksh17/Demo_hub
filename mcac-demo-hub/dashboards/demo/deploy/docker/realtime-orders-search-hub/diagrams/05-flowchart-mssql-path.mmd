@@ -1,0 +1,14 @@
+%% SQL Server publisher to Kafka to subscriber (demo hub)
+flowchart TD
+  H1[Step 1: Connect publisher e.g. host port 14331]
+  H2[Step 2: MERGE catalog mirror or INSERT hub workload table]
+  H3[Step 3: CDC on scenario catalog mirror only]
+  H4[Step 4: Debezium SqlServerConnector]
+  H5[Step 5: Kafka topic for dbo scenario catalog mirror]
+  H6[Step 6: JDBC sink upserts to subscriber table]
+  H7[Step 7: Optional native replication try job]
+
+  H1 --> H2
+  H2 --> H3
+  H2 -.-> H7
+  H3 --> H4 --> H5 --> H6

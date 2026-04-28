@@ -7,7 +7,14 @@
 GRANT CONNECT ON DATABASE demo TO replicator;
 GRANT USAGE ON SCHEMA public TO replicator;
 
-CREATE USER demo WITH PASSWORD 'demopass';
+-- Idempotent for K8s bootstrap re-runs (job retries / re-apply after partial success).
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'demo') THEN
+    CREATE ROLE demo WITH LOGIN PASSWORD 'demopass';
+  END IF;
+END
+$$;
 GRANT CONNECT ON DATABASE demo TO demo;
 GRANT USAGE, CREATE ON SCHEMA public TO demo;
 GRANT pg_monitor TO demo;
@@ -28,7 +35,10 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO replicator;
 ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public GRANT SELECT ON TABLES TO replicator;
 ALTER DEFAULT PRIVILEGES FOR ROLE demo IN SCHEMA public GRANT SELECT ON TABLES TO replicator;
 
-CREATE PUBLICATION dbz_publication FOR TABLE public.demo_items;
+-- Idempotent bootstrap re-runs; requires psql (\gexec). IF NOT EXISTS for publications needs PG 15+.
+SELECT 'CREATE PUBLICATION dbz_publication FOR TABLE public.demo_items'
+WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_publication WHERE pubname = 'dbz_publication')
+\gexec
 
 -- Seed rows for demos and Grafana/Prometheus smoke tests (CDC will see these on fresh volumes).
 INSERT INTO demo_items (name) VALUES

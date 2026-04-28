@@ -2,6 +2,7 @@
 # Single entry point for the demo-hub Kubernetes stack: ordered start / stop / restart / status.
 #
 # Usage (from dashboards/demo):
+#   ./demo-start-hub.sh                               # apply + bootstrap + register all Kafka Connect connectors (see repo root)
 #   ./deploy/k8s/scripts/demo-hub.sh start            # apply manifests + data bootstrap
 #   ./deploy/k8s/scripts/demo-hub.sh stop             # delete namespace (full teardown)
 #   ./deploy/k8s/scripts/demo-hub.sh restart          # stop then start (clean slate + bootstrap)
@@ -34,6 +35,7 @@ usage() {
 demo-hub.sh — single entry point for the demo-hub Kubernetes stack
 
 Usage (from dashboards/demo):
+  ./demo-start-hub.sh                             full stack + connector registration (wrapper)
   ./deploy/k8s/scripts/demo-hub.sh start          apply generated/all.yaml + data bootstrap Jobs
   ./deploy/k8s/scripts/demo-hub.sh stop           delete namespace demo-hub (full teardown)
   ./deploy/k8s/scripts/demo-hub.sh restart        stop then start (clean slate + bootstrap)

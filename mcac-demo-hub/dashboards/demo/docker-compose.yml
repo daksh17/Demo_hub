@@ -8,6 +8,13 @@
 # Default Compose project name (overridable with COMPOSE_PROJECT_NAME). Container prefix: demo-hub-<service>-N
 name: demo-hub
 
+# PostgreSQL 16 (Bitnami pin) + repmgr CLI/extension — same image as K8s `POSTGRESQL_IMAGE` in gen_demo_hub_k8s.py.
+x-postgresql-repmgr: &postgresql_repmgr
+  build:
+    context: ./deploy/docker/postgres-kafka
+    dockerfile: Dockerfile.repmgr
+  image: mcac-demo/postgresql-repmgr:16.6.0
+
 services:
   prometheus:
     image: "prom/prometheus:v2.17.1"
@@ -229,8 +236,7 @@ services:
       - demo_net
 
   postgresql-primary:
-    # Bitnami frequently removes dated tags; use :latest or pin by digest in production.
-    image: docker.io/bitnami/postgresql:latest
+    <<: *postgresql_repmgr
     restart: unless-stopped
     ports:
       - "15432:5432"
@@ -241,8 +247,8 @@ services:
       POSTGRESQL_USERNAME: postgres
       POSTGRESQL_PASSWORD: postgres
       POSTGRESQL_DATABASE: demo
-      # Bitnami defaults to pgaudit; add pg_stat_statements via this env (more reliable than -c shared_preload_libraries alone).
-      POSTGRESQL_SHARED_PRELOAD_LIBRARIES: pgaudit,pg_stat_statements
+      # repmgr first (extension); Bitnami defaults include pgaudit + pg_stat_statements.
+      POSTGRESQL_SHARED_PRELOAD_LIBRARIES: repmgr,pgaudit,pg_stat_statements
       POSTGRESQL_EXTRA_FLAGS: >-
         -c wal_level=logical
         -c max_replication_slots=8
@@ -256,6 +262,7 @@ services:
       - "./deploy/docker/postgres-kafka/02-physical-replication-slots.sh:/docker-entrypoint-initdb.d/02-physical-replication-slots.sh:ro"
       - "./deploy/docker/postgres-kafka/03-pg-stat-statements.sh:/docker-entrypoint-initdb.d/03-pg-stat-statements.sh:ro"
       - "./deploy/docker/postgres-kafka/04-scenario-hub-schema-indexes.sql:/docker-entrypoint-initdb.d/04-scenario-hub-schema-indexes.sql:ro"
+      - "./deploy/docker/postgres-kafka/05-repmgr-extension.sh:/docker-entrypoint-initdb.d/05-repmgr-extension.sh:ro"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U demo -d demo -h 127.0.0.1 -p 5432"]
       interval: 5s
@@ -266,7 +273,7 @@ services:
       - demo_net
 
   postgresql-replica-1:
-    image: docker.io/bitnami/postgresql:latest
+    <<: *postgresql_repmgr
     restart: unless-stopped
     ports:
       - "15433:5432"
@@ -279,7 +286,7 @@ services:
       POSTGRESQL_USERNAME: postgres
       POSTGRESQL_PASSWORD: postgres
       # Physical replication slot on primary (must exist before standby connects; see 02-physical-replication-slots.sh).
-      POSTGRESQL_SHARED_PRELOAD_LIBRARIES: pgaudit,pg_stat_statements
+      POSTGRESQL_SHARED_PRELOAD_LIBRARIES: repmgr,pgaudit,pg_stat_statements
       POSTGRESQL_EXTRA_FLAGS: >-
         -c primary_slot_name=pgdemo_phys_replica_1
         -c pg_stat_statements.max=10000
@@ -299,7 +306,7 @@ services:
       - demo_net
 
   postgresql-replica-2:
-    image: docker.io/bitnami/postgresql:latest
+    <<: *postgresql_repmgr
     restart: unless-stopped
     ports:
       - "15434:5432"
@@ -311,7 +318,7 @@ services:
       POSTGRESQL_MASTER_PORT_NUMBER: "5432"
       POSTGRESQL_USERNAME: postgres
       POSTGRESQL_PASSWORD: postgres
-      POSTGRESQL_SHARED_PRELOAD_LIBRARIES: pgaudit,pg_stat_statements
+      POSTGRESQL_SHARED_PRELOAD_LIBRARIES: repmgr,pgaudit,pg_stat_statements
       POSTGRESQL_EXTRA_FLAGS: >-
         -c primary_slot_name=pgdemo_phys_replica_2
         -c pg_stat_statements.max=10000
@@ -386,6 +393,171 @@ services:
       - /bin/sh
       - -c
       - apk add --no-cache bash curl && exec bash /work/kafka-connect-register/register-all.sh http://kafka-connect:8083
+
+  # SQL Server (Linux): publisher + subscriber — CDC + Kafka mirror; optional native transactional replication (best-effort).
+  # Host: localhost:14331 (publisher), :14332 (subscriber). Hub writes catalog rows to publisher when MSSQL_HOST is set.
+  mssql-publisher:
+    image: mcr.microsoft.com/mssql/server:2022-CU14-ubuntu-22.04
+    platform: linux/amd64
+    hostname: mssql-publisher
+    restart: unless-stopped
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: "Developer"
+      MSSQL_AGENT_ENABLED: "true"
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:-Demo_hub_Mssql_2025!}
+    ports:
+      - "14331:1433"
+    volumes:
+      - mssql_publisher_data:/var/opt/mssql
+    networks:
+      - demo_net
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          'bash -c "exec 3<>/dev/tcp/127.0.0.1/1433" || exit 1',
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 36
+      start_period: 30s
+
+  mssql-subscriber:
+    image: mcr.microsoft.com/mssql/server:2022-CU14-ubuntu-22.04
+    platform: linux/amd64
+    hostname: mssql-subscriber
+    restart: unless-stopped
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: "Developer"
+      MSSQL_AGENT_ENABLED: "true"
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:-Demo_hub_Mssql_2025!}
+    ports:
+      - "14332:1433"
+    volumes:
+      - mssql_subscriber_data:/var/opt/mssql
+    networks:
+      - demo_net
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          'bash -c "exec 3<>/dev/tcp/127.0.0.1/1433" || exit 1',
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 36
+      start_period: 30s
+
+  mssql-publisher-schema-init:
+    build:
+      context: ./deploy/docker/mssql-kafka
+      dockerfile: Dockerfile.repl-bootstrap
+    image: mcac-demo/mssql-tools:22.04
+    restart: "no"
+    environment:
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:-Demo_hub_Mssql_2025!}
+    volumes:
+      - ./deploy/docker/mssql-kafka:/scripts:ro
+    networks:
+      - demo_net
+    depends_on:
+      mssql-publisher:
+        condition: service_healthy
+    command: ["/bin/bash", "/scripts/init-publisher.sh"]
+
+  mssql-subscriber-schema-init:
+    build:
+      context: ./deploy/docker/mssql-kafka
+      dockerfile: Dockerfile.repl-bootstrap
+    image: mcac-demo/mssql-tools:22.04
+    restart: "no"
+    environment:
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:-Demo_hub_Mssql_2025!}
+    volumes:
+      - ./deploy/docker/mssql-kafka:/scripts:ro
+    networks:
+      - demo_net
+    depends_on:
+      mssql-subscriber:
+        condition: service_healthy
+    command: ["/bin/bash", "/scripts/init-subscriber.sh"]
+
+  mssql-replication-try:
+    build:
+      context: ./deploy/docker/mssql-kafka
+      dockerfile: Dockerfile.repl-bootstrap
+    image: mcac-demo/mssql-tools:22.04
+    restart: "no"
+    environment:
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:-Demo_hub_Mssql_2025!}
+    volumes:
+      - ./deploy/docker/mssql-kafka:/scripts:ro
+    networks:
+      - demo_net
+    depends_on:
+      mssql-publisher-schema-init:
+        condition: service_completed_successfully
+    command: ["/bin/bash", "/scripts/try-replication-bootstrap.sh"]
+
+  mssql-kafka-connect-register:
+    image: alpine:3.19
+    restart: "no"
+    volumes:
+      - ./deploy/docker:/work:ro
+    working_dir: /work
+    networks:
+      - demo_net
+    environment:
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:-Demo_hub_Mssql_2025!}
+      SCHEMA_HISTORY_KAFKA_BOOTSTRAP: kafka:29092
+    depends_on:
+      kafka-connect:
+        condition: service_healthy
+      mssql-subscriber-schema-init:
+        condition: service_completed_successfully
+      mssql-replication-try:
+        condition: service_completed_successfully
+    command:
+      - /bin/sh
+      - -c
+      - apk add --no-cache bash curl && exec bash /work/mssql-kafka/register-mssql-connectors.sh http://kafka-connect:8083
+
+  # Prometheus metrics for SQL Server (publisher + subscriber). Requires VIEW SERVER STATE (sa OK).
+  mssql-exporter-publisher:
+    image: awaragi/prometheus-mssql-exporter:latest
+    platform: linux/amd64
+    restart: unless-stopped
+    networks:
+      - demo_net
+    environment:
+      SERVER: mssql-publisher
+      PORT: "1433"
+      USERNAME: sa
+      PASSWORD: ${MSSQL_SA_PASSWORD:-Demo_hub_Mssql_2025!}
+      ENCRYPT: "true"
+      TRUST_SERVER_CERTIFICATE: "true"
+    depends_on:
+      mssql-publisher:
+        condition: service_healthy
+
+  mssql-exporter-subscriber:
+    image: awaragi/prometheus-mssql-exporter:latest
+    platform: linux/amd64
+    restart: unless-stopped
+    networks:
+      - demo_net
+    environment:
+      SERVER: mssql-subscriber
+      PORT: "1433"
+      USERNAME: sa
+      PASSWORD: ${MSSQL_SA_PASSWORD:-Demo_hub_Mssql_2025!}
+      ENCRYPT: "true"
+      TRUST_SERVER_CERTIFICATE: "true"
+    depends_on:
+      mssql-subscriber:
+        condition: service_healthy
 
   postgres-exporter-primary:
     image: prometheuscommunity/postgres-exporter:v0.17.1
@@ -765,6 +937,7 @@ services:
     volumes:
       - ./deploy/docker/realtime-orders-search-hub/demo-ui/app.py:/app/app.py:ro
       - ./deploy/docker/realtime-orders-search-hub/demo-ui/scenario.py:/app/scenario.py:ro
+      - ./deploy/docker/realtime-orders-search-hub/demo-ui/hub_config.py:/app/hub_config.py:ro
     restart: unless-stopped
     ports:
       - "8888:8888"
@@ -777,6 +950,11 @@ services:
       OPENSEARCH_URL: http://opensearch:9200
       OPENSEARCH_INDEX: hub-orders
       KAFKA_BOOTSTRAP: kafka:29092
+      MSSQL_HOST: mssql-publisher
+      MSSQL_PORT: "1433"
+      MSSQL_USER: sa
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:-Demo_hub_Mssql_2025!}
+      MSSQL_DATABASE: demo
       # Sustain + large payload waves: many sequential BatchStatements; demo Cassandra uses 500M heap — throttle + long timeout helps avoid coordinator timeouts (code 1100).
       CASSANDRA_WORKLOAD_REQUEST_TIMEOUT_SECONDS: "300"
       CASSANDRA_WORKLOAD_INTER_BATCH_SLEEP_MS: "25"
@@ -798,6 +976,10 @@ services:
         condition: service_healthy
       cassandra:
         condition: service_healthy
+      mssql-publisher:
+        condition: service_healthy
+      mssql-publisher-schema-init:
+        condition: service_completed_successfully
 
 networks:
   demo_net:
@@ -827,4 +1009,8 @@ volumes:
   redis_data:
     driver: local
   opensearch_data:
+    driver: local
+  mssql_publisher_data:
+    driver: local
+  mssql_subscriber_data:
     driver: local

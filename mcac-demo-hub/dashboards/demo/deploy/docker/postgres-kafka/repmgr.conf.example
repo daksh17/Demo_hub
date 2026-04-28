@@ -1,0 +1,65 @@
+# Example repmgr 5.x configuration for a 3-node PostgreSQL cluster.
+#
+# IMPORTANT — mcac-demo-hub today:
+#   - Uses Bitnami streaming replication (POSTGRESQL_REPLICATION_MODE + physical slots).
+#   - Ships repmgr CLI + extension in DB `repmgr` only; failover/switchover is NOT automated.
+#   - Turning this file into a working repmgr cluster requires: dedicated repmgr DB user,
+#     pg_hba + connectivity between all nodes, `repmgr primary register` / `standby register`,
+#     and usually replacing or aligning Bitnami's standby bootstrap with `repmgr standby clone`.
+#
+# Paths below match Bitnami layout inside the container (PGDATA under the volume).
+#
+# --- Per-node settings (copy to each host; change node_id, node_name, conninfo) ---
+#
+#node_id=1
+#node_name=primary1
+#conninfo='host=postgresql-primary port=5432 user=repmgr dbname=repmgr connect_timeout=2'
+#data_directory='/bitnami/postgresql/data'
+#pg_bindir='/opt/bitnami/postgresql/bin'
+#
+# --- Shared settings (same on all nodes) ---
+#
+#use_replication_slots=yes
+#pg_basebackup_options='--waldir=/bitnami/postgresql/data/pg_wal'
+#
+# Logging (optional)
+#log_level=INFO
+#log_file='/bitnami/postgresql/logs/repmgr.log'
+#log_facility=STDERR
+#
+# Failover / promotion (tune for your environment; promote_command is run on a standby)
+#failover=automatic
+#promote_command='/opt/bitnami/postgresql/bin/repmgr standby promote -f /bitnami/postgresql/conf/repmgr.conf --log-to-file'
+#follow_command='/opt/bitnami/postgresql/bin/repmgr standby follow -f /bitnami/postgresql/conf/repmgr.conf --log-to-file --upstream-node-id=%n'
+#
+# Service control (must match how Postgres is started in the container; Bitnami uses custom scripts)
+#service_start_command='...'
+#service_stop_command='...'
+#service_restart_command='...'
+#service_reload_command='...'
+#
+# Event notifications (optional; for alerting)
+#event_notification_command='/path/to/handler.sh %n %e %s "%t" "%d"'
+#
+# --- PostgreSQL role for repmgr (create once on primary, replicate to standbys) ---
+#
+# Example (adjust password; repmgr needs replication privilege and access to repmgr DB):
+#
+#   CREATE ROLE repmgr WITH LOGIN REPLICATION PASSWORD 'changeme';
+#   GRANT CREATE ON DATABASE repmgr TO repmgr;
+#   \c repmgr
+#   GRANT ALL ON SCHEMA repmgr TO repmgr;   -- extension objects live here after CREATE EXTENSION
+#
+# (Exact GRANTs depend on repmgr version; see https://repmgr.org/docs/current/quickstart.html )
+#
+# --- Typical commands (after cluster is registered) ---
+#
+#   repmgr -f /bitnami/postgresql/conf/repmgr.conf primary register
+#   repmgr -f ... standby clone -h primary-host -U repmgr -d repmgr --fast-checkpoint
+#   repmgr -f ... standby register
+#   repmgr -f ... standby switchover   # controlled switchover
+#   repmgr -f ... standby promote      # manual promotion (e.g. after primary loss)
+#   repmgrd -f ... --pid-file /tmp/repmgrd.pid --no-pid-file   # daemon for auto-failover
+#
+# Kubernetes: use stable DNS (e.g. postgresql-primary.demo-hub.svc.cluster.local) in conninfo
+# and ensure NetworkPolicy allows 5432 between Postgres pods.

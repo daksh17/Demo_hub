@@ -1,0 +1,717 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mssql-publisher
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/name: mssql-publisher
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: mssql
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mssql-publisher
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mssql-publisher
+        app.kubernetes.io/part-of: demo-hub
+        demo-hub.io/group: mssql
+    spec:
+      securityContext:
+        fsGroup: 10001
+      containers:
+        - name: mssql-publisher
+          image: mcr.microsoft.com/mssql/server:2022-CU14-ubuntu-22.04
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: ACCEPT_EULA
+              value: "Y"
+            - name: MSSQL_PID
+              value: "Developer"
+            - name: MSSQL_AGENT_ENABLED
+              value: "true"
+            - name: MSSQL_SA_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: mssql-sa-password
+          resources:
+            requests:
+              memory: "2Gi"
+            limits:
+              memory: "4Gi"
+          volumeMounts:
+            - name: data
+              mountPath: /var/opt/mssql
+          ports:
+            - containerPort: 1433
+              name: mssql
+          readinessProbe:
+            tcpSocket:
+              port: 1433
+            initialDelaySeconds: 45
+            periodSeconds: 8
+            timeoutSeconds: 3
+            failureThreshold: 30
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: mssql-publisher
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/name: mssql-publisher
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: mssql
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: mssql-publisher
+  ports:
+    - port: 1433
+      targetPort: 1433
+      name: mssql
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mssql-subscriber
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/name: mssql-subscriber
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: mssql
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mssql-subscriber
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mssql-subscriber
+        app.kubernetes.io/part-of: demo-hub
+        demo-hub.io/group: mssql
+    spec:
+      securityContext:
+        fsGroup: 10001
+      containers:
+        - name: mssql-subscriber
+          image: mcr.microsoft.com/mssql/server:2022-CU14-ubuntu-22.04
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: ACCEPT_EULA
+              value: "Y"
+            - name: MSSQL_PID
+              value: "Developer"
+            - name: MSSQL_AGENT_ENABLED
+              value: "true"
+            - name: MSSQL_SA_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: mssql-sa-password
+          resources:
+            requests:
+              memory: "2Gi"
+            limits:
+              memory: "4Gi"
+          volumeMounts:
+            - name: data
+              mountPath: /var/opt/mssql
+          ports:
+            - containerPort: 1433
+              name: mssql
+          readinessProbe:
+            tcpSocket:
+              port: 1433
+            initialDelaySeconds: 45
+            periodSeconds: 8
+            timeoutSeconds: 3
+            failureThreshold: 30
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: mssql-subscriber
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/name: mssql-subscriber
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: mssql
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: mssql-subscriber
+  ports:
+    - port: 1433
+      targetPort: 1433
+      name: mssql
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mssql-exporter-publisher
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/name: mssql-exporter-publisher
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: mssql
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mssql-exporter-publisher
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mssql-exporter-publisher
+        app.kubernetes.io/part-of: demo-hub
+        demo-hub.io/group: mssql
+    spec:
+      initContainers:
+        - name: wait-mssql
+          image: alpine:3.19
+          command:
+            - /bin/sh
+            - -c
+            - |
+              apk add --no-cache netcat-openbsd >/dev/null
+              for i in $(seq 1 150); do
+                if nc -z -w 2 mssql-publisher.demo-hub.svc.cluster.local 1433 2>/dev/null; then exit 0; fi
+                sleep 2
+              done
+              echo "timeout waiting for mssql-publisher.demo-hub.svc.cluster.local:1433" >&2
+              exit 1
+      containers:
+        - name: mssql-exporter-publisher
+          image: awaragi/prometheus-mssql-exporter:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: SERVER
+              value: "mssql-publisher"
+            - name: PORT
+              value: "1433"
+            - name: USERNAME
+              value: "sa"
+            - name: ENCRYPT
+              value: "true"
+            - name: TRUST_SERVER_CERTIFICATE
+              value: "true"
+            - name: PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: mssql-sa-password
+          ports:
+            - containerPort: 4000
+              name: metrics
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: mssql-exporter-publisher
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/name: mssql-exporter-publisher
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: mssql
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: mssql-exporter-publisher
+  ports:
+    - port: 4000
+      targetPort: 4000
+      name: metrics
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mssql-exporter-subscriber
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/name: mssql-exporter-subscriber
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: mssql
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mssql-exporter-subscriber
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mssql-exporter-subscriber
+        app.kubernetes.io/part-of: demo-hub
+        demo-hub.io/group: mssql
+    spec:
+      initContainers:
+        - name: wait-mssql
+          image: alpine:3.19
+          command:
+            - /bin/sh
+            - -c
+            - |
+              apk add --no-cache netcat-openbsd >/dev/null
+              for i in $(seq 1 150); do
+                if nc -z -w 2 mssql-subscriber.demo-hub.svc.cluster.local 1433 2>/dev/null; then exit 0; fi
+                sleep 2
+              done
+              echo "timeout waiting for mssql-subscriber.demo-hub.svc.cluster.local:1433" >&2
+              exit 1
+      containers:
+        - name: mssql-exporter-subscriber
+          image: awaragi/prometheus-mssql-exporter:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: SERVER
+              value: "mssql-subscriber"
+            - name: PORT
+              value: "1433"
+            - name: USERNAME
+              value: "sa"
+            - name: ENCRYPT
+              value: "true"
+            - name: TRUST_SERVER_CERTIFICATE
+              value: "true"
+            - name: PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: mssql-sa-password
+          ports:
+            - containerPort: 4000
+              name: metrics
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: mssql-exporter-subscriber
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/name: mssql-exporter-subscriber
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: mssql
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: mssql-exporter-subscriber
+  ports:
+    - port: 4000
+      targetPort: 4000
+      name: metrics
+---
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mssql-kafka-scripts
+  namespace: demo-hub
+  labels:
+    demo-hub.io/group: mssql
+    app.kubernetes.io/part-of: demo-hub
+data:
+  chain.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export MSSQL_SA_PASSWORD="${MSSQL_SA_PASSWORD:?}"
+    bash /scripts/init-publisher.sh
+    bash /scripts/init-subscriber.sh
+    bash /scripts/try-replication-bootstrap.sh
+    for i in $(seq 1 180); do
+      if curl -sf "http://kafka-connect:8083/connectors" >/dev/null 2>&1; then
+        echo "kafka-connect ready (attempt $i)" >&2
+        break
+      fi
+      sleep 2
+      if [[ "$i" -eq 180 ]]; then
+        echo "timeout waiting for kafka-connect:8083" >&2
+        exit 1
+      fi
+    done
+    export SCHEMA_HISTORY_KAFKA_BOOTSTRAP="${SCHEMA_HISTORY_KAFKA_BOOTSTRAP:-kafka:9092}"
+    exec bash /scripts/register-mssql-connectors.sh "http://kafka-connect:8083"
+
+  init-publisher.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+    PW="${MSSQL_SA_PASSWORD:?missing MSSQL_SA_PASSWORD}"
+    for i in $(seq 1 60); do
+      if sqlcmd -S mssql-publisher -U sa -P "$PW" -C -Q "SELECT 1" >/dev/null 2>&1; then
+        break
+      fi
+      sleep 2
+    done
+    sqlcmd -S mssql-publisher -U sa -P "$PW" -C -b -i /scripts/01-publisher-schema.sql
+    echo "mssql-publisher schema OK."
+
+  init-subscriber.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+    PW="${MSSQL_SA_PASSWORD:?missing MSSQL_SA_PASSWORD}"
+    for i in $(seq 1 60); do
+      if sqlcmd -S mssql-subscriber -U sa -P "$PW" -C -Q "SELECT 1" >/dev/null 2>&1; then
+        break
+      fi
+      sleep 2
+    done
+    sqlcmd -S mssql-subscriber -U sa -P "$PW" -C -b -i /scripts/02-subscriber-schema.sql
+    echo "mssql-subscriber schema OK."
+
+  try-replication-bootstrap.sh: |
+    #!/usr/bin/env bash
+    # Optional: native transactional replication (often flaky in Docker). Safe to ignore failures.
+    set -u
+    PW="${MSSQL_SA_PASSWORD:?missing MSSQL_SA_PASSWORD}"
+    set +e
+    sqlcmd -S mssql-publisher -U sa -P "$PW" -C -b -i /scripts/05-transactional-replication-bootstrap.sql
+    code=$?
+    set -e
+    if [[ "$code" != 0 ]]; then
+      echo "mssql: transactional replication bootstrap returned $code — continuing without it (CDC+Kafka still works)." >&2
+    fi
+    exit 0
+
+  register-mssql-connectors.sh: |
+    #!/usr/bin/env bash
+    # Debezium SQL Server CDC (publisher) + JDBC sink (subscriber). Requires kafka-connect image with SQL Server plugin.
+    # Usage: ./register-mssql-connectors.sh [http://kafka-connect:8083]
+    set -euo pipefail
+    CONNECT="${1:-http://localhost:8083}"
+    CONNECT="${CONNECT%/}"
+    SCHEMA_HISTORY_KAFKA_BOOTSTRAP="${SCHEMA_HISTORY_KAFKA_BOOTSTRAP:-kafka:29092}"
+    MSSQL_SA_PASSWORD="${MSSQL_SA_PASSWORD:-Demo_hub_Mssql_2025!}"
+    CURL_CONNECT_TIMEOUT="${CURL_CONNECT_TIMEOUT:-5}"
+    CURL_MAX_TIME="${CURL_MAX_TIME:-120}"
+    curl_opts=(--connect-timeout "${CURL_CONNECT_TIMEOUT}" --max-time "${CURL_MAX_TIME}" -sS)
+    
+    remove_connector() {
+      local name="$1" code i
+      code="$(curl "${curl_opts[@]}" -o /dev/null -w '%{http_code}' "$CONNECT/connectors/$name" 2>/dev/null || echo 000)"
+      [[ "$code" == "404" ]] && return 0
+      curl "${curl_opts[@]}" -o /dev/null -X PUT "$CONNECT/connectors/$name/pause" 2>/dev/null || true
+      sleep 2
+      curl "${curl_opts[@]}" -o /dev/null -X DELETE "$CONNECT/connectors/$name" 2>/dev/null || true
+      for i in $(seq 1 90); do
+        code="$(curl "${curl_opts[@]}" -o /dev/null -w '%{http_code}' "$CONNECT/connectors/$name" 2>/dev/null || echo 000)"
+        [[ "$code" == "404" ]] && return 0
+        sleep 1
+      done
+      return 1
+    }
+    
+    post_connector() {
+      local label="$1" tmp resp code
+      tmp="$(mktemp)"
+      cat >"$tmp"
+      resp="$(mktemp)"
+      code="$(curl "${curl_opts[@]}" -o "$resp" -w '%{http_code}' -X POST \
+        -H 'Content-Type: application/json' --data-binary @"$tmp" "$CONNECT/connectors")"
+      rm -f "$tmp"
+      if [[ "$code" != "201" && "$code" != "200" ]]; then
+        echo "Failed to register ${label} (HTTP ${code}). Response:" >&2
+        cat "$resp" >&2
+        rm -f "$resp"
+        return 1
+      fi
+      cat "$resp"
+      echo
+      rm -f "$resp"
+    }
+    
+    echo "Removing existing mssql-source-demo / mssql-jdbc-sink-demo if present..."
+    remove_connector "mssql-jdbc-sink-demo" || true
+    remove_connector "mssql-source-demo" || true
+    
+    mssql_source_ok=0
+    for attempt in $(seq 1 8); do
+      if post_connector "mssql-source-demo" <<JSON
+    {
+      "name": "mssql-source-demo",
+      "config": {
+        "connector.class": "io.debezium.connector.sqlserver.SqlServerConnector",
+        "tasks.max": "1",
+        "database.hostname": "mssql-publisher",
+        "database.port": "1433",
+        "database.user": "sa",
+        "database.password": "${MSSQL_SA_PASSWORD}",
+        "database.names": "demo",
+        "topic.prefix": "demomssql",
+        "table.include.list": "dbo.scenario_catalog_mirror_mssql",
+        "schema.history.internal.kafka.bootstrap.servers": "${SCHEMA_HISTORY_KAFKA_BOOTSTRAP}",
+        "schema.history.internal.kafka.topic": "demomssql.schema-changes.internal",
+        "database.encrypt": "false",
+        "database.trustServerCertificate": "true",
+        "snapshot.mode": "initial",
+        "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+        "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+        "key.converter.schemas.enable": "true",
+        "value.converter.schemas.enable": "true"
+      }
+    }
+    JSON
+      then
+        mssql_source_ok=1
+        break
+      fi
+      if [[ "$attempt" -lt 8 ]]; then
+        echo "mssql-source-demo registration failed (attempt ${attempt}/8); retrying in 15s…" >&2
+        sleep 15
+      fi
+    done
+    if [[ "$mssql_source_ok" -ne 1 ]]; then
+      echo "Cannot register mssql-source-demo. If the error mentions database \"demo\": ensure publisher" >&2
+      echo "has DB demo (mssql-demo-bootstrap / init-publisher) and MSSQL_SA_PASSWORD matches the Secret." >&2
+      echo "K8s: kubectl logs -n demo-hub job/mssql-demo-bootstrap --tail=100" >&2
+      echo "     ./deploy/k8s/scripts/verify-mssql-publisher-demo.sh" >&2
+      exit 1
+    fi
+    
+    echo "Registered mssql-source-demo."
+    
+    post_connector "mssql-jdbc-sink-demo" <<JSON
+    {
+      "name": "mssql-jdbc-sink-demo",
+      "config": {
+        "connector.class": "io.debezium.connector.jdbc.JdbcSinkConnector",
+        "tasks.max": "1",
+        "topics": "demomssql.dbo.scenario_catalog_mirror_mssql",
+        "connection.url": "jdbc:sqlserver://mssql-subscriber:1433;databaseName=demo;encrypt=false;trustServerCertificate=true",
+        "connection.username": "sa",
+        "connection.password": "${MSSQL_SA_PASSWORD}",
+        "dialect.name": "sqlserver",
+        "insert.mode": "upsert",
+        "delete.enabled": "false",
+        "primary.key.mode": "record_key",
+        "primary.key.fields": "id",
+        "table.name.format": "dbo.demo_items_from_kafka_mssql",
+        "auto.create": "false",
+        "schema.evolution": "basic",
+        "quote.identifiers": "false",
+        "transforms": "unwrap",
+        "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
+        "transforms.unwrap.delete.handling.mode": "drop",
+        "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+        "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+        "key.converter.schemas.enable": "true",
+        "value.converter.schemas.enable": "true",
+        "errors.log.enable": "true"
+      }
+    }
+    JSON
+    
+    echo "Registered mssql-jdbc-sink-demo -> mssql-subscriber.demo.dbo.demo_items_from_kafka_mssql"
+    echo "Check: curl -s $CONNECT/connectors"
+
+  01-publisher-schema.sql: |
+    /* Publisher: demo DB, hub mirror table, CDC for Debezium. */
+    IF NOT EXISTS (SELECT * FROM sys.databases WHERE name = N'demo')
+        CREATE DATABASE demo;
+    GO
+    USE demo;
+    GO
+    IF OBJECT_ID(N'dbo.scenario_catalog_mirror_mssql', N'U') IS NULL
+    BEGIN
+        CREATE TABLE dbo.scenario_catalog_mirror_mssql (
+            id INT IDENTITY(1, 1) NOT NULL PRIMARY KEY,
+            sku NVARCHAR(128) NOT NULL UNIQUE,
+            title NVARCHAR(512) NOT NULL,
+            category NVARCHAR(256) NULL,
+            unit_price_cents INT NOT NULL DEFAULT 0,
+            stock_units INT NOT NULL DEFAULT 0,
+            source_mongo_id NVARCHAR(96) NULL,
+            kafka_msg_key NVARCHAR(160) NULL,
+            updated_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+        );
+    END
+    GO
+    /* Hub workload generator (not CDC — avoids noisy Debezium topics). */
+    IF OBJECT_ID(N'dbo.hub_workload_mssql', N'U') IS NULL
+    BEGIN
+        CREATE TABLE dbo.hub_workload_mssql (
+            id BIGINT IDENTITY(1, 1) NOT NULL PRIMARY KEY,
+            run_id NVARCHAR(32) NOT NULL,
+            seq INT NOT NULL,
+            name NVARCHAR(4000) NOT NULL,
+            created_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+            CONSTRAINT UQ_hub_workload_mssql_run_seq UNIQUE (run_id, seq)
+        );
+        CREATE INDEX IX_hub_workload_mssql_run_id ON dbo.hub_workload_mssql (run_id);
+    END
+    GO
+    /* CDC (required for Debezium SQL Server connector). */
+    IF EXISTS (SELECT 1 FROM sys.databases WHERE name = N'demo' AND is_cdc_enabled = 0)
+    BEGIN
+        EXEC sys.sp_cdc_enable_db;
+    END
+    GO
+    USE demo;
+    GO
+    DECLARE @oid INT = OBJECT_ID(N'dbo.scenario_catalog_mirror_mssql');
+    IF @oid IS NOT NULL
+       AND EXISTS (SELECT 1 FROM sys.databases WHERE name = N'demo' AND is_cdc_enabled = 1)
+       AND (SELECT COALESCE(is_tracked_by_cdc, 0) FROM sys.tables WHERE object_id = @oid) = 0
+    BEGIN
+        EXEC sys.sp_cdc_enable_table
+            @source_schema = N'dbo',
+            @source_name = N'scenario_catalog_mirror_mssql',
+            @role_name = NULL,
+            @supports_net_changes = 1;
+    END
+    GO
+
+  02-subscriber-schema.sql: |
+    /* Subscriber: sink table aligned with Debezium unwrap columns (upsert by id). */
+    IF NOT EXISTS (SELECT * FROM sys.databases WHERE name = N'demo')
+        CREATE DATABASE demo;
+    GO
+    USE demo;
+    GO
+    IF OBJECT_ID(N'dbo.demo_items_from_kafka_mssql', N'U') IS NULL
+    BEGIN
+        CREATE TABLE dbo.demo_items_from_kafka_mssql (
+            id INT NOT NULL PRIMARY KEY,
+            sku NVARCHAR(128) NULL,
+            title NVARCHAR(512) NULL,
+            category NVARCHAR(256) NULL,
+            unit_price_cents INT NULL,
+            stock_units INT NULL,
+            source_mongo_id NVARCHAR(96) NULL,
+            kafka_msg_key NVARCHAR(160) NULL,
+            updated_at DATETIME2 NULL
+        );
+    END
+    GO
+
+  05-transactional-replication-bootstrap.sql: |
+    /*
+     * Best-effort transactional replication bootstrap (publisher = distributor).
+     * Docker labs often need @@SERVERNAME / DNS aligned with compose hostnames.
+     * If this fails, Debezium + JDBC sink still work; only native SQL Server replication is skipped.
+     *
+     * Run from sqlcmd connected to PUBLISHER as sa, then SUBSCRIBER steps separately if needed.
+     * See: https://learn.microsoft.com/en-us/sql/linux/sql-server-linux-replication-configure-transactional
+     */
+    SET NOCOUNT ON;
+    USE master;
+    GO
+    
+    DECLARE @dist sysname = CAST(SERVERPROPERTY('MachineName') AS sysname);
+    DECLARE @pwd NVARCHAR(128) = N'ReplDist_DemoHub_2025!';
+    
+    /* Distributor + distribution database (idempotent-ish). */
+    IF NOT EXISTS (SELECT 1 FROM sys.databases WHERE name = N'distribution')
+    BEGIN
+        EXEC sp_adddistributor @distributor = @dist, @password = @pwd;
+        EXEC sp_adddistributiondb
+            @database = N'distribution',
+            @data_folder = N'/var/opt/mssql/data',
+            @log_folder = N'/var/opt/mssql/data',
+            @log_file_size = 2,
+            @min_distretention = 0,
+            @max_distretention = 72,
+            @history_retention = 48;
+    END
+    GO
+    
+    USE demo;
+    GO
+    IF NOT EXISTS (
+        SELECT 1 FROM sys.databases WHERE name = N'demo' AND is_published = 1
+    )
+    BEGIN
+        EXEC sp_replicationdboption @dbname = N'demo', @optname = N'publish', @value = N'true';
+    END
+    GO
+    
+    USE demo;
+    GO
+    IF NOT EXISTS (SELECT 1 FROM syspublications WHERE name = N'demo_hub_pub')
+    BEGIN
+        EXEC sp_addpublication
+            @publication = N'demo_hub_pub',
+            @description = N'demo-hub catalog mirror',
+            @sync_method = N'native',
+            @status = N'active',
+            @allow_push = N'true',
+            @allow_pull = N'true',
+            @independent_agent = N'true';
+    END
+    GO
+    
+    USE demo;
+    GO
+    IF NOT EXISTS (SELECT 1 FROM sysarticles a INNER JOIN syspublications p ON a.pubid = p.pubid WHERE p.name = N'demo_hub_pub' AND a.article = N'scenario_catalog_mirror_mssql')
+    BEGIN
+        EXEC sp_addarticle
+            @publication = N'demo_hub_pub',
+            @article = N'scenario_catalog_mirror_mssql',
+            @source_table = N'scenario_catalog_mirror_mssql',
+            @source_owner = N'dbo',
+            @destination_table = N'scenario_catalog_mirror_mssql',
+            @type = N'logbased';
+    END
+    GO
+---
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mssql-demo-bootstrap
+  namespace: demo-hub
+  labels:
+    demo-hub.io/group: mssql
+    app.kubernetes.io/part-of: demo-hub
+spec:
+  activeDeadlineSeconds: 3600
+  ttlSecondsAfterFinished: 86400
+  backoffLimit: 4
+  template:
+    metadata:
+      labels:
+        demo-hub.io/group: mssql
+        app.kubernetes.io/part-of: demo-hub
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: run
+          image: mcac-demo/mssql-tools:22.04
+          imagePullPolicy: Never
+          command:
+            - "/bin/bash"
+            - "/scripts/chain.sh"
+          env:
+            - name: MSSQL_SA_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: mssql-sa-password
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+      volumes:
+        - name: scripts
+          configMap:
+            name: mssql-kafka-scripts
+            defaultMode: 0755

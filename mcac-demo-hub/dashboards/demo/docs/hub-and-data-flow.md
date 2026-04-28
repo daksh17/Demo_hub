@@ -7,25 +7,29 @@ This page describes **application behavior** that is the same in Docker Compose 
 | URL | Purpose |
 |-----|---------|
 | **http://localhost:8888** | Home: single-order demo, links to stores |
-| **http://localhost:8888/workload** | Tunable batch load across Postgres, Mongo, Redis, Cassandra, OpenSearch |
+| **http://localhost:8888/workload** | Tunable batch load across Postgres, Mongo, Redis, Cassandra, OpenSearch, and optionally **SQL Server** (`demo.dbo.hub_workload_mssql` on the publisher) |
 | **http://localhost:8888/scenario** | Multi-DB scenario (Faker, pipelines, Kafka topics from Python — independent of Kafka Connect unless you also register connectors) |
 
 **Implementation:** [`deploy/docker/realtime-orders-search-hub/demo-ui/`](../deploy/docker/realtime-orders-search-hub/demo-ui/) (FastAPI). **Narrative + diagrams:** [`deploy/docker/realtime-orders-search-hub/README.md`](../deploy/docker/realtime-orders-search-hub/README.md), [`scenario-flow/README.md`](../deploy/docker/realtime-orders-search-hub/scenario-flow/README.md).
 
-## Kafka Connect & CDC (four connectors)
+## Kafka Connect & CDC (Postgres + Mongo + optional SQL Server)
 
-The stack can run **Debezium Postgres source + JDBC sink** and **Debezium Mongo source + Mongo sink**. The hub’s “Single order” / “Workload” paths write **source** rows only:
+The stack can run **Debezium Postgres source + JDBC sink** and **Debezium Mongo source + Mongo sink** (**four** connectors), and **Debezium SQL Server source + JDBC sink to the subscriber** (**two** more). The hub’s “Single order” / “Workload” paths write **source** rows only:
 
 - Postgres: **`public.demo_items`**
 - Mongo: **`demo.demo_items`**
+- SQL Server (when registered): publisher **`dbo.scenario_catalog_mirror_mssql`** (and related CDC setup from `mssql-kafka` init)
 
-**Sink** tables/collections (**`demo_items_from_kafka`**, **`demo.demo_items_from_kafka`**) fill only when **all four connectors** are **RUNNING** (Kafka Connect → topics → sinks).
+**Sink** tables/collections (**`demo_items_from_kafka`**, **`demo.demo_items_from_kafka`**, subscriber mirror) fill only when the corresponding connectors are **RUNNING**.
 
 | Action | Command / note |
 |--------|------------------|
-| **Compose (automatic one-shot)** | Service **`kafka-connect-register`** runs [`deploy/docker/kafka-connect-register/register-all.sh`](../deploy/docker/kafka-connect-register/register-all.sh) |
-| **Compose (manual from repo root `dashboards/demo`)** | `./deploy/docker/kafka-connect-register/register-all.sh` |
-| **Kubernetes** | Port-forward Connect REST (see [`deploy/k8s/README.md`](../deploy/k8s/README.md)), then `DEMO_HUB_K8S=1 ./deploy/docker/kafka-connect-register/register-all.sh http://127.0.0.1:8083` (schema history uses in-cluster **`kafka:9092`**) |
+| **Compose (automatic one-shots)** | **`kafka-connect-register`** runs [`register-all.sh`](../deploy/docker/kafka-connect-register/register-all.sh) (Postgres + Mongo). **`mssql-kafka-connect-register`** runs [`mssql-kafka/register-mssql-connectors.sh`](../deploy/docker/mssql-kafka/register-mssql-connectors.sh) after MSSQL schema jobs (SQL Server uses in-network **`kafka:29092`** for schema history). |
+| **Compose / K8s — all six from host** | After Connect is up: [`register-all-connectors.sh`](../deploy/docker/kafka-connect-register/register-all-connectors.sh) — with **`DEMO_HUB_K8S=1`** also runs **[`apply-mssql-schema-k8s.sh`](../deploy/k8s/scripts/apply-mssql-schema-k8s.sh)** (unless **`SKIP_MSSQL_SCHEMA_APPLY=1`**), then **`register-all.sh`** and **`register-mssql-connectors.sh`**. Full cluster bring-up + registration: **[`../demo-start-hub.sh`](../demo-start-hub.sh)**. |
+| **Compose (manual — PG+Mongo only)** | `./deploy/docker/kafka-connect-register/register-all.sh` |
+| **Kubernetes (PG+Mongo)** | Port-forward Connect REST (see [`deploy/k8s/README.md`](../deploy/k8s/README.md)), then `DEMO_HUB_K8S=1 ./deploy/docker/kafka-connect-register/register-all.sh http://127.0.0.1:8083` |
+| **Kubernetes (PG+Mongo+MSSQL)** | Same port-forward, then `DEMO_HUB_K8S=1 ./deploy/docker/kafka-connect-register/register-all-connectors.sh http://127.0.0.1:8083` — or rely on Job **`mssql-demo-bootstrap`** for MSSQL registration after Connect is Ready. |
+| **Resume paused connectors** | `./deploy/docker/kafka-connect-register/resume-kafka-connectors.sh http://127.0.0.1:8083` |
 | **Diagnose** | `./diagnose-kafka-connect.sh` (from `dashboards/demo`) |
 | **Reset sinks / connectors** | `./reset-kafka-connect-demo.sh`, `./clean-kafka-connect-sinks.sh` |
 

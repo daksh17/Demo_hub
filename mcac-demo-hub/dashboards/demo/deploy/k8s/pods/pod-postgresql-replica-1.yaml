@@ -10,7 +10,7 @@ metadata:
 spec:
   containers:
     - name: postgresql-replica-1
-      image: docker.io/bitnami/postgresql:latest
+      image: mcac-demo/postgresql-repmgr:16.6.0
       imagePullPolicy: IfNotPresent
       env:
         - name: POSTGRESQL_REPLICATION_MODE
@@ -23,11 +23,13 @@ spec:
           value: "postgres"
         - name: POSTGRESQL_PASSWORD
           value: "postgres"
+        - name: POSTGRESQL_SHARED_PRELOAD_LIBRARIES
+          value: "repmgr,pgaudit,pg_stat_statements"
         - name: POSTGRESQL_MASTER_HOST
           value: "postgresql-primary"
         - name: POSTGRESQL_MASTER_PORT_NUMBER
           value: "5432"
         - name: POSTGRESQL_EXTRA_FLAGS
-          value: "-c primary_slot_name=pgdemo_phys_replica_1"
+          value: "-c wal_level=replica -c primary_slot_name=pgdemo_phys_replica_1 -c pg_stat_statements.max=10000 -c pg_stat_statements.track=all"
       ports:
         - containerPort: 5432

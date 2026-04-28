@@ -1,5 +1,6 @@
 fastapi==0.115.6
 uvicorn[standard]==0.32.1
+itsdangerous==2.2.0
 psycopg[binary]==3.2.3
 pymongo==4.10.1
 redis==5.2.1
@@ -8,3 +9,4 @@ httpx==0.28.1
 pydantic==2.10.3
 Faker==33.1.0
 kafka-python==2.0.2
+pymssql==2.3.2

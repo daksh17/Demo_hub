@@ -11,8 +11,13 @@ flowchart TB
     PR2[(Replica 2)]
   end
 
+  subgraph sqlsrv [SQL Server demo]
+    MPUB[(Publisher :14331)]
+    MSUB[(Subscriber :14332)]
+  end
+
   subgraph mongo [MongoDB sharded]
-    MS[mongos :27025 host]
+    MONGOS[mongos :27025 host]
     TIC[tic / tac / toe shards]
   end
 
@@ -36,28 +41,33 @@ flowchart TB
 
   U --> API
   API --> PG
-  API --> MS
+  API --> MPUB
+  API --> MONGOS
   API --> CS
   API --> RD
   API --> OS
 
   PG --> PR1
   PG --> PR2
-  MS --> TIC
+  MONGOS --> TIC
 
   PG --> KC
-  MS --> KC
+  MONGOS --> KC
+  MPUB --> KC
   KC --> K
   ZK --> K
 
   KC -. optional consumers / sinks .-> OS
   KC -. optional consumers .-> RD
   KC -. optional consumers .-> CS
+  KC -. JDBC sink .-> MSUB
 
   OSD --> OS
 
   PG --> PROM
-  MS --> PROM
+  MONGOS --> PROM
+  MPUB --> PROM
+  MSUB --> PROM
   K --> PROM
   CS --> PROM
   RD --> PROM

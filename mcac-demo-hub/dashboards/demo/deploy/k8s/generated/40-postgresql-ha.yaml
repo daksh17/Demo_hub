@@ -19,9 +19,43 @@ spec:
         app.kubernetes.io/part-of: demo-hub
         demo-hub.io/group: postgres-ha
     spec:
+      initContainers:
+        - name: assert-repmgr-extension
+          image: mcac-demo/postgresql-repmgr:16.6.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              f=/opt/bitnami/postgresql/share/extension/repmgr.control
+              if [ ! -f "$f" ]; then
+                echo "Missing $f in image mcac-demo/postgresql-repmgr:16.6.0." >&2
+                echo "Rebuild: docker build --no-cache -t mcac-demo/postgresql-repmgr:16.6.0 -f deploy/docker/postgres-kafka/Dockerfile.repmgr deploy/docker/postgres-kafka" >&2
+                exit 1
+              fi
+        - name: mcac-wal-archive-conf
+          image: mcac-demo/postgresql-repmgr:16.6.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MCAC_ARCHIVE_MODE
+              value: "on"
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              conf_dir=/bitnami/postgresql/conf/conf.d
+              mkdir -p "$conf_dir"
+              printf '%s\n' "archive_mode = ${MCAC_ARCHIVE_MODE}" \
+                "archive_command = '/opt/bitnami/scripts/mcac-wal-archive.sh %p %f'" \
+                > "$conf_dir/99-mcac-archive.conf"
+          volumeMounts:
+            - name: data
+              mountPath: /bitnami/postgresql
       containers:
         - name: postgresql-primary
-          image: docker.io/bitnamilegacy/postgresql:16.6.0-debian-12-r2
+          image: mcac-demo/postgresql-repmgr:16.6.0
           imagePullPolicy: IfNotPresent
           env:
             - name: POSTGRESQL_REPLICATION_MODE
@@ -33,7 +67,7 @@ spec:
             - name: POSTGRESQL_DATABASE
               value: "demo"
             - name: POSTGRESQL_SHARED_PRELOAD_LIBRARIES
-              value: "pgaudit,pg_stat_statements"
+              value: "repmgr,pgaudit,pg_stat_statements"
             - name: POSTGRESQL_EXTRA_FLAGS
               value: "-c wal_level=logical -c max_replication_slots=8 -c max_wal_senders=8 -c pg_stat_statements.max=10000 -c pg_stat_statements.track=all"
             - name: POSTGRESQL_REPLICATION_PASSWORD
@@ -97,9 +131,43 @@ spec:
         app.kubernetes.io/part-of: demo-hub
         demo-hub.io/group: postgres-ha
     spec:
+      initContainers:
+        - name: assert-repmgr-extension
+          image: mcac-demo/postgresql-repmgr:16.6.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              f=/opt/bitnami/postgresql/share/extension/repmgr.control
+              if [ ! -f "$f" ]; then
+                echo "Missing $f in image mcac-demo/postgresql-repmgr:16.6.0." >&2
+                echo "Rebuild: docker build --no-cache -t mcac-demo/postgresql-repmgr:16.6.0 -f deploy/docker/postgres-kafka/Dockerfile.repmgr deploy/docker/postgres-kafka" >&2
+                exit 1
+              fi
+        - name: mcac-wal-archive-conf
+          image: mcac-demo/postgresql-repmgr:16.6.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MCAC_ARCHIVE_MODE
+              value: "always"
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              conf_dir=/bitnami/postgresql/conf/conf.d
+              mkdir -p "$conf_dir"
+              printf '%s\n' "archive_mode = ${MCAC_ARCHIVE_MODE}" \
+                "archive_command = '/opt/bitnami/scripts/mcac-wal-archive.sh %p %f'" \
+                > "$conf_dir/99-mcac-archive.conf"
+          volumeMounts:
+            - name: data
+              mountPath: /bitnami/postgresql
       containers:
         - name: postgresql-replica-1
-          image: docker.io/bitnamilegacy/postgresql:16.6.0-debian-12-r2
+          image: mcac-demo/postgresql-repmgr:16.6.0
           imagePullPolicy: IfNotPresent
           env:
             - name: POSTGRESQL_REPLICATION_MODE
@@ -111,9 +179,9 @@ spec:
             - name: POSTGRESQL_MASTER_PORT_NUMBER
               value: "5432"
             - name: POSTGRESQL_SHARED_PRELOAD_LIBRARIES
-              value: "pgaudit,pg_stat_statements"
+              value: "repmgr,pgaudit,pg_stat_statements"
             - name: POSTGRESQL_EXTRA_FLAGS
-              value: "-c primary_slot_name=pgdemo_phys_replica_1 -c pg_stat_statements.max=10000 -c pg_stat_statements.track=all"
+              value: "-c wal_level=replica -c primary_slot_name=pgdemo_phys_replica_1 -c pg_stat_statements.max=10000 -c pg_stat_statements.track=all"
             - name: POSTGRESQL_REPLICATION_PASSWORD
               valueFrom:
                 secretKeyRef:
@@ -175,9 +243,43 @@ spec:
         app.kubernetes.io/part-of: demo-hub
         demo-hub.io/group: postgres-ha
     spec:
+      initContainers:
+        - name: assert-repmgr-extension
+          image: mcac-demo/postgresql-repmgr:16.6.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              f=/opt/bitnami/postgresql/share/extension/repmgr.control
+              if [ ! -f "$f" ]; then
+                echo "Missing $f in image mcac-demo/postgresql-repmgr:16.6.0." >&2
+                echo "Rebuild: docker build --no-cache -t mcac-demo/postgresql-repmgr:16.6.0 -f deploy/docker/postgres-kafka/Dockerfile.repmgr deploy/docker/postgres-kafka" >&2
+                exit 1
+              fi
+        - name: mcac-wal-archive-conf
+          image: mcac-demo/postgresql-repmgr:16.6.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MCAC_ARCHIVE_MODE
+              value: "always"
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              conf_dir=/bitnami/postgresql/conf/conf.d
+              mkdir -p "$conf_dir"
+              printf '%s\n' "archive_mode = ${MCAC_ARCHIVE_MODE}" \
+                "archive_command = '/opt/bitnami/scripts/mcac-wal-archive.sh %p %f'" \
+                > "$conf_dir/99-mcac-archive.conf"
+          volumeMounts:
+            - name: data
+              mountPath: /bitnami/postgresql
       containers:
         - name: postgresql-replica-2
-          image: docker.io/bitnamilegacy/postgresql:16.6.0-debian-12-r2
+          image: mcac-demo/postgresql-repmgr:16.6.0
           imagePullPolicy: IfNotPresent
           env:
             - name: POSTGRESQL_REPLICATION_MODE
@@ -189,9 +291,9 @@ spec:
             - name: POSTGRESQL_MASTER_PORT_NUMBER
               value: "5432"
             - name: POSTGRESQL_SHARED_PRELOAD_LIBRARIES
-              value: "pgaudit,pg_stat_statements"
+              value: "repmgr,pgaudit,pg_stat_statements"
             - name: POSTGRESQL_EXTRA_FLAGS
-              value: "-c primary_slot_name=pgdemo_phys_replica_2 -c pg_stat_statements.max=10000 -c pg_stat_statements.track=all"
+              value: "-c wal_level=replica -c primary_slot_name=pgdemo_phys_replica_2 -c pg_stat_statements.max=10000 -c pg_stat_statements.track=all"
             - name: POSTGRESQL_REPLICATION_PASSWORD
               valueFrom:
                 secretKeyRef:

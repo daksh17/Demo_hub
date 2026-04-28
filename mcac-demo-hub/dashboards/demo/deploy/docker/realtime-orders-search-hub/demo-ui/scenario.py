@@ -20,19 +20,21 @@ from cassandra.cluster import Session as CassandraSession
 from faker import Faker
 from pymongo import MongoClient
 
+from hub_config import get_runtime_config
+
 fake = Faker()
 Faker.seed(42)
 
-PG_DSN = os.environ.get(
-    "POSTGRES_DSN",
-    "postgresql://demo:demopass@postgresql-primary:5432/demo",
-)
-MONGO_URI = os.environ.get("MONGO_URI", "mongodb://mongo-mongos1:27017")
-REDIS_URL = os.environ.get("REDIS_URL", "redis://:demoredispass@redis:6379/0")
-OPENSEARCH_URL = os.environ.get("OPENSEARCH_URL", "http://opensearch:9200").rstrip("/")
-HUB_KEYSPACE = os.environ.get("CASSANDRA_KEYSPACE", "demo_hub")
 KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP", "kafka:29092")
-SCENARIO_OS_INDEX = os.environ.get("SCENARIO_PIPELINE_OS_INDEX", "hub-scenario-pipeline")
+
+# Optional SQL Server (Compose: mssql-publisher) — catalog mirror + Debezium CDC.
+MSSQL_HOST = os.environ.get("MSSQL_HOST", "").strip()
+MSSQL_PORT = int(os.environ.get("MSSQL_PORT", "1433") or "1433")
+MSSQL_USER = os.environ.get("MSSQL_USER", "sa")
+MSSQL_SA_PASSWORD = os.environ.get("MSSQL_SA_PASSWORD", "")
+MSSQL_DATABASE = os.environ.get("MSSQL_DATABASE", "demo")
+# Docker SQL Server: pymssql often needs encrypt=off unless you configure TLS.
+_MSSQL_ENCRYPT = os.environ.get("MSSQL_ENCRYPT", "off").strip().lower()
 
 MONGO_COLL = "scenario_products"
 REDIS_DASH_KEY = "scenario:dashboard:summary"
@@ -159,10 +161,13 @@ def _ensure_postgres_scenario_indexes(conn: psycopg.Connection) -> None:
         conn.execute(sql)
 
 
-def ensure_cassandra_scenario_schema(session: CassandraSession) -> None:
+def ensure_cassandra_scenario_schema(
+    session: CassandraSession, keyspace: str | None = None
+) -> None:
+    ks = keyspace if keyspace is not None else get_runtime_config().cassandra_keyspace
     session.execute(
         f"""
-        CREATE TABLE IF NOT EXISTS {HUB_KEYSPACE}.scenario_timeline (
+        CREATE TABLE IF NOT EXISTS {ks}.scenario_timeline (
           order_ref text,
           event_ts timestamp,
           event_type text,
@@ -174,11 +179,12 @@ def ensure_cassandra_scenario_schema(session: CassandraSession) -> None:
     # Secondary index: use only for low-cardinality filters in demos (ORDER_PLACED vs FULFILLMENT_READY).
     # High-cardinality or large partitions: prefer model + query by partition key or a dedicated table.
     session.execute(
-        f"CREATE INDEX IF NOT EXISTS scenario_timeline_event_type ON {HUB_KEYSPACE}.scenario_timeline (event_type)"
+        f"CREATE INDEX IF NOT EXISTS scenario_timeline_event_type ON {ks}.scenario_timeline (event_type)"
     )
 
 
 def ensure_scenario_os_index(client: httpx.Client) -> None:
+    cfg = get_runtime_config()
     body = {
         "mappings": {
             "properties": {
@@ -190,17 +196,22 @@ def ensure_scenario_os_index(client: httpx.Client) -> None:
             }
         }
     }
-    r = client.head(f"{OPENSEARCH_URL}/{SCENARIO_OS_INDEX}")
+    r = client.head(f"{cfg.opensearch_url}/{cfg.scenario_opensearch_index}")
     if r.status_code == 200:
         return
-    r = client.put(f"{OPENSEARCH_URL}/{SCENARIO_OS_INDEX}", json=body)
+    r = client.put(
+        f"{cfg.opensearch_url}/{cfg.scenario_opensearch_index}", json=body
+    )
     if r.status_code not in (200, 201):
-        raise RuntimeError(f"OpenSearch {SCENARIO_OS_INDEX}: {r.status_code} {r.text}")
+        raise RuntimeError(
+            f"OpenSearch {cfg.scenario_opensearch_index}: {r.status_code} {r.text}"
+        )
 
 
 def _mirror_to_opensearch(
     client: httpx.Client, *, topic: str, key: str, direction: str, payload: dict
 ) -> None:
+    cfg = get_runtime_config()
     doc = {
         "topic": topic,
         "msg_key": key,
@@ -210,7 +221,7 @@ def _mirror_to_opensearch(
     }
     _id = f"{key}-{uuid.uuid4().hex[:12]}"
     r = client.put(
-        f"{OPENSEARCH_URL}/{SCENARIO_OS_INDEX}/_doc/{_id}",
+        f"{cfg.opensearch_url}/{cfg.scenario_opensearch_index}/_doc/{_id}",
         json=doc,
         headers={"Content-Type": "application/json"},
     )
@@ -224,7 +235,8 @@ def _redis_push_recent(r: redis.Redis, rec: dict) -> None:
 
 
 def _redis_refresh_summary(r: redis.Redis) -> None:
-    with psycopg.connect(PG_DSN) as conn:
+    cfg = get_runtime_config()
+    with psycopg.connect(cfg.postgres_dsn) as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM scenario_catalog_mirror")
             n_mir = cur.fetchone()[0]
@@ -232,7 +244,7 @@ def _redis_refresh_summary(r: redis.Redis) -> None:
             n_ord = cur.fetchone()[0]
             cur.execute("SELECT COUNT(*) FROM scenario_fulfillment_lines")
             n_ful = cur.fetchone()[0]
-    mc = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10_000)
+    mc = MongoClient(cfg.mongo_uri, serverSelectionTimeoutMS=10_000)
     n_mongo = mc["demo"][MONGO_COLL].count_documents({})
     mc.close()
     summary = {
@@ -250,9 +262,10 @@ def _redis_refresh_summary(r: redis.Redis) -> None:
 
 def op_seed_catalog(count: int = 10) -> dict[str, Any]:
     """Service A: product catalog documents in Mongo (rich semi-realistic attributes)."""
+    cfg = get_runtime_config()
     mc: MongoClient | None = None
     try:
-        mc = MongoClient(MONGO_URI, serverSelectionTimeoutMS=30_000)
+        mc = MongoClient(cfg.mongo_uri, serverSelectionTimeoutMS=30_000)
         coll = mc["demo"][MONGO_COLL]
         inserted = []
         cats = ["electronics", "home", "apparel", "grocery", "sports"]
@@ -276,7 +289,7 @@ def op_seed_catalog(count: int = 10) -> dict[str, Any]:
         return {
             "ok": False,
             "error": str(e),
-            "mongo_uri": MONGO_URI,
+            "mongo_uri": cfg.mongo_uri,
             "hint": "K8s: ensure Job mongo-demo-bootstrap is Complete (sharding + demo DB). "
             "Check: kubectl logs -n demo-hub job/mongo-demo-bootstrap --tail=80 ; "
             "kubectl logs -n demo-hub deploy/mongo-mongos1 --tail=50",
@@ -286,64 +299,279 @@ def op_seed_catalog(count: int = 10) -> dict[str, Any]:
             mc.close()
 
 
+def _mssql_connect() -> tuple[Any | None, str | None]:
+    """
+    Returns (connection, None) on success, or (None, short_error) when SQL Server
+    is skipped or unreachable. Callers can surface the message in API JSON / workload errors.
+    """
+    try:
+        import pymssql  # type: ignore
+    except ImportError as e:
+        return None, f"pymssql not installed ({e})"
+    if not MSSQL_HOST or not MSSQL_SA_PASSWORD:
+        return None, "MSSQL_HOST or MSSQL_SA_PASSWORD is not set"
+    kw: dict[str, Any] = dict(
+        server=MSSQL_HOST,
+        port=MSSQL_PORT,
+        user=MSSQL_USER,
+        password=MSSQL_SA_PASSWORD,
+        database=MSSQL_DATABASE,
+        timeout=30,
+    )
+    if _MSSQL_ENCRYPT in ("off", "false", "0", "no"):
+        kw["encrypt"] = "off"
+    elif _MSSQL_ENCRYPT in ("on", "true", "1", "yes"):
+        kw["encrypt"] = "on"
+    try:
+        return pymssql.connect(**kw), None
+    except TypeError:
+        kw.pop("encrypt", None)
+        try:
+            return pymssql.connect(**kw), None
+        except Exception as e:
+            return None, f"connect failed: {e}"
+    except Exception as e:
+        return None, f"connect failed: {e}"
+
+
+def mssql_merge_catalog_row(
+    conn: Any,
+    sku: str,
+    title: str,
+    category: str | None,
+    unit_price_cents: int,
+    stock_units: int,
+    source_mongo_id: str,
+    kafka_msg_key: str,
+) -> bool:
+    if conn is None:
+        return False
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            MERGE dbo.scenario_catalog_mirror_mssql WITH (HOLDLOCK) AS T
+            USING (
+              SELECT %s AS sku, %s AS title, %s AS category, %s AS unit_price_cents,
+                     %s AS stock_units, %s AS source_mongo_id, %s AS kafka_msg_key
+            ) AS S
+            ON T.sku = S.sku
+            WHEN MATCHED THEN UPDATE SET
+              title = S.title, category = S.category, unit_price_cents = S.unit_price_cents,
+              stock_units = S.stock_units, source_mongo_id = S.source_mongo_id,
+              kafka_msg_key = S.kafka_msg_key, updated_at = SYSUTCDATETIME()
+            WHEN NOT MATCHED THEN
+              INSERT (sku, title, category, unit_price_cents, stock_units, source_mongo_id, kafka_msg_key)
+              VALUES (S.sku, S.title, S.category, S.unit_price_cents, S.stock_units, S.source_mongo_id, S.kafka_msg_key);
+            """,
+            (
+                sku,
+                title[:512],
+                category,
+                unit_price_cents,
+                stock_units,
+                source_mongo_id[:96] if source_mongo_id else None,
+                kafka_msg_key[:160] if kafka_msg_key else None,
+            ),
+        )
+        return True
+    except Exception:
+        return False
+
+
+def fetch_view_mssql() -> dict[str, Any]:
+    conn, err = _mssql_connect()
+    if conn is None:
+        return {
+            "ok": False,
+            "error": err or "MSSQL connection unavailable.",
+        }
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT TOP 40 * FROM dbo.scenario_catalog_mirror_mssql ORDER BY id DESC"
+        )
+        cols = [c[0] for c in cur.description]
+        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+        for r in rows:
+            for k, v in list(r.items()):
+                if hasattr(v, "isoformat"):
+                    r[k] = v.isoformat()
+                elif hasattr(v, "as_tuple"):  # Decimal
+                    r[k] = float(v)
+        return {"ok": True, "table": "dbo.scenario_catalog_mirror_mssql", "rows": rows}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    finally:
+        conn.close()
+
+
+MSSQL_WORKLOAD_NAME_MAX_CHARS = int(
+    os.environ.get("MSSQL_WORKLOAD_NAME_MAX_CHARS", "4000")
+)
+
+
+def workload_mssql_batch(
+    run_id: str,
+    seq_base: int,
+    total_records: int,
+    batch_size: int,
+    pad: str,
+) -> tuple[int, str | None]:
+    """
+    Insert synthetic rows into dbo.hub_workload_mssql (same run_id/seq convention as other stores).
+    Returns (rows_committed, error_message).
+    """
+    conn, err = _mssql_connect()
+    if conn is None:
+        return 0, err or "mssql unavailable"
+    lim = max(64, min(MSSQL_WORKLOAD_NAME_MAX_CHARS, 4000))
+    n = 0
+    try:
+        cur = conn.cursor()
+        for start in range(0, total_records, batch_size):
+            chunk = []
+            for j in range(start, min(start + batch_size, total_records)):
+                i = seq_base + j
+                name = (f"wl-{run_id}-{i}|{pad}")[:lim]
+                chunk.append((run_id, i, name))
+            cur.executemany(
+                "INSERT INTO dbo.hub_workload_mssql (run_id, seq, name) VALUES (%s, %s, %s)",
+                chunk,
+            )
+            n += len(chunk)
+        conn.commit()
+        return n, None
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return n, str(e)
+    finally:
+        conn.close()
+
+
+def fetch_workload_sample_mssql(run_id: str, limit: int) -> dict[str, Any]:
+    conn, err = _mssql_connect()
+    if conn is None:
+        return {
+            "ok": False,
+            "error": err or "MSSQL connection unavailable.",
+        }
+    try:
+        cur = conn.cursor()
+        lim = max(1, min(int(limit), 500))
+        cur.execute(
+            f"SELECT TOP ({lim}) id, run_id, seq, name, created_at "
+            "FROM dbo.hub_workload_mssql WHERE run_id = %s ORDER BY seq DESC",
+            (run_id,),
+        )
+        cols = [c[0] for c in cur.description]
+        rows = []
+        for r in cur.fetchall():
+            d = dict(zip(cols, r))
+            for k, v in list(d.items()):
+                if hasattr(v, "isoformat"):
+                    d[k] = v.isoformat()
+                elif hasattr(v, "as_tuple"):
+                    d[k] = float(v)
+            if d.get("name"):
+                nm = d["name"]
+                d["name"] = nm[:200] + ("…" if len(nm) > 200 else "")
+            rows.append(d)
+        return {"ok": True, "count": len(rows), "rows": rows}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    finally:
+        conn.close()
+
+
 def op_pipeline_mongo_to_postgres_and_kafka() -> dict[str, Any]:
     """
     Consume-from-Mongo pattern (here: synchronous pull). Writes mirror rows in Postgres,
     emits Kafka events, mirrors same payload to OpenSearch (stand-in for Kafka→OS sink).
     """
-    mc = MongoClient(MONGO_URI, serverSelectionTimeoutMS=30_000)
+    cfg = get_runtime_config()
+    mc = MongoClient(cfg.mongo_uri, serverSelectionTimeoutMS=30_000)
     coll = mc["demo"][MONGO_COLL]
     docs = list(coll.find().sort("updated_at", -1).limit(80))
     mc.close()
     mirrored = 0
+    mssql_ok = 0
     kafka_ok = 0
-    with httpx.Client(timeout=60.0) as hc:
-        with psycopg.connect(PG_DSN) as conn:
-            ensure_postgres_scenario_schema(conn)
-            for d in docs:
-                sku = d.get("sku")
-                if not sku:
-                    continue
-                msg_key = f"catalog-{sku}"
-                conn.execute(
-                    """
-                    INSERT INTO scenario_catalog_mirror
-                      (sku, title, category, unit_price_cents, stock_units, source_mongo_id, kafka_msg_key)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s)
-                    ON CONFLICT (sku) DO UPDATE SET
-                      title = EXCLUDED.title,
-                      category = EXCLUDED.category,
-                      unit_price_cents = EXCLUDED.unit_price_cents,
-                      stock_units = EXCLUDED.stock_units,
-                      source_mongo_id = EXCLUDED.source_mongo_id,
-                      kafka_msg_key = EXCLUDED.kafka_msg_key,
-                      updated_at = NOW()
-                    """,
-                    (
-                        sku,
-                        d.get("title", "")[:512],
+    mssql_conn, mssql_err = _mssql_connect()
+    try:
+        with httpx.Client(timeout=60.0) as hc:
+            ensure_scenario_os_index(hc)
+            with psycopg.connect(cfg.postgres_dsn) as conn:
+                ensure_postgres_scenario_schema(conn)
+                for d in docs:
+                    sku = d.get("sku")
+                    if not sku:
+                        continue
+                    msg_key = f"catalog-{sku}"
+                    conn.execute(
+                        """
+                        INSERT INTO scenario_catalog_mirror
+                          (sku, title, category, unit_price_cents, stock_units, source_mongo_id, kafka_msg_key)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT (sku) DO UPDATE SET
+                          title = EXCLUDED.title,
+                          category = EXCLUDED.category,
+                          unit_price_cents = EXCLUDED.unit_price_cents,
+                          stock_units = EXCLUDED.stock_units,
+                          source_mongo_id = EXCLUDED.source_mongo_id,
+                          kafka_msg_key = EXCLUDED.kafka_msg_key,
+                          updated_at = NOW()
+                        """,
+                        (
+                            sku,
+                            d.get("title", "")[:512],
+                            d.get("category"),
+                            int(d.get("unit_price_cents", 0)),
+                            int(d.get("stock_units", 0)),
+                            str(d.get("_id", "")),
+                            msg_key,
+                        ),
+                    )
+                    mirrored += 1
+                    payload = {
+                        "action": "catalog.synced_from_mongo",
+                        "sku": sku,
+                        "title": d.get("title"),
+                        "warehouse": d.get("warehouse"),
+                    }
+                    if _producer_send(TOPIC_CATALOG, msg_key, payload):
+                        kafka_ok += 1
+                    _mirror_to_opensearch(
+                        hc, topic=TOPIC_CATALOG, key=msg_key, direction="mongo→kafka+os", payload=payload
+                    )
+                    if mssql_merge_catalog_row(
+                        mssql_conn,
+                        str(sku),
+                        str(d.get("title", "")),
                         d.get("category"),
                         int(d.get("unit_price_cents", 0)),
                         int(d.get("stock_units", 0)),
                         str(d.get("_id", "")),
                         msg_key,
-                    ),
-                )
-                mirrored += 1
-                payload = {
-                    "action": "catalog.synced_from_mongo",
-                    "sku": sku,
-                    "title": d.get("title"),
-                    "warehouse": d.get("warehouse"),
-                }
-                if _producer_send(TOPIC_CATALOG, msg_key, payload):
-                    kafka_ok += 1
-                _mirror_to_opensearch(
-                    hc, topic=TOPIC_CATALOG, key=msg_key, direction="mongo→kafka+os", payload=payload
-                )
-            conn.commit()
+                    ):
+                        mssql_ok += 1
+                conn.commit()
+                if mssql_conn is not None:
+                    try:
+                        mssql_conn.commit()
+                    except Exception:
+                        pass
+    finally:
+        if mssql_conn is not None:
+            try:
+                mssql_conn.close()
+            except Exception:
+                pass
 
-    r = redis.from_url(REDIS_URL, decode_responses=True)
+    r = redis.from_url(cfg.redis_url, decode_responses=True)
     _redis_push_recent(
         r,
         {
@@ -354,14 +582,19 @@ def op_pipeline_mongo_to_postgres_and_kafka() -> dict[str, Any]:
         },
     )
     _redis_refresh_summary(r)
-    return {
+    out: dict[str, Any] = {
         "ok": True,
         "mongo_docs_processed": len(docs),
         "postgres_rows_touched": mirrored,
+        "mssql_rows_upserted": mssql_ok,
         "kafka_events_sent": kafka_ok,
         "opensearch_mirrored": mirrored,
-        "note": "OpenSearch holds the same logical stream Connect would sink from Kafka.",
+        "note": "OpenSearch holds the same logical stream Connect would sink from Kafka. "
+        "SQL Server mirror + Debezium CDC when mssql-publisher is configured.",
     }
+    if mssql_conn is None and mssql_err and MSSQL_HOST and MSSQL_SA_PASSWORD:
+        out["mssql_connect_error"] = mssql_err
+    return out
 
 
 def build_faker_customer_bundle() -> dict[str, Any]:
@@ -386,7 +619,8 @@ def op_place_order(
     ship_label: str | None = None,
 ) -> dict[str, Any]:
     """OLTP: order in Postgres + timeline in Cassandra + events (Kafka + OS) + Redis."""
-    mc = MongoClient(MONGO_URI, serverSelectionTimeoutMS=30_000)
+    cfg = get_runtime_config()
+    mc = MongoClient(cfg.mongo_uri, serverSelectionTimeoutMS=30_000)
     coll = mc["demo"][MONGO_COLL]
     skus = [d["sku"] for d in coll.find({}, {"sku": 1}).limit(50)]
     mc.close()
@@ -396,7 +630,7 @@ def op_place_order(
     pick = skus[: min(lines_count, len(skus))]
     lines = []
     total = 0
-    with psycopg.connect(PG_DSN) as conn:
+    with psycopg.connect(cfg.postgres_dsn) as conn:
         ensure_postgres_scenario_schema(conn)
         with conn.cursor() as cur:
             for sku in pick:
@@ -416,7 +650,7 @@ def op_place_order(
     slon = ship_lon
     slab = (ship_label or "").strip()[:500] or None
 
-    with psycopg.connect(PG_DSN) as conn:
+    with psycopg.connect(cfg.postgres_dsn) as conn:
         ensure_postgres_scenario_schema(conn)
         conn.execute(
             """
@@ -462,6 +696,7 @@ def op_place_order(
     }
     sent = _producer_send(TOPIC_ORDERS, order_ref, payload)
     with httpx.Client(timeout=30.0) as hc:
+        ensure_scenario_os_index(hc)
         _mirror_to_opensearch(
             hc, topic=TOPIC_ORDERS, key=order_ref, direction="api→kafka+os", payload=payload
         )
@@ -474,7 +709,7 @@ def op_place_order(
             detail[:4000],
         )
 
-    r = redis.from_url(REDIS_URL, decode_responses=True)
+    r = redis.from_url(cfg.redis_url, decode_responses=True)
     r.setex(
         f"scenario:order:latest:{order_ref}",
         3600,
@@ -514,9 +749,10 @@ def op_place_order(
 def op_write_cassandra_timeline(
     session: CassandraSession, order_ref: str, event_type: str, detail: str
 ) -> None:
+    ks = get_runtime_config().cassandra_keyspace
     session.execute(
         f"""
-        INSERT INTO {HUB_KEYSPACE}.scenario_timeline (order_ref, event_ts, event_type, detail)
+        INSERT INTO {ks}.scenario_timeline (order_ref, event_ts, event_type, detail)
         VALUES (%s, %s, %s, %s)
         """,
         (order_ref, datetime.now(timezone.utc), event_type, detail[:4000]),
@@ -529,7 +765,8 @@ def op_pipeline_postgres_to_fulfillment_and_kafka(
     """
     Another path: read committed orders in Postgres, create fulfillment lines + broadcast.
     """
-    with psycopg.connect(PG_DSN) as conn:
+    cfg = get_runtime_config()
+    with psycopg.connect(cfg.postgres_dsn) as conn:
         ensure_postgres_scenario_schema(conn)
         with conn.cursor() as cur:
             cur.execute(
@@ -570,6 +807,7 @@ def op_pipeline_postgres_to_fulfillment_and_kafka(
             }
             _producer_send(TOPIC_PIPELINE, order_ref, payload)
             with httpx.Client(timeout=30.0) as hc:
+                ensure_scenario_os_index(hc)
                 _mirror_to_opensearch(
                     hc,
                     topic=TOPIC_PIPELINE,
@@ -586,7 +824,7 @@ def op_pipeline_postgres_to_fulfillment_and_kafka(
                 )
         conn.commit()
 
-    r = redis.from_url(REDIS_URL, decode_responses=True)
+    r = redis.from_url(cfg.redis_url, decode_responses=True)
     _redis_refresh_summary(r)
     return {
         "ok": True,
@@ -597,7 +835,8 @@ def op_pipeline_postgres_to_fulfillment_and_kafka(
 
 def fetch_view_postgres() -> dict[str, Any]:
     out: dict[str, Any] = {"tables": {}}
-    with psycopg.connect(PG_DSN) as conn:
+    cfg = get_runtime_config()
+    with psycopg.connect(cfg.postgres_dsn) as conn:
         with conn.cursor() as cur:
             for name, sql in [
                 ("scenario_catalog_mirror", "SELECT * FROM scenario_catalog_mirror ORDER BY id DESC LIMIT 25"),
@@ -616,7 +855,8 @@ def fetch_view_postgres() -> dict[str, Any]:
 
 
 def fetch_view_mongo() -> dict[str, Any]:
-    mc = MongoClient(MONGO_URI, serverSelectionTimeoutMS=30_000)
+    cfg = get_runtime_config()
+    mc = MongoClient(cfg.mongo_uri, serverSelectionTimeoutMS=30_000)
     cur = (
         mc["demo"][MONGO_COLL]
         .find({}, {"_id": 1, "sku": 1, "title": 1, "category": 1, "unit_price_cents": 1, "stock_units": 1})
@@ -632,7 +872,8 @@ def fetch_view_mongo() -> dict[str, Any]:
 
 
 def fetch_view_redis() -> dict[str, Any]:
-    r = redis.from_url(REDIS_URL, decode_responses=True)
+    cfg = get_runtime_config()
+    r = redis.from_url(cfg.redis_url, decode_responses=True)
     dash = r.get(REDIS_DASH_KEY)
     recent = r.lrange(REDIS_KAFKA_RECENT, 0, 19)
     keys = r.keys("scenario:order:latest:*")[:15]
@@ -652,8 +893,9 @@ def fetch_view_redis() -> dict[str, Any]:
 
 
 def fetch_view_cassandra(session: CassandraSession) -> dict[str, Any]:
+    ks = get_runtime_config().cassandra_keyspace
     rows = session.execute(
-        f"SELECT order_ref, event_ts, event_type, detail FROM {HUB_KEYSPACE}.scenario_timeline "
+        f"SELECT order_ref, event_ts, event_type, detail FROM {ks}.scenario_timeline "
         "LIMIT 50 ALLOW FILTERING"
     )
     out = []
@@ -666,10 +908,11 @@ def fetch_view_cassandra(session: CassandraSession) -> dict[str, Any]:
                 "detail": (row.detail or "")[:300],
             }
         )
-    return {"table": f"{HUB_KEYSPACE}.scenario_timeline", "rows": out}
+    return {"table": f"{ks}.scenario_timeline", "rows": out}
 
 
 def fetch_view_opensearch() -> dict[str, Any]:
+    cfg = get_runtime_config()
     query = {
         "size": 20,
         "sort": [{"ts": {"order": "desc"}}],
@@ -677,7 +920,7 @@ def fetch_view_opensearch() -> dict[str, Any]:
     }
     with httpx.Client(timeout=30.0) as hc:
         r = hc.post(
-            f"{OPENSEARCH_URL}/{SCENARIO_OS_INDEX}/_search",
+            f"{cfg.opensearch_url}/{cfg.scenario_opensearch_index}/_search",
             json=query,
             headers={"Content-Type": "application/json"},
         )
@@ -699,7 +942,7 @@ def fetch_view_opensearch() -> dict[str, Any]:
                 "payload": src.get("payload"),
             }
         )
-    return {"index": SCENARIO_OS_INDEX, "hits": slim}
+    return {"index": cfg.scenario_opensearch_index, "hits": slim}
 
 
 def fetch_view_kafka_meta() -> dict[str, Any]:
