@@ -39,6 +39,10 @@ SK_POSTGRESQL_REPLICATION_PASSWORD = "postgresql-replication-password"
 SK_REDIS_PASSWORD = "redis-password"
 SK_DEMO_USER_PASSWORD = "demo-user-password"
 SK_HUB_POSTGRES_DSN = "hub-postgres-dsn"
+SK_HUB_POSTGRES_ADMIN_DSN = "hub-postgres-admin-dsn"
+SK_HUB_POSTGRES_REPLICA_READ_DSN = "hub-postgres-replica-read-dsn"
+SK_HUB_POSTGRES_LOGICAL_SUB_DSN = "hub-postgres-logical-sub-dsn"
+SK_HUB_POSTGRES_LOGICAL_SUB_ADMIN_DSN = "hub-postgres-logical-sub-admin-dsn"
 SK_HUB_REDIS_URL = "hub-redis-url"
 SK_MSSQL_SA_PASSWORD = "mssql-sa-password"
 MSSQL_SERVER_IMAGE = "mcr.microsoft.com/mssql/server:2022-CU14-ubuntu-22.04"
@@ -54,6 +58,8 @@ CASSANDRA_DATA_STORAGE_SIZE = "10Gi"
 MCAC_INIT_IMAGE = "mcac-demo/mcac-init:local"
 # Custom image: Bitnami PostgreSQL 16.6.0 pin + repmgr (see deploy/docker/postgres-kafka/Dockerfile.repmgr). Build before K8s apply.
 POSTGRESQL_IMAGE = "mcac-demo/postgresql-repmgr:16.6.0"
+# Standalone logical subscriber (no repmgr); pin matches Dockerfile.repmgr base — same major as primary.
+POSTGRES_SUB_IMAGE = "docker.io/bitnamilegacy/postgresql:16.6.0-debian-12-r2"
 
 # WAL archive: set via /bitnami/postgresql/conf/conf.d/ (init container), not POSTGRESQL_EXTRA_FLAGS —
 # Bitnami splits EXTRA_FLAGS on spaces, so archive_command / mkdir -p / test -f break postgres argv.
@@ -279,6 +285,7 @@ def _hub_wait_upstream() -> str:
     kh = fqdn_service("kafka")
     oh = fqdn_service("opensearch")
     pg = fqdn_service("postgresql-primary")
+    pgsub = fqdn_service("postgres-sub")
     # CQL: probe cassandra-0 via headless (same stable target as port-forward / driver contact points).
     # The ClusterIP Service name "cassandra" can lag or not match nc expectations on some CNIs.
     cs0 = f"cassandra-0.cassandra-headless.{NS}.svc.cluster.local"
@@ -297,6 +304,7 @@ def _hub_wait_upstream() -> str:
                 if nc -z -w 3 {kh} 9092 2>/dev/null \\
                   && nc -z -w 3 {oh} 9200 2>/dev/null \\
                   && nc -z -w 3 {pg} 5432 2>/dev/null \\
+                  && nc -z -w 3 {pgsub} 5432 2>/dev/null \\
                   && nc -z -w 3 {cs0} 9042 2>/dev/null \\
                   && nc -z -w 3 {rd} 6379 2>/dev/null \\
                   && nc -z -w 3 {ms} 1433 2>/dev/null; then
@@ -304,11 +312,11 @@ def _hub_wait_upstream() -> str:
                   exit 0
                 fi
                 if [ $((i % 15)) -eq 0 ]; then
-                  echo "wait-hub-deps: attempt $i/200 — kafka:9092=$(p {kh} 9092) opensearch:9200=$(p {oh} 9200) postgres:5432=$(p {pg} 5432) cassandra-0:9042=$(p {cs0} 9042) redis:6379=$(p {rd} 6379) mssql-publisher:1433=$(p {ms} 1433) (mongos not gated)" >&2
+                  echo "wait-hub-deps: attempt $i/200 — kafka:9092=$(p {kh} 9092) opensearch:9200=$(p {oh} 9200) postgres:5432=$(p {pg} 5432) postgres-sub:5432=$(p {pgsub} 5432) cassandra-0:9042=$(p {cs0} 9042) redis:6379=$(p {rd} 6379) mssql-publisher:1433=$(p {ms} 1433) (mongos not gated)" >&2
                 fi
                 sleep 2
               done
-              echo "timeout waiting for kafka:9092, opensearch:9200, postgresql-primary:5432," >&2
+              echo "timeout waiting for kafka:9092, opensearch:9200, postgresql-primary:5432, postgres-sub:5432," >&2
               echo "  cassandra-0:9042 (headless), redis:6379, mssql-publisher:1433" >&2
               exit 1
 """
@@ -422,6 +430,10 @@ def demo_hub_secret_stringdata() -> dict[str, str]:
         SK_REDIS_PASSWORD: "demoredispass",
         SK_DEMO_USER_PASSWORD: "demopass",
         SK_HUB_POSTGRES_DSN: "postgresql://demo:demopass@postgresql-primary:5432/demo",
+        SK_HUB_POSTGRES_ADMIN_DSN: "postgresql://postgres:postgres@postgresql-primary:5432/postgres",
+        SK_HUB_POSTGRES_REPLICA_READ_DSN: "postgresql://demo:demopass@postgresql-replica-1:5432/demo_logical_pub",
+        SK_HUB_POSTGRES_LOGICAL_SUB_DSN: "postgresql://demo:demopass@postgres-sub:5432/demo",
+        SK_HUB_POSTGRES_LOGICAL_SUB_ADMIN_DSN: "postgresql://postgres:postgres@postgres-sub:5432/postgres",
         SK_HUB_REDIS_URL: "redis://:demoredispass@redis:6379/0",
         SK_MSSQL_SA_PASSWORD: "Demo_hub_Mssql_2025!",
     }
@@ -1530,6 +1542,65 @@ def postgres_ha() -> str:
     return join_docs(*docs)
 
 
+def postgres_logical_subscriber() -> str:
+    """Standalone PostgreSQL pod for logical replication subscriber (not a repmgr HA replica)."""
+    env = [
+        ("POSTGRESQL_USERNAME", "postgres"),
+        ("POSTGRESQL_DATABASE", "demo"),
+        ("POSTGRESQL_SHARED_PRELOAD_LIBRARIES", "pgaudit,pg_stat_statements"),
+        (
+            "POSTGRESQL_EXTRA_FLAGS",
+            "-c max_logical_replication_workers=8 -c max_worker_processes=16 "
+            "-c max_sync_workers_per_subscription=4 "
+            "-c pg_stat_statements.max=10000 -c pg_stat_statements.track=all",
+        ),
+    ]
+    sec = [("POSTGRESQL_PASSWORD", SECRET_NAME, SK_POSTGRESQL_PASSWORD)]
+    return deployment(
+        "postgres-sub",
+        "postgres-logical-sub",
+        POSTGRES_SUB_IMAGE,
+        1,
+        [(5432, "pg")],
+        env,
+        data_mount="/bitnami/postgresql",
+        env_secret_refs=sec,
+        readiness_probe=tcp_readiness_probe(
+            5432, initial_delay=15, period=5, failure_threshold=18
+        ),
+    )
+
+
+def postgres_sub_bootstrap_job() -> str:
+    """Ensure ``demo`` role on postgres-sub (mirrors primary bootstrap pattern)."""
+    bootstrap = r"""#!/usr/bin/env bash
+set -euo pipefail
+export PGHOST=postgres-sub
+export PGPORT=5432
+until pg_isready -h "$PGHOST" -p "$PGPORT" -U postgres; do sleep 3; done
+export PGPASSWORD=postgres
+psql -h "$PGHOST" -U postgres -d postgres -v ON_ERROR_STOP=1 -c "DO \$bootstrap\$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'demo') THEN CREATE ROLE demo WITH LOGIN PASSWORD 'demopass'; END IF; END \$bootstrap\$;"
+psql -h "$PGHOST" -U postgres -d postgres -v ON_ERROR_STOP=1 -c "GRANT CONNECT ON DATABASE demo TO demo;"
+psql -h "$PGHOST" -U postgres -d demo -v ON_ERROR_STOP=1 -c "GRANT USAGE, CREATE ON SCHEMA public TO demo;"
+psql -h "$PGHOST" -U postgres -d postgres -v ON_ERROR_STOP=1 -c "GRANT pg_monitor TO demo;"
+echo "postgres-sub bootstrap done."
+"""
+    cm = configmap(
+        "postgres-sub-bootstrap-sql",
+        "postgres-logical-sub",
+        {"bootstrap.sh": bootstrap},
+    )
+    job = batch_job(
+        "postgres-sub-bootstrap",
+        "postgres-logical-sub",
+        POSTGRES_SUB_IMAGE,
+        ["/bin/bash", "/scripts/bootstrap.sh"],
+        "postgres-sub-bootstrap-sql",
+        active_deadline_seconds=600,
+    )
+    return join_docs(cm, job)
+
+
 def redis_stack() -> str:
     r = deployment(
         "redis",
@@ -1874,8 +1945,9 @@ exec bash /scripts/register-mssql-connectors.sh "http://kafka-connect:8083"
         "mssql-kafka-scripts",
         active_deadline_seconds=3600,
         env_secret_refs=[("MSSQL_SA_PASSWORD", SECRET_NAME, SK_MSSQL_SA_PASSWORD)],
-        # Local-only image (build-mssql-tools-image.sh). Never avoids useless pulls from a registry.
-        image_pull_policy="Never",
+        # Local-only image (build-mssql-tools-image.sh). IfNotPresent matches other demo images:
+        # use node-local image when present (OrbStack/Docker Desktop shared store); otherwise pull is attempted and fails until built.
+        image_pull_policy="IfNotPresent",
     )
     return join_docs(cm, job)
 
@@ -2010,6 +2082,10 @@ def hub_demo_ui() -> str:
         strategy_recreate=True,
         env_secret_refs=[
             ("POSTGRES_DSN", SECRET_NAME, SK_HUB_POSTGRES_DSN),
+            ("POSTGRES_ADMIN_DSN", SECRET_NAME, SK_HUB_POSTGRES_ADMIN_DSN),
+            ("POSTGRES_REPLICA_READ_DSN", SECRET_NAME, SK_HUB_POSTGRES_REPLICA_READ_DSN),
+            ("POSTGRES_LOGICAL_SUB_DSN", SECRET_NAME, SK_HUB_POSTGRES_LOGICAL_SUB_DSN),
+            ("POSTGRES_LOGICAL_SUB_ADMIN_DSN", SECRET_NAME, SK_HUB_POSTGRES_LOGICAL_SUB_ADMIN_DSN),
             ("REDIS_URL", SECRET_NAME, SK_HUB_REDIS_URL),
             ("MSSQL_SA_PASSWORD", SECRET_NAME, SK_MSSQL_SA_PASSWORD),
         ],
@@ -2025,6 +2101,7 @@ Generated Jobs (apply **after** workloads are running):
 |-----|---------|
 | **vault-demo-hub-seed** | Writes demo credentials + Kafka Connect fields into Vault KV v2 (`secret/demo-hub/...`). Re-run after Vault pod restart (dev mode is in-memory). |
 | **postgres-demo-bootstrap** | Debezium user/table/publication + physical replication slots + scenario schema (mirrors `postgres-kafka/*.sql` init). |
+| **postgres-sub-bootstrap** | Creates ``demo`` role on **postgres-sub** (logical subscriber pod). Run after **postgres-sub** rollout and alongside primary bootstrap. |
 | **cassandra-demo-schema** | `demo_hub` keyspace with **RF=3** + placeholder table (ring replication). |
 | **mongo-demo-bootstrap** | Config RS → shard RS → addShard → sharded collections (mirrors `mongo-sharded/*.sh` + `prepare-demo-collections.sh`). |
 | **mssql-demo-bootstrap** | Publisher + subscriber schema (`sqlcmd`), optional replication try, then **register-mssql-connectors.sh** against **kafka-connect:8083** (needs Connect rollout first — see `apply-data-bootstrap.sh`). |
@@ -2053,7 +2130,9 @@ def main() -> None:
         ("30-cassandra-ring.yaml", cassandra_statefulset()),
         ("35-cassandra-schema-job.yaml", cassandra_schema_job()),
         ("40-postgresql-ha.yaml", postgres_ha()),
+        ("41-postgres-sub-logical.yaml", postgres_logical_subscriber()),
         ("45-postgres-bootstrap-job.yaml", postgres_bootstrap_job()),
+        ("46-postgres-sub-bootstrap-job.yaml", postgres_sub_bootstrap_job()),
         ("50-redis.yaml", redis_stack()),
         ("60-mongo-sharded.yaml", mongo_sharded_all_deployments()),
         ("61-mongo-bootstrap-job.yaml", mongo_sharded_scripts_and_jobs()),

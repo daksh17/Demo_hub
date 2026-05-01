@@ -1,0 +1,58 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-sub-bootstrap-sql
+  namespace: demo-hub
+  labels:
+    demo-hub.io/group: postgres-logical-sub
+    app.kubernetes.io/part-of: demo-hub
+data:
+  bootstrap.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export PGHOST=postgres-sub
+    export PGPORT=5432
+    until pg_isready -h "$PGHOST" -p "$PGPORT" -U postgres; do sleep 3; done
+    export PGPASSWORD=postgres
+    psql -h "$PGHOST" -U postgres -d postgres -v ON_ERROR_STOP=1 -c "DO \$bootstrap\$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'demo') THEN CREATE ROLE demo WITH LOGIN PASSWORD 'demopass'; END IF; END \$bootstrap\$;"
+    psql -h "$PGHOST" -U postgres -d postgres -v ON_ERROR_STOP=1 -c "GRANT CONNECT ON DATABASE demo TO demo;"
+    psql -h "$PGHOST" -U postgres -d demo -v ON_ERROR_STOP=1 -c "GRANT USAGE, CREATE ON SCHEMA public TO demo;"
+    psql -h "$PGHOST" -U postgres -d postgres -v ON_ERROR_STOP=1 -c "GRANT pg_monitor TO demo;"
+    echo "postgres-sub bootstrap done."
+---
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: postgres-sub-bootstrap
+  namespace: demo-hub
+  labels:
+    demo-hub.io/group: postgres-logical-sub
+    app.kubernetes.io/part-of: demo-hub
+spec:
+  activeDeadlineSeconds: 600
+  ttlSecondsAfterFinished: 86400
+  backoffLimit: 4
+  template:
+    metadata:
+      labels:
+        demo-hub.io/group: postgres-logical-sub
+        app.kubernetes.io/part-of: demo-hub
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: run
+          image: docker.io/bitnamilegacy/postgresql:16.6.0-debian-12-r2
+          imagePullPolicy: IfNotPresent
+          command:
+            - "/bin/bash"
+            - "/scripts/bootstrap.sh"
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+      volumes:
+        - name: scripts
+          configMap:
+            name: postgres-sub-bootstrap-sql
+            defaultMode: 0755

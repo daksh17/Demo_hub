@@ -21,6 +21,10 @@ stringData:
   redis-password: demoredispass
   demo-user-password: demopass
   hub-postgres-dsn: postgresql://demo:demopass@postgresql-primary:5432/demo
+  hub-postgres-admin-dsn: postgresql://postgres:postgres@postgresql-primary:5432/postgres
+  hub-postgres-replica-read-dsn: postgresql://demo:demopass@postgresql-replica-1:5432/demo_logical_pub
+  hub-postgres-logical-sub-dsn: postgresql://demo:demopass@postgres-sub:5432/demo
+  hub-postgres-logical-sub-admin-dsn: postgresql://postgres:postgres@postgres-sub:5432/postgres
   hub-redis-url: redis://:demoredispass@redis:6379/0
   mssql-sa-password: Demo_hub_Mssql_2025!
 ---
@@ -174,6 +178,10 @@ spec:
                           redis-password=demoredispass \
                           demo-user-password=demopass \
                           hub-postgres-dsn=postgresql://demo:demopass@postgresql-primary:5432/demo \
+                          hub-postgres-admin-dsn=postgresql://postgres:postgres@postgresql-primary:5432/postgres \
+                          hub-postgres-replica-read-dsn=postgresql://demo:demopass@postgresql-replica-1:5432/demo_logical_pub \
+                          hub-postgres-logical-sub-dsn=postgresql://demo:demopass@postgres-sub:5432/demo \
+                          hub-postgres-logical-sub-admin-dsn=postgresql://postgres:postgres@postgres-sub:5432/postgres \
                           hub-redis-url=redis://:demoredispass@redis:6379/0 \
                           mssql-sa-password='Demo_hub_Mssql_2025!'
               vault kv put secret/demo-hub/kafka-connect/pg-source \
@@ -17928,6 +17936,82 @@ spec:
       name: pg
 ---
 
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres-sub
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/name: postgres-sub
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: postgres-logical-sub
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres-sub
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres-sub
+        app.kubernetes.io/part-of: demo-hub
+        demo-hub.io/group: postgres-logical-sub
+    spec:
+      containers:
+        - name: postgres-sub
+          image: docker.io/bitnamilegacy/postgresql:16.6.0-debian-12-r2
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POSTGRESQL_USERNAME
+              value: "postgres"
+            - name: POSTGRESQL_DATABASE
+              value: "demo"
+            - name: POSTGRESQL_SHARED_PRELOAD_LIBRARIES
+              value: "pgaudit,pg_stat_statements"
+            - name: POSTGRESQL_EXTRA_FLAGS
+              value: "-c max_logical_replication_workers=8 -c max_worker_processes=16 -c max_sync_workers_per_subscription=4 -c pg_stat_statements.max=10000 -c pg_stat_statements.track=all"
+            - name: POSTGRESQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: postgresql-password
+          volumeMounts:
+            - name: data
+              mountPath: /bitnami/postgresql
+          ports:
+            - containerPort: 5432
+              name: pg
+          readinessProbe:
+            tcpSocket:
+              port: 5432
+            initialDelaySeconds: 15
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 18
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-sub
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/name: postgres-sub
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: postgres-logical-sub
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: postgres-sub
+  ports:
+    - port: 5432
+      targetPort: 5432
+      name: pg
+---
+
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -18131,6 +18215,66 @@ spec:
         - name: scripts
           configMap:
             name: postgres-bootstrap-sql
+            defaultMode: 0755
+---
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-sub-bootstrap-sql
+  namespace: demo-hub
+  labels:
+    demo-hub.io/group: postgres-logical-sub
+    app.kubernetes.io/part-of: demo-hub
+data:
+  bootstrap.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export PGHOST=postgres-sub
+    export PGPORT=5432
+    until pg_isready -h "$PGHOST" -p "$PGPORT" -U postgres; do sleep 3; done
+    export PGPASSWORD=postgres
+    psql -h "$PGHOST" -U postgres -d postgres -v ON_ERROR_STOP=1 -c "DO \$bootstrap\$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'demo') THEN CREATE ROLE demo WITH LOGIN PASSWORD 'demopass'; END IF; END \$bootstrap\$;"
+    psql -h "$PGHOST" -U postgres -d postgres -v ON_ERROR_STOP=1 -c "GRANT CONNECT ON DATABASE demo TO demo;"
+    psql -h "$PGHOST" -U postgres -d demo -v ON_ERROR_STOP=1 -c "GRANT USAGE, CREATE ON SCHEMA public TO demo;"
+    psql -h "$PGHOST" -U postgres -d postgres -v ON_ERROR_STOP=1 -c "GRANT pg_monitor TO demo;"
+    echo "postgres-sub bootstrap done."
+---
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: postgres-sub-bootstrap
+  namespace: demo-hub
+  labels:
+    demo-hub.io/group: postgres-logical-sub
+    app.kubernetes.io/part-of: demo-hub
+spec:
+  activeDeadlineSeconds: 600
+  ttlSecondsAfterFinished: 86400
+  backoffLimit: 4
+  template:
+    metadata:
+      labels:
+        demo-hub.io/group: postgres-logical-sub
+        app.kubernetes.io/part-of: demo-hub
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: run
+          image: docker.io/bitnamilegacy/postgresql:16.6.0-debian-12-r2
+          imagePullPolicy: IfNotPresent
+          command:
+            - "/bin/bash"
+            - "/scripts/bootstrap.sh"
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+      volumes:
+        - name: scripts
+          configMap:
+            name: postgres-sub-bootstrap-sql
             defaultMode: 0755
 ---
 
@@ -19817,7 +19961,11 @@ data:
     #!/usr/bin/env bash
     # Debezium SQL Server CDC (publisher) + JDBC sink (subscriber). Requires kafka-connect image with SQL Server plugin.
     # Usage: ./register-mssql-connectors.sh [http://kafka-connect:8083]
+    #
+    # If registration fails with "Cannot open database \"demo\"", the publisher has no demo DB yet
+    # (bootstrap not finished) or MSSQL_SA_PASSWORD here does not match the server / K8s secret.
     set -euo pipefail
+    set +H 2>/dev/null || true
     CONNECT="${1:-http://localhost:8083}"
     CONNECT="${CONNECT%/}"
     SCHEMA_HISTORY_KAFKA_BOOTSTRAP="${SCHEMA_HISTORY_KAFKA_BOOTSTRAP:-kafka:29092}"
@@ -19860,13 +20008,23 @@ data:
       rm -f "$resp"
     }
     
-    echo "Removing existing mssql-source-demo / mssql-jdbc-sink-demo if present..."
-    remove_connector "mssql-jdbc-sink-demo" || true
-    remove_connector "mssql-source-demo" || true
+    mssql_source_register_hint() {
+      cat >&2 <<'HINT'
     
-    mssql_source_ok=0
-    for attempt in $(seq 1 8); do
-      if post_connector "mssql-source-demo" <<JSON
+    After "Cannot open database \"demo\"" / login failed when validating mssql-source-demo:
+      1) Ensure the publisher has database demo (and CDC): finish Job mssql-demo-bootstrap / Compose
+         mssql-publisher-schema-init, or run 01-publisher-schema.sql against mssql-publisher.
+      2) MSSQL_SA_PASSWORD in this shell must match the publisher (K8s: demo-hub-credentials key
+         mssql-sa-password; default Demo_hub_Mssql_2025!).
+      3) Kubernetes: kubectl logs -n demo-hub job/mssql-demo-bootstrap --tail=100
+         and: ./deploy/k8s/scripts/verify-mssql-publisher-demo.sh
+    HINT
+    }
+    
+    post_mssql_source_with_retries() {
+      local attempt
+      for attempt in $(seq 1 8); do
+        if post_connector "mssql-source-demo" <<JSON
     {
       "name": "mssql-source-demo",
       "config": {
@@ -19891,22 +20049,23 @@ data:
       }
     }
     JSON
-      then
-        mssql_source_ok=1
-        break
-      fi
-      if [[ "$attempt" -lt 8 ]]; then
-        echo "mssql-source-demo registration failed (attempt ${attempt}/8); retrying in 15s…" >&2
-        sleep 15
-      fi
-    done
-    if [[ "$mssql_source_ok" -ne 1 ]]; then
-      echo "Cannot register mssql-source-demo. If the error mentions database \"demo\": ensure publisher" >&2
-      echo "has DB demo (mssql-demo-bootstrap / init-publisher) and MSSQL_SA_PASSWORD matches the Secret." >&2
-      echo "K8s: kubectl logs -n demo-hub job/mssql-demo-bootstrap --tail=100" >&2
-      echo "     ./deploy/k8s/scripts/verify-mssql-publisher-demo.sh" >&2
-      exit 1
-    fi
+        then
+          return 0
+        fi
+        if [[ "$attempt" -lt 8 ]]; then
+          echo "mssql-source-demo registration failed (attempt ${attempt}/8); retrying in 15s…" >&2
+          sleep 15
+        fi
+      done
+      mssql_source_register_hint
+      return 1
+    }
+    
+    echo "Removing existing mssql-source-demo / mssql-jdbc-sink-demo if present..."
+    remove_connector "mssql-jdbc-sink-demo" || true
+    remove_connector "mssql-source-demo" || true
+    
+    post_mssql_source_with_retries
     
     echo "Registered mssql-source-demo."
     
@@ -20117,7 +20276,7 @@ spec:
       containers:
         - name: run
           image: mcac-demo/mssql-tools:22.04
-          imagePullPolicy: Never
+          imagePullPolicy: IfNotPresent
           command:
             - "/bin/bash"
             - "/scripts/chain.sh"
@@ -20738,6 +20897,7 @@ spec:
                 if nc -z -w 3 kafka.demo-hub.svc.cluster.local 9092 2>/dev/null \
                   && nc -z -w 3 opensearch.demo-hub.svc.cluster.local 9200 2>/dev/null \
                   && nc -z -w 3 postgresql-primary.demo-hub.svc.cluster.local 5432 2>/dev/null \
+                  && nc -z -w 3 postgres-sub.demo-hub.svc.cluster.local 5432 2>/dev/null \
                   && nc -z -w 3 cassandra-0.cassandra-headless.demo-hub.svc.cluster.local 9042 2>/dev/null \
                   && nc -z -w 3 redis.demo-hub.svc.cluster.local 6379 2>/dev/null \
                   && nc -z -w 3 mssql-publisher.demo-hub.svc.cluster.local 1433 2>/dev/null; then
@@ -20745,11 +20905,11 @@ spec:
                   exit 0
                 fi
                 if [ $((i % 15)) -eq 0 ]; then
-                  echo "wait-hub-deps: attempt $i/200 — kafka:9092=$(p kafka.demo-hub.svc.cluster.local 9092) opensearch:9200=$(p opensearch.demo-hub.svc.cluster.local 9200) postgres:5432=$(p postgresql-primary.demo-hub.svc.cluster.local 5432) cassandra-0:9042=$(p cassandra-0.cassandra-headless.demo-hub.svc.cluster.local 9042) redis:6379=$(p redis.demo-hub.svc.cluster.local 6379) mssql-publisher:1433=$(p mssql-publisher.demo-hub.svc.cluster.local 1433) (mongos not gated)" >&2
+                  echo "wait-hub-deps: attempt $i/200 — kafka:9092=$(p kafka.demo-hub.svc.cluster.local 9092) opensearch:9200=$(p opensearch.demo-hub.svc.cluster.local 9200) postgres:5432=$(p postgresql-primary.demo-hub.svc.cluster.local 5432) postgres-sub:5432=$(p postgres-sub.demo-hub.svc.cluster.local 5432) cassandra-0:9042=$(p cassandra-0.cassandra-headless.demo-hub.svc.cluster.local 9042) redis:6379=$(p redis.demo-hub.svc.cluster.local 6379) mssql-publisher:1433=$(p mssql-publisher.demo-hub.svc.cluster.local 1433) (mongos not gated)" >&2
                 fi
                 sleep 2
               done
-              echo "timeout waiting for kafka:9092, opensearch:9200, postgresql-primary:5432," >&2
+              echo "timeout waiting for kafka:9092, opensearch:9200, postgresql-primary:5432, postgres-sub:5432," >&2
               echo "  cassandra-0:9042 (headless), redis:6379, mssql-publisher:1433" >&2
               exit 1
       containers:
@@ -20788,6 +20948,26 @@ spec:
                 secretKeyRef:
                   name: demo-hub-credentials
                   key: hub-postgres-dsn
+            - name: POSTGRES_ADMIN_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: hub-postgres-admin-dsn
+            - name: POSTGRES_REPLICA_READ_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: hub-postgres-replica-read-dsn
+            - name: POSTGRES_LOGICAL_SUB_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: hub-postgres-logical-sub-dsn
+            - name: POSTGRES_LOGICAL_SUB_ADMIN_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: hub-postgres-logical-sub-admin-dsn
             - name: REDIS_URL
               valueFrom:
                 secretKeyRef:

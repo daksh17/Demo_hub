@@ -938,11 +938,16 @@ services:
       - ./deploy/docker/realtime-orders-search-hub/demo-ui/app.py:/app/app.py:ro
       - ./deploy/docker/realtime-orders-search-hub/demo-ui/scenario.py:/app/scenario.py:ro
       - ./deploy/docker/realtime-orders-search-hub/demo-ui/hub_config.py:/app/hub_config.py:ro
+      - ./deploy/docker/realtime-orders-search-hub/demo-ui/postgres_logical_demo.py:/app/postgres_logical_demo.py:ro
+      - ./deploy/docker/realtime-orders-search-hub/demo-ui/postgres_faker_schema.py:/app/postgres_faker_schema.py:ro
+      - ./deploy/docker/realtime-orders-search-hub/demo-ui/postgres_schema_clone.py:/app/postgres_schema_clone.py:ro
     restart: unless-stopped
     ports:
       - "8888:8888"
     environment:
       POSTGRES_DSN: postgresql://demo:demopass@postgresql-primary:5432/demo
+      POSTGRES_ADMIN_DSN: postgresql://postgres:postgres@postgresql-primary:5432/postgres
+      POSTGRES_REPLICA_READ_DSN: postgresql://demo:demopass@postgresql-replica-1:5432/demo_logical_sub
       MONGO_URI: mongodb://mongo-mongos1:27017
       REDIS_URL: redis://:${REDIS_PASSWORD:-demoredispass}@redis:6379/0
       CASSANDRA_HOSTS: cassandra

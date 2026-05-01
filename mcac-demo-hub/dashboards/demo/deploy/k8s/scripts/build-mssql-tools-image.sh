@@ -4,7 +4,8 @@
 # cannot see your Docker image store (build with the same engine OrbStack/kind uses, then re-apply the Job).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
-docker build -t mcac-demo/mssql-tools:22.04 \
+# linux/amd64 matches Dockerfile.repl-bootstrap and SQL Server image; on Apple Silicon this uses QEMU (slower).
+docker build --platform linux/amd64 -t mcac-demo/mssql-tools:22.04 \
   -f "$ROOT/deploy/docker/mssql-kafka/Dockerfile.repl-bootstrap" \
   "$ROOT/deploy/docker/mssql-kafka"
 echo "Built mcac-demo/mssql-tools:22.04"

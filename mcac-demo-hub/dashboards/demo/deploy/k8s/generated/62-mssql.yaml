@@ -396,7 +396,11 @@ data:
     #!/usr/bin/env bash
     # Debezium SQL Server CDC (publisher) + JDBC sink (subscriber). Requires kafka-connect image with SQL Server plugin.
     # Usage: ./register-mssql-connectors.sh [http://kafka-connect:8083]
+    #
+    # If registration fails with "Cannot open database \"demo\"", the publisher has no demo DB yet
+    # (bootstrap not finished) or MSSQL_SA_PASSWORD here does not match the server / K8s secret.
     set -euo pipefail
+    set +H 2>/dev/null || true
     CONNECT="${1:-http://localhost:8083}"
     CONNECT="${CONNECT%/}"
     SCHEMA_HISTORY_KAFKA_BOOTSTRAP="${SCHEMA_HISTORY_KAFKA_BOOTSTRAP:-kafka:29092}"
@@ -439,13 +443,23 @@ data:
       rm -f "$resp"
     }
     
-    echo "Removing existing mssql-source-demo / mssql-jdbc-sink-demo if present..."
-    remove_connector "mssql-jdbc-sink-demo" || true
-    remove_connector "mssql-source-demo" || true
+    mssql_source_register_hint() {
+      cat >&2 <<'HINT'
     
-    mssql_source_ok=0
-    for attempt in $(seq 1 8); do
-      if post_connector "mssql-source-demo" <<JSON
+    After "Cannot open database \"demo\"" / login failed when validating mssql-source-demo:
+      1) Ensure the publisher has database demo (and CDC): finish Job mssql-demo-bootstrap / Compose
+         mssql-publisher-schema-init, or run 01-publisher-schema.sql against mssql-publisher.
+      2) MSSQL_SA_PASSWORD in this shell must match the publisher (K8s: demo-hub-credentials key
+         mssql-sa-password; default Demo_hub_Mssql_2025!).
+      3) Kubernetes: kubectl logs -n demo-hub job/mssql-demo-bootstrap --tail=100
+         and: ./deploy/k8s/scripts/verify-mssql-publisher-demo.sh
+    HINT
+    }
+    
+    post_mssql_source_with_retries() {
+      local attempt
+      for attempt in $(seq 1 8); do
+        if post_connector "mssql-source-demo" <<JSON
     {
       "name": "mssql-source-demo",
       "config": {
@@ -470,22 +484,23 @@ data:
       }
     }
     JSON
-      then
-        mssql_source_ok=1
-        break
-      fi
-      if [[ "$attempt" -lt 8 ]]; then
-        echo "mssql-source-demo registration failed (attempt ${attempt}/8); retrying in 15s…" >&2
-        sleep 15
-      fi
-    done
-    if [[ "$mssql_source_ok" -ne 1 ]]; then
-      echo "Cannot register mssql-source-demo. If the error mentions database \"demo\": ensure publisher" >&2
-      echo "has DB demo (mssql-demo-bootstrap / init-publisher) and MSSQL_SA_PASSWORD matches the Secret." >&2
-      echo "K8s: kubectl logs -n demo-hub job/mssql-demo-bootstrap --tail=100" >&2
-      echo "     ./deploy/k8s/scripts/verify-mssql-publisher-demo.sh" >&2
-      exit 1
-    fi
+        then
+          return 0
+        fi
+        if [[ "$attempt" -lt 8 ]]; then
+          echo "mssql-source-demo registration failed (attempt ${attempt}/8); retrying in 15s…" >&2
+          sleep 15
+        fi
+      done
+      mssql_source_register_hint
+      return 1
+    }
+    
+    echo "Removing existing mssql-source-demo / mssql-jdbc-sink-demo if present..."
+    remove_connector "mssql-jdbc-sink-demo" || true
+    remove_connector "mssql-source-demo" || true
+    
+    post_mssql_source_with_retries
     
     echo "Registered mssql-source-demo."
     
@@ -696,7 +711,7 @@ spec:
       containers:
         - name: run
           image: mcac-demo/mssql-tools:22.04
-          imagePullPolicy: Never
+          imagePullPolicy: IfNotPresent
           command:
             - "/bin/bash"
             - "/scripts/chain.sh"

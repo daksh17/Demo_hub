@@ -6,6 +6,7 @@ Generated Jobs (apply **after** workloads are running):
 |-----|---------|
 | **vault-demo-hub-seed** | Writes demo credentials + Kafka Connect fields into Vault KV v2 (`secret/demo-hub/...`). Re-run after Vault pod restart (dev mode is in-memory). |
 | **postgres-demo-bootstrap** | Debezium user/table/publication + physical replication slots + scenario schema (mirrors `postgres-kafka/*.sql` init). |
+| **postgres-sub-bootstrap** | Creates ``demo`` role on **postgres-sub** (logical subscriber pod). Run after **postgres-sub** rollout and alongside primary bootstrap. |
 | **cassandra-demo-schema** | `demo_hub` keyspace with **RF=3** + placeholder table (ring replication). |
 | **mongo-demo-bootstrap** | Config RS → shard RS → addShard → sharded collections (mirrors `mongo-sharded/*.sh` + `prepare-demo-collections.sh`). |
 | **mssql-demo-bootstrap** | Publisher + subscriber schema (`sqlcmd`), optional replication try, then **register-mssql-connectors.sh** against **kafka-connect:8083** (needs Connect rollout first — see `apply-data-bootstrap.sh`). |

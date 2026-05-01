@@ -9,6 +9,7 @@
 # inside that pod yet — usually CrashLoopBackOff or not Ready. Check: kubectl get pods -n demo-hub;
 # kubectl logs deploy/prometheus -n demo-hub --tail=50. To forward everything except Prometheus
 # while you fix it: SKIP_PROMETHEUS=1 ./deploy/k8s/scripts/port-forward-demo-hub.sh
+# MSSQL pods down: SKIP_MSSQL=1 ./deploy/k8s/scripts/port-forward-demo-hub.sh
 #
 # Cassandra: forward **pod/cassandra-0**, not svc/cassandra — the Service load-balances 3 replicas;
 # CQL + port-forward (socat) often hits "Connection reset by peer" / lost connection when the
@@ -24,12 +25,14 @@
 #
 # Override local ports if something is already bound, e.g.:
 #   LOCAL_PG_PORT=15432 LOCAL_PROM_PORT=19090 LOCAL_REDIS_PORT=16379 LOCAL_KAFKA_CONNECT_PORT=18083 ./deploy/k8s/scripts/port-forward-demo-hub.sh
+# SQL Server (publisher + subscriber): default localhost 14333 / 14334 → pod :1433 (override LOCAL_MSSQL_*_PORT).
 set -euo pipefail
 NS="${NS:-demo-hub}"
 
 LOCAL_PG_PORT="${LOCAL_PG_PORT:-5432}"
 LOCAL_PG_REPLICA_1_PORT="${LOCAL_PG_REPLICA_1_PORT:-5433}"
 LOCAL_PG_REPLICA_2_PORT="${LOCAL_PG_REPLICA_2_PORT:-5434}"
+LOCAL_PG_LOGICAL_SUB_PORT="${LOCAL_PG_LOGICAL_SUB_PORT:-5435}"
 LOCAL_CQL_PORT="${LOCAL_CQL_PORT:-9042}"
 LOCAL_MONGO_PORT="${LOCAL_MONGO_PORT:-27017}"
 LOCAL_REDIS_PORT="${LOCAL_REDIS_PORT:-6379}"
@@ -41,6 +44,11 @@ LOCAL_KAFKA_CONNECT_PORT="${LOCAL_KAFKA_CONNECT_PORT:-8083}"
 LOCAL_OPENSEARCH_PORT="${LOCAL_OPENSEARCH_PORT:-9200}"
 LOCAL_OS_DASHBOARDS_PORT="${LOCAL_OS_DASHBOARDS_PORT:-5601}"
 LOCAL_VAULT_PORT="${LOCAL_VAULT_PORT:-8200}"
+# SQL Server 2022 (publisher / subscriber); remote port always 1433. Defaults avoid clashing with a host SQL Server on :1433.
+LOCAL_MSSQL_PUBLISHER_PORT="${LOCAL_MSSQL_PUBLISHER_PORT:-14333}"
+LOCAL_MSSQL_SUBSCRIBER_PORT="${LOCAL_MSSQL_SUBSCRIBER_PORT:-14334}"
+# Matches demo-hub Secret demo-hub-credentials key mssql-sa-password unless you rotated it (override this echo).
+MSSQL_SA_PASSWORD_HINT="${MSSQL_SA_PASSWORD_HINT:-Demo_hub_Mssql_2025!}"
 
 echo "Namespace: $NS"
 echo "Open in browser or point clients at 127.0.0.1 — keep this process running (Ctrl+C stops all forwards)."
@@ -48,6 +56,7 @@ echo ""
 echo "  PostgreSQL primary   127.0.0.1:${LOCAL_PG_PORT}   user=demo password=demopass db=demo  (superuser: postgres / postgres)"
 echo "  PostgreSQL replica-1 127.0.0.1:${LOCAL_PG_REPLICA_1_PORT}  (read-only; same users as primary)"
 echo "  PostgreSQL replica-2 127.0.0.1:${LOCAL_PG_REPLICA_2_PORT}  (read-only)"
+echo "  PostgreSQL postgres-sub (logical subscriber pod) 127.0.0.1:${LOCAL_PG_LOGICAL_SUB_PORT}  (writable; db demo_logical_sub after hub setup)"
 echo "  Cassandra CQL cqlsh 127.0.0.1 ${LOCAL_CQL_PORT}   (pod/cassandra-0; keyspace demo_hub after bootstrap Job)"
 echo "  MongoDB       mongosh mongodb://127.0.0.1:${LOCAL_MONGO_PORT}/"
 echo "  Redis         127.0.0.1:${LOCAL_REDIS_PORT}   (password demoredispass; URI redis://:demoredispass@127.0.0.1:${LOCAL_REDIS_PORT}/0)"
@@ -58,12 +67,17 @@ echo "  Kafka Connect http://127.0.0.1:${LOCAL_KAFKA_CONNECT_PORT}/  (REST; list
 echo "  OpenSearch    http://127.0.0.1:${LOCAL_OPENSEARCH_PORT}/  (REST API; e.g. curl -s http://127.0.0.1:${LOCAL_OPENSEARCH_PORT}/_cluster/health)"
 echo "  OS Dashboards http://127.0.0.1:${LOCAL_OS_DASHBOARDS_PORT}/  (matches “OpenSearch Dashboards” link on hub home)"
 echo "  Vault UI/API http://127.0.0.1:${LOCAL_VAULT_PORT}/  (token: demo-hub-dev-root — demo dev mode only)"
+echo "  SQL Server publisher 127.0.0.1:${LOCAL_MSSQL_PUBLISHER_PORT}  login=sa password=${MSSQL_SA_PASSWORD_HINT}  (database demo after bootstrap; encrypt optional)"
+echo "  SQL Server subscriber 127.0.0.1:${LOCAL_MSSQL_SUBSCRIBER_PORT}  login=sa password=${MSSQL_SA_PASSWORD_HINT}"
+echo "       sqlcmd publisher: sqlcmd -S 127.0.0.1,${LOCAL_MSSQL_PUBLISHER_PORT} -U sa -P \"${MSSQL_SA_PASSWORD_HINT}\" -C -Q \"SELECT name FROM sys.databases\""
+echo "       JDBC publisher: jdbc:sqlserver://127.0.0.1:${LOCAL_MSSQL_PUBLISHER_PORT};databaseName=demo;encrypt=false;trustServerCertificate=true"
 echo ""
 
 # Remote port is always 5432 (container + Service targetPort). Local ports differ so primary + replicas can all bind.
 kubectl -n "$NS" port-forward "svc/postgresql-primary" "${LOCAL_PG_PORT}:5432" &
 kubectl -n "$NS" port-forward "svc/postgresql-replica-1" "${LOCAL_PG_REPLICA_1_PORT}:5432" &
 kubectl -n "$NS" port-forward "svc/postgresql-replica-2" "${LOCAL_PG_REPLICA_2_PORT}:5432" &
+kubectl -n "$NS" port-forward "svc/postgres-sub" "${LOCAL_PG_LOGICAL_SUB_PORT}:5432" &
 kubectl -n "$NS" port-forward "pod/cassandra-0" "${LOCAL_CQL_PORT}:9042" &
 kubectl -n "$NS" port-forward "svc/mongo-mongos1" "${LOCAL_MONGO_PORT}:27017" &
 kubectl -n "$NS" port-forward "svc/redis" "${LOCAL_REDIS_PORT}:6379" &
@@ -78,5 +92,11 @@ kubectl -n "$NS" port-forward "svc/kafka-connect" "${LOCAL_KAFKA_CONNECT_PORT}:8
 kubectl -n "$NS" port-forward "svc/opensearch" "${LOCAL_OPENSEARCH_PORT}:9200" &
 kubectl -n "$NS" port-forward "svc/opensearch-dashboards" "${LOCAL_OS_DASHBOARDS_PORT}:5601" &
 kubectl -n "$NS" port-forward "svc/vault" "${LOCAL_VAULT_PORT}:8200" &
+if [[ "${SKIP_MSSQL:-}" == "1" ]]; then
+  echo "SKIP_MSSQL=1 — not forwarding svc/mssql-publisher / svc/mssql-subscriber." >&2
+else
+  kubectl -n "$NS" port-forward "svc/mssql-publisher" "${LOCAL_MSSQL_PUBLISHER_PORT}:1433" &
+  kubectl -n "$NS" port-forward "svc/mssql-subscriber" "${LOCAL_MSSQL_SUBSCRIBER_PORT}:1433" &
+fi
 
 wait

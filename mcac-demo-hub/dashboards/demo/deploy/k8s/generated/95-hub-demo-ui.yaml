@@ -34,6 +34,7 @@ spec:
                 if nc -z -w 3 kafka.demo-hub.svc.cluster.local 9092 2>/dev/null \
                   && nc -z -w 3 opensearch.demo-hub.svc.cluster.local 9200 2>/dev/null \
                   && nc -z -w 3 postgresql-primary.demo-hub.svc.cluster.local 5432 2>/dev/null \
+                  && nc -z -w 3 postgres-sub.demo-hub.svc.cluster.local 5432 2>/dev/null \
                   && nc -z -w 3 cassandra-0.cassandra-headless.demo-hub.svc.cluster.local 9042 2>/dev/null \
                   && nc -z -w 3 redis.demo-hub.svc.cluster.local 6379 2>/dev/null \
                   && nc -z -w 3 mssql-publisher.demo-hub.svc.cluster.local 1433 2>/dev/null; then
@@ -41,11 +42,11 @@ spec:
                   exit 0
                 fi
                 if [ $((i % 15)) -eq 0 ]; then
-                  echo "wait-hub-deps: attempt $i/200 — kafka:9092=$(p kafka.demo-hub.svc.cluster.local 9092) opensearch:9200=$(p opensearch.demo-hub.svc.cluster.local 9200) postgres:5432=$(p postgresql-primary.demo-hub.svc.cluster.local 5432) cassandra-0:9042=$(p cassandra-0.cassandra-headless.demo-hub.svc.cluster.local 9042) redis:6379=$(p redis.demo-hub.svc.cluster.local 6379) mssql-publisher:1433=$(p mssql-publisher.demo-hub.svc.cluster.local 1433) (mongos not gated)" >&2
+                  echo "wait-hub-deps: attempt $i/200 — kafka:9092=$(p kafka.demo-hub.svc.cluster.local 9092) opensearch:9200=$(p opensearch.demo-hub.svc.cluster.local 9200) postgres:5432=$(p postgresql-primary.demo-hub.svc.cluster.local 5432) postgres-sub:5432=$(p postgres-sub.demo-hub.svc.cluster.local 5432) cassandra-0:9042=$(p cassandra-0.cassandra-headless.demo-hub.svc.cluster.local 9042) redis:6379=$(p redis.demo-hub.svc.cluster.local 6379) mssql-publisher:1433=$(p mssql-publisher.demo-hub.svc.cluster.local 1433) (mongos not gated)" >&2
                 fi
                 sleep 2
               done
-              echo "timeout waiting for kafka:9092, opensearch:9200, postgresql-primary:5432," >&2
+              echo "timeout waiting for kafka:9092, opensearch:9200, postgresql-primary:5432, postgres-sub:5432," >&2
               echo "  cassandra-0:9042 (headless), redis:6379, mssql-publisher:1433" >&2
               exit 1
       containers:
@@ -84,6 +85,26 @@ spec:
                 secretKeyRef:
                   name: demo-hub-credentials
                   key: hub-postgres-dsn
+            - name: POSTGRES_ADMIN_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: hub-postgres-admin-dsn
+            - name: POSTGRES_REPLICA_READ_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: hub-postgres-replica-read-dsn
+            - name: POSTGRES_LOGICAL_SUB_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: hub-postgres-logical-sub-dsn
+            - name: POSTGRES_LOGICAL_SUB_ADMIN_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: hub-postgres-logical-sub-admin-dsn
             - name: REDIS_URL
               valueFrom:
                 secretKeyRef:

@@ -82,7 +82,7 @@ ClusterIPs are **not** on `127.0.0.1` until you forward. In a **second terminal*
 ./deploy/k8s/scripts/port-forward-demo-hub.sh
 ```
 
-Leave it running. Defaults map **localhost** ports to services/pods in **`demo-hub`** (see script header for **`SKIP_PROMETHEUS=1`** if Prometheus is down).
+Leave it running. Defaults map **localhost** ports to services/pods in **`demo-hub`** (see script header for **`SKIP_PROMETHEUS=1`** if Prometheus is down, **`SKIP_MSSQL=1`** if SQL Server forwards fail).
 
 **Override local ports** (host already using 9042, 5432, …):
 
@@ -101,6 +101,8 @@ Leave it running. Defaults map **localhost** ports to services/pods in **`demo-h
 | **`LOCAL_OPENSEARCH_PORT`** | 9200 | `svc/opensearch:9200` |
 | **`LOCAL_OS_DASHBOARDS_PORT`** | 5601 | `svc/opensearch-dashboards:5601` |
 | **`LOCAL_VAULT_PORT`** | 8200 | `svc/vault:8200` |
+| **`LOCAL_MSSQL_PUBLISHER_PORT`** | 14333 | `svc/mssql-publisher:1433` (localhost ↔ publisher; SA password matches Secret **`mssql-sa-password`**, default **`Demo_hub_Mssql_2025!`** — override echo with **`MSSQL_SA_PASSWORD_HINT`**) |
+| **`LOCAL_MSSQL_SUBSCRIBER_PORT`** | 14334 | `svc/mssql-subscriber:1433` (subscriber instance) |
 
 Example — use **19042** on the host for CQL:
 
@@ -559,7 +561,7 @@ python3 scripts/gen_demo_hub_pods.py
 |--------|----------------|
 | **`demo-hub.sh` / `apply-data-bootstrap.sh` stuck** on “Waiting for PostgreSQL primary…” | `kubectl rollout status` waits until the **primary pod is Ready**. If the pod is **Pending** (disk-pressure, insufficient CPU/RAM) or **CrashLoop** / **ImagePullBackOff**, this blocks until timeout (~7 min). Run: `kubectl get pods -n demo-hub -l app.kubernetes.io/name=postgresql-primary`; `kubectl describe pod -n demo-hub -l app.kubernetes.io/name=postgresql-primary` and read **Events**. Fix node disk/resources or image issues first. |
 | **PostgreSQL `ErrImagePull` on `mcac-demo/postgresql-repmgr:16.6.0`** | Build the image (`./deploy/k8s/scripts/build-all-custom-images.sh` step 6/6, or `docker build -f deploy/docker/postgres-kafka/Dockerfile.repmgr …`), then load into the cluster (`kind load docker-image mcac-demo/postgresql-repmgr:16.6.0`) or push to a registry the nodes can pull. Restart **`postgresql-primary`** and replicas. |
-| **`mssql-demo-bootstrap` ImagePullBackOff** / **ErrImageNeverPull** (`mcac-demo/mssql-tools:22.04`) | This tag is **not** on a public registry. Build [`scripts/build-mssql-tools-image.sh`](scripts/build-mssql-tools-image.sh) (or **`build-all-custom-images.sh`**) with the **same Docker/OrbStack** your cluster uses. **OrbStack** K8s normally sees locally built images immediately; **kind** needs `kind load docker-image mcac-demo/mssql-tools:22.04`. The Job uses **`imagePullPolicy: Never`** so kubelet does not try Docker Hub. `kubectl delete job mssql-demo-bootstrap -n demo-hub` → `kubectl apply -f generated/62-mssql.yaml` (or **`apply-data-bootstrap.sh`**). |
+| **`mssql-demo-bootstrap` ImagePullBackOff** / **ErrImageNeverPull** (`mcac-demo/mssql-tools:22.04`) | This tag is **not** on a public registry. Build [`scripts/build-mssql-tools-image.sh`](scripts/build-mssql-tools-image.sh) (or **`build-all-custom-images.sh`**) with the **same Docker/OrbStack** your cluster uses. **OrbStack** / Docker Desktop K8s normally see locally built images; **kind** needs `kind load docker-image mcac-demo/mssql-tools:22.04`. The Job uses **`imagePullPolicy: IfNotPresent`** (use local image when it exists). **`ErrImageNeverPull`** on older manifests meant **`imagePullPolicy: Never`** and the image was missing locally — build the image, then `kubectl delete job mssql-demo-bootstrap -n demo-hub` → `kubectl apply -f generated/62-mssql.yaml`. |
 | **Publisher has no `demo` DB** (verify script lists only master/model/msdb/tempdb) | Schema init never ran or the bootstrap Job failed early. Run [`scripts/apply-mssql-schema-k8s.sh`](scripts/apply-mssql-schema-k8s.sh) from **`dashboards/demo`**, then [`scripts/verify-mssql-publisher-demo.sh`](scripts/verify-mssql-publisher-demo.sh) — **`demo`** should appear. Re-register MSSQL connectors (`register-mssql-connectors.sh` with **`DEMO_HUB_K8S=1`** and port-forward). |
 | **SQL Server pods CrashLoop / wrong platform** | Image is **`linux/amd64`**. On **Apple Silicon** clusters without emulation, schedule on **amd64** nodes or use a cluster that runs x86_64 SQL Server. **`mssql-publisher` / `mssql-subscriber`** need ~**2–4Gi** memory per [`62-mssql.yaml`](generated/62-mssql.yaml) limits. |
 | **ErrImagePull** / **ImagePullBackOff** (nodetool-exporter) | Not on a public registry — build and load: **`./deploy/k8s/scripts/build-load-nodetool-exporter.sh`** (or `docker compose build nodetool-exporter` then `kind load docker-image demo-hub/nodetool-exporter:latest`). |
