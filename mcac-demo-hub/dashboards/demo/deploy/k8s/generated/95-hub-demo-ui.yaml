@@ -37,17 +37,18 @@ spec:
                   && nc -z -w 3 postgres-sub.demo-hub.svc.cluster.local 5432 2>/dev/null \
                   && nc -z -w 3 cassandra-0.cassandra-headless.demo-hub.svc.cluster.local 9042 2>/dev/null \
                   && nc -z -w 3 redis.demo-hub.svc.cluster.local 6379 2>/dev/null \
-                  && nc -z -w 3 mssql-publisher.demo-hub.svc.cluster.local 1433 2>/dev/null; then
+                  && nc -z -w 3 mssql-publisher.demo-hub.svc.cluster.local 1433 2>/dev/null \
+                  && nc -z -w 3 trino.demo-hub.svc.cluster.local 8080 2>/dev/null; then
                   echo "wait-hub-deps: all upstream TCP checks OK (attempt $i)" >&2
                   exit 0
                 fi
                 if [ $((i % 15)) -eq 0 ]; then
-                  echo "wait-hub-deps: attempt $i/200 — kafka:9092=$(p kafka.demo-hub.svc.cluster.local 9092) opensearch:9200=$(p opensearch.demo-hub.svc.cluster.local 9200) postgres:5432=$(p postgresql-primary.demo-hub.svc.cluster.local 5432) postgres-sub:5432=$(p postgres-sub.demo-hub.svc.cluster.local 5432) cassandra-0:9042=$(p cassandra-0.cassandra-headless.demo-hub.svc.cluster.local 9042) redis:6379=$(p redis.demo-hub.svc.cluster.local 6379) mssql-publisher:1433=$(p mssql-publisher.demo-hub.svc.cluster.local 1433) (mongos not gated)" >&2
+                  echo "wait-hub-deps: attempt $i/200 — kafka:9092=$(p kafka.demo-hub.svc.cluster.local 9092) opensearch:9200=$(p opensearch.demo-hub.svc.cluster.local 9200) postgres:5432=$(p postgresql-primary.demo-hub.svc.cluster.local 5432) postgres-sub:5432=$(p postgres-sub.demo-hub.svc.cluster.local 5432) cassandra-0:9042=$(p cassandra-0.cassandra-headless.demo-hub.svc.cluster.local 9042) redis:6379=$(p redis.demo-hub.svc.cluster.local 6379) mssql-publisher:1433=$(p mssql-publisher.demo-hub.svc.cluster.local 1433) trino:8080=$(p trino.demo-hub.svc.cluster.local 8080) (mongos not gated)" >&2
                 fi
                 sleep 2
               done
               echo "timeout waiting for kafka:9092, opensearch:9200, postgresql-primary:5432, postgres-sub:5432," >&2
-              echo "  cassandra-0:9042 (headless), redis:6379, mssql-publisher:1433" >&2
+              echo "  cassandra-0:9042 (headless), redis:6379, mssql-publisher:1433, trino:8080" >&2
               exit 1
       containers:
         - name: hub-demo-ui
@@ -80,6 +81,8 @@ spec:
               value: "demo"
             - name: MSSQL_ENCRYPT
               value: "off"
+            - name: TRINO_HTTP
+              value: "http://trino:8080"
             - name: POSTGRES_DSN
               valueFrom:
                 secretKeyRef:

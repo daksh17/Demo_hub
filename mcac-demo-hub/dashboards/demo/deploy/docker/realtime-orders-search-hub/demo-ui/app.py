@@ -1,8 +1,11 @@
 """
 Browser UI + API: single-order ingest and configurable multi-DB workload generator.
 """
+import asyncio
+import decimal
 import json
 import os
+import re
 import secrets
 from urllib.parse import unquote, urlparse
 import threading
@@ -23,6 +26,8 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from pymongo import MongoClient
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.sessions import SessionMiddleware
+from trino.dbapi import connect as trino_connect
+from trino.exceptions import TrinoConnectionError, TrinoUserError
 
 import postgres_logical_demo as pg_logical
 import postgres_faker_schema as pg_faker_schema
@@ -147,6 +152,142 @@ _cassandra_insert_prep = None
 ALLOWED_TARGETS = frozenset(
     {"postgres", "mongo", "redis", "cassandra", "opensearch", "mssql"}
 )
+
+TRINO_ALLOWED_CATALOGS = frozenset(
+    {"demo_pg", "demo_mongo", "demo_es", "demo_sqlserver", "memory"}
+)
+TRINO_ROW_CAP = max(1, min(2000, int(os.environ.get("TRINO_QUERY_ROW_CAP", "500"))))
+_TRINO_FORBIDDEN_KW = re.compile(
+    r"\b(INSERT|UPDATE|DELETE|MERGE|CREATE|DROP|ALTER|TRUNCATE|GRANT|REVOKE)\b",
+    re.I,
+)
+_TRINO_ALLOWED_START = re.compile(
+    r"^\s*(SELECT\b|WITH\b|SHOW\b|DESCRIBE\b|DESC\b|TABLE\b|EXPLAIN\b)",
+    re.I | re.DOTALL,
+)
+
+
+def _trino_sql_guard(sql: str) -> None:
+    core = sql.strip().rstrip(";").strip()
+    if not core:
+        raise HTTPException(status_code=400, detail="empty SQL")
+    parts = [p.strip() for p in sql.split(";") if p.strip()]
+    if len(parts) != 1:
+        raise HTTPException(
+            status_code=400, detail="exactly one SQL statement (no multiple ; chunks)",
+        )
+    if _TRINO_FORBIDDEN_KW.search(core):
+        raise HTTPException(
+            status_code=400,
+            detail="mutating SQL keywords are not allowed from this hub",
+        )
+    if not _TRINO_ALLOWED_START.match(core):
+        raise HTTPException(
+            status_code=400,
+            detail="only SELECT, WITH, SHOW, DESCRIBE, TABLE, or EXPLAIN …",
+        )
+
+
+def _trino_cell_json(v: Any) -> Any:
+    if v is None:
+        return None
+    if isinstance(v, decimal.Decimal):
+        return str(v)
+    if isinstance(v, datetime):
+        return v.isoformat()
+    if isinstance(v, (bytes, bytearray)):
+        return bytes(v).decode("utf-8", errors="replace")
+    if isinstance(v, (list, dict)):
+        return json.loads(json.dumps(v, default=str))
+    return v
+
+
+def _parse_trino_http(base: str) -> tuple[str, int, str]:
+    u = urlparse(base.strip())
+    if u.scheme not in ("http", "https") or not u.hostname:
+        raise HTTPException(
+            status_code=500,
+            detail="TRINO_HTTP must be like http://trino:8080",
+        )
+    host = u.hostname
+    assert host is not None
+    if u.port is not None:
+        port = u.port
+    else:
+        port = 443 if u.scheme == "https" else 8080
+    return host, port, u.scheme
+
+
+def _execute_trino_query(
+    cfg,
+    sql: str,
+    catalog: str | None,
+    schema: str | None,
+) -> dict[str, Any]:
+    if not (cfg.trino_http_url or "").strip():
+        raise HTTPException(
+            status_code=503,
+            detail="Trino not configured (TRINO_HTTP is empty). Kubernetes demo-hub sets it to http://trino:8080.",
+        )
+    cat = (catalog or "demo_pg").strip()
+    if cat not in TRINO_ALLOWED_CATALOGS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"catalog must be one of {sorted(TRINO_ALLOWED_CATALOGS)}",
+        )
+    sch_raw = (schema or "").strip()
+    sch = sch_raw or None
+    if sch is not None and not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", sch):
+        raise HTTPException(status_code=400, detail="invalid schema identifier")
+
+    host, port, scheme = _parse_trino_http(cfg.trino_http_url)
+    conn = trino_connect(
+        host=host,
+        port=port,
+        user="hub-demo-ui",
+        catalog=cat,
+        schema=sch,
+        http_scheme=scheme,
+        request_timeout=120.0,
+    )
+    try:
+        cur = conn.cursor()
+        cur.execute(sql)
+        cols = [d[0] for d in cur.description] if cur.description else []
+        truncated = False
+        rows: list[list[Any]] = []
+        while len(rows) < TRINO_ROW_CAP:
+            batch = cur.fetchmany(min(256, TRINO_ROW_CAP - len(rows)))
+            if not batch:
+                break
+            for r in batch:
+                rows.append([_trino_cell_json(c) for c in r])
+                if len(rows) >= TRINO_ROW_CAP:
+                    truncated = True
+                    break
+            if truncated:
+                break
+        if truncated:
+            while cur.fetchmany(512):
+                pass
+        return {
+            "ok": True,
+            "catalog": cat,
+            "schema": sch,
+            "columns": cols,
+            "rows": rows,
+            "row_count": len(rows),
+            "truncated": truncated,
+        }
+    except TrinoUserError as e:
+        raise HTTPException(status_code=400, detail=e.message) from e
+    except TrinoConnectionError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def _make_pad(payload_kb: int) -> str:
@@ -357,7 +498,7 @@ NAV = """
   <nav style="margin-bottom:1rem;font-size:0.95rem;">
     <a href="/">Single order</a> · <a href="/workload">Workload</a> ·
     <a href="/reads">Read-back</a> · <a href="/scenario">Scenario</a> ·
-    <a href="/postgres">Postgres</a> ·
+    <a href="/postgres">Postgres</a> · <a href="/trino">Trino</a> ·
     <a href="/connections">External DBs</a>
   </nav>
 """
@@ -1289,6 +1430,97 @@ CONNECTIONS_PAGE = f"""<!DOCTYPE html>
 """
 
 
+TRINO_PAGE = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Trino SQL — hub demo</title>
+  <style>
+    :root {{ font-family: ui-sans-serif, system-ui, sans-serif; background: #0f1419; color: #e7e9ea; }}
+    body {{ max-width: 52rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }}
+    a {{ color: #6cb5f4; }}
+    h1 {{ font-size: 1.35rem; font-weight: 600; }}
+    p.note {{ color: #8899a6; font-size: 0.9rem; }}
+    label {{ display: block; margin: 0.5rem 0 0.25rem; font-size: 0.85rem; color: #c8d0d8; }}
+    select, textarea {{
+      width: 100%; box-sizing: border-box; border-radius: 8px;
+      border: 1px solid #38444d; background: #16181c; color: #e7e9ea;
+      font-family: ui-monospace, monospace; font-size: 0.82rem;
+    }}
+    textarea {{ min-height: 9rem; padding: 0.65rem; resize: vertical; }}
+    select {{ padding: 0.45rem 0.5rem; }}
+    button {{
+      background: #1d9bf0; color: #fff; border: 0; border-radius: 9999px;
+      padding: 0.55rem 1.2rem; font-size: 0.95rem; font-weight: 600; cursor: pointer; margin-top: 0.85rem;
+    }}
+    button:disabled {{ opacity: 0.5; cursor: not-allowed; }}
+    #status {{ margin-top: 0.75rem; font-size: 0.9rem; }}
+    #status.ok {{ color: #7af87a; }}
+    #status.err {{ color: #f66; }}
+    pre {{ background: #16181c; border: 1px solid #2f3336; border-radius: 8px; padding: 1rem; overflow: auto; font-size: 0.76rem; }}
+  </style>
+</head>
+<body>
+  {NAV}
+  <h1>Trino (federated SQL)</h1>
+  <p class="note">Kubernetes stacks expose catalogs <code>demo_pg</code>, <code>demo_mongo</code>,
+    <code>demo_es</code> (OpenSearch via Elasticsearch connector), <code>demo_sqlserver</code>, and <code>memory</code>.
+    The hub only allows read-only statements (<code>SELECT</code>, <code>SHOW</code>, <code>DESCRIBE</code>, …).
+    Set env <code>TRINO_HTTP</code> (empty in plain Docker Compose unless you add Trino).</p>
+  <label>Catalog</label>
+  <select id="catalog">
+    <option value="demo_pg">demo_pg (Postgres)</option>
+    <option value="demo_mongo">demo_mongo</option>
+    <option value="demo_es">demo_es</option>
+    <option value="demo_sqlserver">demo_sqlserver</option>
+    <option value="memory">memory</option>
+  </select>
+  <label>Schema <span style="color:#71767b">(optional, e.g. public)</span></label>
+  <input id="schema" type="text" placeholder="public" autocomplete="off"
+    style="width:100%;box-sizing:border-box;padding:0.45rem 0.55rem;border-radius:8px;border:1px solid #38444d;background:#16181c;color:#e7e9ea;font-family:ui-monospace,monospace;font-size:0.82rem;"/>
+  <label>SQL</label>
+  <textarea id="sql" spellcheck="false">SELECT table_schema, table_name FROM demo_pg.information_schema.tables WHERE table_schema NOT IN ('pg_catalog','information_schema') ORDER BY 1,2 LIMIT 30</textarea>
+  <button type="button" id="run">Run</button>
+  <p id="status"></p>
+  <pre id="out">Results appear here.</pre>
+  <script>
+    document.getElementById("run").onclick = async () => {{
+      const st = document.getElementById("status");
+      const out = document.getElementById("out");
+      const sql = document.getElementById("sql").value;
+      const catalog = document.getElementById("catalog").value;
+      const schema = document.getElementById("schema").value.trim();
+      st.textContent = "Running…";
+      st.className = "";
+      out.textContent = "";
+      try {{
+        const r = await fetch("/api/trino/query", {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{ sql, catalog, schema: schema || null }}),
+        }});
+        const data = await r.json().catch(() => ({{ detail: r.statusText }}));
+        if (!r.ok) {{
+          st.textContent = data.detail || r.statusText;
+          st.className = "err";
+          out.textContent = JSON.stringify(data, null, 2);
+          return;
+        }}
+        st.textContent = data.truncated ? `OK (${{data.row_count}} rows, truncated)` : `OK (${{data.row_count}} rows)`;
+        st.className = "ok";
+        out.textContent = JSON.stringify(data, null, 2);
+      }} catch (e) {{
+        st.textContent = String(e);
+        st.className = "err";
+      }}
+    }};
+  </script>
+</body>
+</html>
+"""
+
+
 POSTGRES_LANDING_PAGE = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2168,6 +2400,12 @@ def _normalize_hub_pg_identifier(v: object) -> object:
     return v
 
 
+class TrinoQueryBody(BaseModel):
+    sql: str = Field(..., min_length=1, max_length=96_000)
+    catalog: str | None = Field(None, max_length=64)
+    schema: str | None = Field(None, max_length=128)
+
+
 class PostgresLogicalInsertBody(BaseModel):
     note: str = ""
 
@@ -2922,6 +3160,11 @@ async def connections_page():
     return HTMLResponse(CONNECTIONS_PAGE)
 
 
+@app.get("/trino", response_class=HTMLResponse)
+async def trino_page():
+    return HTMLResponse(TRINO_PAGE)
+
+
 @app.get("/postgres", response_class=HTMLResponse)
 async def postgres_hub_page():
     """Landing tab for Postgres-only demos (logical replication, links to scenario PG view, etc.)."""
@@ -2942,6 +3185,19 @@ async def postgres_faker_schema_page():
 async def postgres_logical_legacy_redirect():
     """Old path; keep bookmarks working."""
     return RedirectResponse(url="/postgres/logical", status_code=307)
+
+
+@app.post("/api/trino/query")
+async def api_trino_query(body: TrinoQueryBody):
+    cfg = get_runtime_config()
+    _trino_sql_guard(body.sql)
+    return await asyncio.to_thread(
+        _execute_trino_query,
+        cfg,
+        body.sql.strip(),
+        body.catalog,
+        body.schema,
+    )
 
 
 @app.post("/api/postgres-logical/setup")
@@ -3222,6 +3478,9 @@ async def api_connections_get(request: Request):
             "opensearch_index": rt.opensearch_index,
             "opensearch_workload_index": rt.opensearch_workload_index,
             "scenario_opensearch_index": rt.scenario_opensearch_index,
+            "trino_http_url": mask_connection_hint(rt.trino_http_url)
+            if rt.trino_http_url
+            else "(disabled)",
         },
     }
 

@@ -955,6 +955,7 @@ services:
       OPENSEARCH_URL: http://opensearch:9200
       OPENSEARCH_INDEX: hub-orders
       KAFKA_BOOTSTRAP: kafka:29092
+      TRINO_HTTP: ""
       MSSQL_HOST: mssql-publisher
       MSSQL_PORT: "1433"
       MSSQL_USER: sa

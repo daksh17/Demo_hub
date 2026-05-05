@@ -10,6 +10,7 @@
 # kubectl logs deploy/prometheus -n demo-hub --tail=50. To forward everything except Prometheus
 # while you fix it: SKIP_PROMETHEUS=1 ./deploy/k8s/scripts/port-forward-demo-hub.sh
 # MSSQL pods down: SKIP_MSSQL=1 ./deploy/k8s/scripts/port-forward-demo-hub.sh
+# Trino not deployed or pod pending: SKIP_TRINO=1 ./deploy/k8s/scripts/port-forward-demo-hub.sh
 #
 # Cassandra: forward **pod/cassandra-0**, not svc/cassandra — the Service load-balances 3 replicas;
 # CQL + port-forward (socat) often hits "Connection reset by peer" / lost connection when the
@@ -47,6 +48,8 @@ LOCAL_VAULT_PORT="${LOCAL_VAULT_PORT:-8200}"
 # SQL Server 2022 (publisher / subscriber); remote port always 1433. Defaults avoid clashing with a host SQL Server on :1433.
 LOCAL_MSSQL_PUBLISHER_PORT="${LOCAL_MSSQL_PUBLISHER_PORT:-14333}"
 LOCAL_MSSQL_SUBSCRIBER_PORT="${LOCAL_MSSQL_SUBSCRIBER_PORT:-14334}"
+# Trino coordinator HTTP (in-cluster :8080). Default 8088 avoids colliding with other localhost :8080 apps.
+LOCAL_TRINO_PORT="${LOCAL_TRINO_PORT:-8088}"
 # Matches demo-hub Secret demo-hub-credentials key mssql-sa-password unless you rotated it (override this echo).
 MSSQL_SA_PASSWORD_HINT="${MSSQL_SA_PASSWORD_HINT:-Demo_hub_Mssql_2025!}"
 
@@ -64,6 +67,7 @@ echo "  Grafana       http://127.0.0.1:${LOCAL_GRAFANA_PORT}/"
 echo "  Prometheus    http://127.0.0.1:${LOCAL_PROM_PORT}/"
 echo "  Hub demo UI   http://127.0.0.1:${LOCAL_HUB_UI_PORT}/  (Faker + map orders: /scenario step 3)"
 echo "  Kafka Connect http://127.0.0.1:${LOCAL_KAFKA_CONNECT_PORT}/  (REST; list: curl -s http://127.0.0.1:${LOCAL_KAFKA_CONNECT_PORT}/connectors)"
+echo "  Trino         http://127.0.0.1:${LOCAL_TRINO_PORT}/  (coordinator UI; federated SQL runner on hub: http://127.0.0.1:${LOCAL_HUB_UI_PORT}/trino)"
 echo "  OpenSearch    http://127.0.0.1:${LOCAL_OPENSEARCH_PORT}/  (REST API; e.g. curl -s http://127.0.0.1:${LOCAL_OPENSEARCH_PORT}/_cluster/health)"
 echo "  OS Dashboards http://127.0.0.1:${LOCAL_OS_DASHBOARDS_PORT}/  (matches “OpenSearch Dashboards” link on hub home)"
 echo "  Vault UI/API http://127.0.0.1:${LOCAL_VAULT_PORT}/  (token: demo-hub-dev-root — demo dev mode only)"
@@ -89,6 +93,11 @@ else
 fi
 kubectl -n "$NS" port-forward "svc/hub-demo-ui" "${LOCAL_HUB_UI_PORT}:8888" &
 kubectl -n "$NS" port-forward "svc/kafka-connect" "${LOCAL_KAFKA_CONNECT_PORT}:8083" &
+if [[ "${SKIP_TRINO:-}" == "1" ]]; then
+  echo "SKIP_TRINO=1 — not forwarding svc/trino (omit SKIP_TRINO once Trino is applied and Ready)." >&2
+else
+  kubectl -n "$NS" port-forward "svc/trino" "${LOCAL_TRINO_PORT}:8080" &
+fi
 kubectl -n "$NS" port-forward "svc/opensearch" "${LOCAL_OPENSEARCH_PORT}:9200" &
 kubectl -n "$NS" port-forward "svc/opensearch-dashboards" "${LOCAL_OS_DASHBOARDS_PORT}:5601" &
 kubectl -n "$NS" port-forward "svc/vault" "${LOCAL_VAULT_PORT}:8200" &

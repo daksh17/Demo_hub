@@ -10,3 +10,4 @@ pydantic==2.10.3
 Faker==33.1.0
 kafka-python==2.0.2
 pymssql==2.3.2
+trino==0.337.0

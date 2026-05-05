@@ -55,6 +55,8 @@ class HubRuntimeConfig:
     opensearch_workload_index: str
     scenario_opensearch_index: str
     workload_redis_prefix: str
+    trino_http_url: str
+    """Trino coordinator HTTP base (e.g. ``http://trino:8080``). Empty disables hub SQL runner."""
 
     @classmethod
     def from_env(cls) -> HubRuntimeConfig:
@@ -95,6 +97,7 @@ class HubRuntimeConfig:
             workload_redis_prefix=os.environ.get(
                 "WORKLOAD_REDIS_PREFIX", "hub:wl:"
             ),
+            trino_http_url=os.environ.get("TRINO_HTTP", "").strip(),
         )
 
     def merge_session(self, session: dict[str, Any]) -> HubRuntimeConfig:
@@ -143,6 +146,7 @@ class HubRuntimeConfig:
                 SK_SCENARIO_OS_INDEX, self.scenario_opensearch_index
             ),
             workload_redis_prefix=self.workload_redis_prefix,
+            trino_http_url=self.trino_http_url,
         )
 
     def is_default_cassandra(self, env_base: HubRuntimeConfig) -> bool:

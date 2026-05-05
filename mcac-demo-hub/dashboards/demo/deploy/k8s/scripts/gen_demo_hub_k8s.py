@@ -60,6 +60,8 @@ MCAC_INIT_IMAGE = "mcac-demo/mcac-init:local"
 POSTGRESQL_IMAGE = "mcac-demo/postgresql-repmgr:16.6.0"
 # Standalone logical subscriber (no repmgr); pin matches Dockerfile.repmgr base — same major as primary.
 POSTGRES_SUB_IMAGE = "docker.io/bitnamilegacy/postgresql:16.6.0-debian-12-r2"
+# Federated SQL: coordinator-only single-pod Trino (query Postgres, Mongo, OpenSearch-API, MSSQL + memory).
+TRINO_IMAGE = "trinodb/trino:452"
 
 # WAL archive: set via /bitnami/postgresql/conf/conf.d/ (init container), not POSTGRESQL_EXTRA_FLAGS —
 # Bitnami splits EXTRA_FLAGS on spaces, so archive_command / mkdir -p / test -f break postgres argv.
@@ -291,6 +293,7 @@ def _hub_wait_upstream() -> str:
     cs0 = f"cassandra-0.cassandra-headless.{NS}.svc.cluster.local"
     rd = fqdn_service("redis")
     ms = fqdn_service("mssql-publisher")
+    tn = fqdn_service("trino")
     return f"""      initContainers:
         - name: wait-hub-deps
           image: alpine:3.19
@@ -307,19 +310,233 @@ def _hub_wait_upstream() -> str:
                   && nc -z -w 3 {pgsub} 5432 2>/dev/null \\
                   && nc -z -w 3 {cs0} 9042 2>/dev/null \\
                   && nc -z -w 3 {rd} 6379 2>/dev/null \\
-                  && nc -z -w 3 {ms} 1433 2>/dev/null; then
+                  && nc -z -w 3 {ms} 1433 2>/dev/null \\
+                  && nc -z -w 3 {tn} 8080 2>/dev/null; then
                   echo "wait-hub-deps: all upstream TCP checks OK (attempt $i)" >&2
                   exit 0
                 fi
                 if [ $((i % 15)) -eq 0 ]; then
-                  echo "wait-hub-deps: attempt $i/200 — kafka:9092=$(p {kh} 9092) opensearch:9200=$(p {oh} 9200) postgres:5432=$(p {pg} 5432) postgres-sub:5432=$(p {pgsub} 5432) cassandra-0:9042=$(p {cs0} 9042) redis:6379=$(p {rd} 6379) mssql-publisher:1433=$(p {ms} 1433) (mongos not gated)" >&2
+                  echo "wait-hub-deps: attempt $i/200 — kafka:9092=$(p {kh} 9092) opensearch:9200=$(p {oh} 9200) postgres:5432=$(p {pg} 5432) postgres-sub:5432=$(p {pgsub} 5432) cassandra-0:9042=$(p {cs0} 9042) redis:6379=$(p {rd} 6379) mssql-publisher:1433=$(p {ms} 1433) trino:8080=$(p {tn} 8080) (mongos not gated)" >&2
                 fi
                 sleep 2
               done
               echo "timeout waiting for kafka:9092, opensearch:9200, postgresql-primary:5432, postgres-sub:5432," >&2
-              echo "  cassandra-0:9042 (headless), redis:6379, mssql-publisher:1433" >&2
+              echo "  cassandra-0:9042 (headless), redis:6379, mssql-publisher:1433, trino:8080" >&2
               exit 1
 """
+
+
+def _trino_wait_deps() -> str:
+    """Trino catalogs touch Postgres, OpenSearch API, Mongo router, MSSQL."""
+    pg = fqdn_service("postgresql-primary")
+    oh = fqdn_service("opensearch")
+    mg = fqdn_service("mongo-mongos1")
+    ms = fqdn_service("mssql-publisher")
+    return f"""      initContainers:
+        - name: wait-trino-deps
+          image: alpine:3.19
+          command:
+            - /bin/sh
+            - -c
+            - |
+              apk add --no-cache netcat-openbsd >/dev/null
+              for i in $(seq 1 180); do
+                if nc -z -w 3 {pg} 5432 2>/dev/null \\
+                  && nc -z -w 3 {oh} 9200 2>/dev/null \\
+                  && nc -z -w 3 {mg} 27017 2>/dev/null \\
+                  && nc -z -w 3 {ms} 1433 2>/dev/null; then
+                  echo "wait-trino-deps: OK (attempt $i)" >&2
+                  exit 0
+                fi
+                sleep 2
+              done
+              echo "timeout waiting for postgres, opensearch, mongo-mongos1, mssql-publisher" >&2
+              exit 1
+"""
+
+
+def trino_stack() -> str:
+    """Coordinator-only Trino with demo-hub catalogs (passwords match demo-hub-credentials literals)."""
+    sd = demo_hub_secret_stringdata()
+    demo_pw = sd[SK_DEMO_USER_PASSWORD]
+    mssql_pw = sd[SK_MSSQL_SA_PASSWORD]
+    pg_jdbc = f"jdbc:postgresql://{fqdn_service('postgresql-primary')}:5432/demo"
+    mongo_uri = f"mongodb://{fqdn_service('mongo-mongos1')}:27017/"
+    es_host = fqdn_service("opensearch")
+
+    main_props = textwrap.dedent(
+        f"""
+        coordinator=true
+        node-scheduler.include-coordinator=true
+        http-server.http.port=8080
+        discovery.uri=http://127.0.0.1:8080
+        query.max-memory=2GB
+        query.max-memory-per-node=1536MB
+        memory.heap-headroom-per-node=128MB
+        web-ui.enabled=true
+        """
+    ).strip()
+
+    node_props = textwrap.dedent(
+        """
+        node.environment=demo_hub
+        node.id=trino-coordinator
+        node.data-dir=/data/trino
+        """
+    ).strip()
+
+    pg_cat = textwrap.dedent(
+        f"""
+        connector.name=postgresql
+        connection-url={pg_jdbc}
+        connection-user=demo
+        connection-password={demo_pw}
+        """
+    ).strip()
+
+    mongo_cat = textwrap.dedent(
+        f"""
+        connector.name=mongodb
+        mongodb.connection-url={mongo_uri}
+        mongodb.case-insensitive-name-matching=true
+        """
+    ).strip()
+
+    es_cat = textwrap.dedent(
+        f"""
+        connector.name=elasticsearch
+        elasticsearch.host={es_host}
+        elasticsearch.port=9200
+        elasticsearch.default-schema-name=default
+        elasticsearch.ignore-publish-address=true
+        """
+    ).strip()
+
+    mssql_host = fqdn_service("mssql-publisher")
+    sqlsrv_cat = textwrap.dedent(
+        f"""
+        connector.name=sqlserver
+        connection-url=jdbc:sqlserver://{mssql_host}:1433;databaseName=demo;encrypt=false;trustServerCertificate=true
+        connection-user=sa
+        connection-password={mssql_pw}
+        """
+    ).strip()
+
+    mem_cat = textwrap.dedent(
+        """
+        connector.name=memory
+        memory.max-data-per-node=128MB
+        """
+    ).strip()
+
+    cm_main = configmap(
+        "trino-main",
+        "trino",
+        {
+            "config.properties": main_props,
+            "node.properties": node_props,
+        },
+    )
+    cm_cat = configmap(
+        "trino-catalog",
+        "trino",
+        {
+            "demo_pg.properties": pg_cat,
+            "demo_mongo.properties": mongo_cat,
+            "demo_es.properties": es_cat,
+            "demo_sqlserver.properties": sqlsrv_cat,
+            "memory.properties": mem_cat,
+        },
+    )
+
+    ml_t = """    demo-hub.io/group: trino
+    app.kubernetes.io/name: trino
+    app.kubernetes.io/part-of: demo-hub"""
+    pl_t = """        demo-hub.io/group: trino
+        app.kubernetes.io/name: trino
+        app.kubernetes.io/part-of: demo-hub"""
+
+    dep = f"""apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trino
+  namespace: {NS}
+  labels:
+{ml_t}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: trino
+  template:
+    metadata:
+      labels:
+{pl_t}
+    spec:
+{_trino_wait_deps()}      containers:
+        - name: trino
+          image: {TRINO_IMAGE}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /v1/info
+              port: http
+            initialDelaySeconds: 40
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 18
+          resources:
+            requests:
+              memory: "2Gi"
+              cpu: "250m"
+            limits:
+              memory: "3Gi"
+          volumeMounts:
+            # Do not mount over all of /etc/trino — that hides the image's stock jvm.config
+            # (JDK-8329528 flags, jvmkill agent, GC tuning). Only override config + catalogs.
+            - name: trino-main
+              mountPath: /etc/trino/config.properties
+              subPath: config.properties
+              readOnly: true
+            - name: trino-main
+              mountPath: /etc/trino/node.properties
+              subPath: node.properties
+              readOnly: true
+            - name: trino-catalog
+              mountPath: /etc/trino/catalog
+              readOnly: true
+      volumes:
+        - name: trino-main
+          configMap:
+            name: trino-main
+        - name: trino-catalog
+          configMap:
+            name: trino-catalog
+"""
+
+    svc = f"""apiVersion: v1
+kind: Service
+metadata:
+  name: trino
+  namespace: {NS}
+  labels:
+{ml_t}
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: trino
+  ports:
+    - port: 8080
+      targetPort: http
+      name: http
+"""
+
+    return join_docs(cm_main, cm_cat, dep, svc)
 
 
 def deployment(
@@ -2077,6 +2294,7 @@ def hub_demo_ui() -> str:
             ("MSSQL_USER", "sa"),
             ("MSSQL_DATABASE", "demo"),
             ("MSSQL_ENCRYPT", "off"),
+            ("TRINO_HTTP", "http://trino:8080"),
         ],
         init_before_containers=_hub_wait_upstream(),
         strategy_recreate=True,
@@ -2140,6 +2358,7 @@ def main() -> None:
         ("70-kafka-connect.yaml", kafka_connect()),
         ("80-exporters.yaml", exporters()),
         ("90-opensearch.yaml", opensearch_stack()),
+        ("93-trino.yaml", trino_stack()),
         ("95-hub-demo-ui.yaml", hub_demo_ui()),
         ("96-kubernetes-ops.yaml", kubernetes_ops_extras()),
         ("98-nodetool-stress.yaml", nodetool_stress()),

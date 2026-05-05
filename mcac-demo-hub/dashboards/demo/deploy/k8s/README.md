@@ -98,6 +98,7 @@ Leave it running. Defaults map **localhost** ports to services/pods in **`demo-h
 | **`LOCAL_PROM_PORT`** | 9090 | `svc/prometheus:9090` |
 | **`LOCAL_HUB_UI_PORT`** | 8888 | `svc/hub-demo-ui:8888` |
 | **`LOCAL_KAFKA_CONNECT_PORT`** | 8083 | `svc/kafka-connect:8083` |
+| **`LOCAL_TRINO_PORT`** | 8088 | `svc/trino:8080` (coordinator UI; use **`SKIP_TRINO=1`** if Trino is not deployed) |
 | **`LOCAL_OPENSEARCH_PORT`** | 9200 | `svc/opensearch:9200` |
 | **`LOCAL_OS_DASHBOARDS_PORT`** | 5601 | `svc/opensearch-dashboards:5601` |
 | **`LOCAL_VAULT_PORT`** | 8200 | `svc/vault:8200` |

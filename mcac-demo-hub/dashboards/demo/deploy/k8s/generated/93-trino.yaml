@@ -1,0 +1,167 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trino-main
+  namespace: demo-hub
+  labels:
+    demo-hub.io/group: trino
+    app.kubernetes.io/part-of: demo-hub
+data:
+  config.properties: |
+    coordinator=true
+    node-scheduler.include-coordinator=true
+    http-server.http.port=8080
+    discovery.uri=http://127.0.0.1:8080
+    query.max-memory=2GB
+    query.max-memory-per-node=1536MB
+    memory.heap-headroom-per-node=128MB
+    web-ui.enabled=true
+
+  node.properties: |
+    node.environment=demo_hub
+    node.id=trino-coordinator
+    node.data-dir=/data/trino
+---
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trino-catalog
+  namespace: demo-hub
+  labels:
+    demo-hub.io/group: trino
+    app.kubernetes.io/part-of: demo-hub
+data:
+  demo_pg.properties: |
+    connector.name=postgresql
+    connection-url=jdbc:postgresql://postgresql-primary.demo-hub.svc.cluster.local:5432/demo
+    connection-user=demo
+    connection-password=demopass
+
+  demo_mongo.properties: |
+    connector.name=mongodb
+    mongodb.connection-url=mongodb://mongo-mongos1.demo-hub.svc.cluster.local:27017/
+    mongodb.case-insensitive-name-matching=true
+
+  demo_es.properties: |
+    connector.name=elasticsearch
+    elasticsearch.host=opensearch.demo-hub.svc.cluster.local
+    elasticsearch.port=9200
+    elasticsearch.default-schema-name=default
+    elasticsearch.ignore-publish-address=true
+
+  demo_sqlserver.properties: |
+    connector.name=sqlserver
+    connection-url=jdbc:sqlserver://mssql-publisher.demo-hub.svc.cluster.local:1433;databaseName=demo;encrypt=false;trustServerCertificate=true
+    connection-user=sa
+    connection-password=Demo_hub_Mssql_2025!
+
+  memory.properties: |
+    connector.name=memory
+    memory.max-data-per-node=128MB
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trino
+  namespace: demo-hub
+  labels:
+    demo-hub.io/group: trino
+    app.kubernetes.io/name: trino
+    app.kubernetes.io/part-of: demo-hub
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: trino
+  template:
+    metadata:
+      labels:
+        demo-hub.io/group: trino
+        app.kubernetes.io/name: trino
+        app.kubernetes.io/part-of: demo-hub
+    spec:
+      initContainers:
+        - name: wait-trino-deps
+          image: alpine:3.19
+          command:
+            - /bin/sh
+            - -c
+            - |
+              apk add --no-cache netcat-openbsd >/dev/null
+              for i in $(seq 1 180); do
+                if nc -z -w 3 postgresql-primary.demo-hub.svc.cluster.local 5432 2>/dev/null \
+                  && nc -z -w 3 opensearch.demo-hub.svc.cluster.local 9200 2>/dev/null \
+                  && nc -z -w 3 mongo-mongos1.demo-hub.svc.cluster.local 27017 2>/dev/null \
+                  && nc -z -w 3 mssql-publisher.demo-hub.svc.cluster.local 1433 2>/dev/null; then
+                  echo "wait-trino-deps: OK (attempt $i)" >&2
+                  exit 0
+                fi
+                sleep 2
+              done
+              echo "timeout waiting for postgres, opensearch, mongo-mongos1, mssql-publisher" >&2
+              exit 1
+      containers:
+        - name: trino
+          image: trinodb/trino:452
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /v1/info
+              port: http
+            initialDelaySeconds: 40
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 18
+          resources:
+            requests:
+              memory: "2Gi"
+              cpu: "250m"
+            limits:
+              memory: "3Gi"
+          volumeMounts:
+            # Do not mount over all of /etc/trino — that hides the image's stock jvm.config
+            # (JDK-8329528 flags, jvmkill agent, GC tuning). Only override config + catalogs.
+            - name: trino-main
+              mountPath: /etc/trino/config.properties
+              subPath: config.properties
+              readOnly: true
+            - name: trino-main
+              mountPath: /etc/trino/node.properties
+              subPath: node.properties
+              readOnly: true
+            - name: trino-catalog
+              mountPath: /etc/trino/catalog
+              readOnly: true
+      volumes:
+        - name: trino-main
+          configMap:
+            name: trino-main
+        - name: trino-catalog
+          configMap:
+            name: trino-catalog
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: trino
+  namespace: demo-hub
+  labels:
+    demo-hub.io/group: trino
+    app.kubernetes.io/name: trino
+    app.kubernetes.io/part-of: demo-hub
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: trino
+  ports:
+    - port: 8080
+      targetPort: http
+      name: http
