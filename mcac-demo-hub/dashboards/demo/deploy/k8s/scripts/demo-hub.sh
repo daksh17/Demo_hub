@@ -19,6 +19,7 @@
 #   WAIT_READY_TIMEOUT=900s  — kubectl wait timeout (default 900s)
 #   SKIP_PROMETHEUS=1        — passed through to port-forward-demo-hub.sh when using port-forward / WITH_PORT_FORWARD
 #   APPLY_CASSANDRA_CQL_NODEPORT=1 — after apply + bootstrap: kubectl apply optional-cassandra-0-cql-nodeport.yaml (local DBeaver/CQL)
+#   KUBECTL_APPLY_EXTRA_ARGS     — extra flags for kubectl apply (e.g. --validate=false); still requires a reachable API server
 #
 set -euo pipefail
 
@@ -52,6 +53,7 @@ Environment:
   WAIT_READY_TIMEOUT=900s  timeout for wait-ready / port-forward pre-check
   SKIP_PROMETHEUS=1        omit Prometheus forward if its pod is down
   APPLY_CASSANDRA_CQL_NODEPORT=1  apply deploy/k8s/optional-cassandra-0-cql-nodeport.yaml after stack is up (stop-start-all-k8s.sh sets this by default)
+  KUBECTL_APPLY_EXTRA_ARGS        extra kubectl apply flags (e.g. --validate=false)
 EOF
   exit "${1:-0}"
 }
@@ -59,6 +61,25 @@ EOF
 regen_manifests() {
   echo "=== Regenerate manifests (gen_demo_hub_k8s.py) ==="
   python3 "$ROOT/scripts/gen_demo_hub_k8s.py"
+}
+
+kubectl_require_cluster() {
+  if kubectl cluster-info &>/dev/null; then
+    return 0
+  fi
+  cat >&2 <<'EOF'
+ERROR: kubectl cannot reach the Kubernetes API server.
+
+Common causes:
+  • Local Kubernetes is stopped — enable/start Kubernetes in OrbStack (or Docker Desktop).
+  • Stale kubeconfig — current-context points at an endpoint nothing is listening on (often https://127.0.0.1:26443).
+
+Verify with:
+  kubectl cluster-info
+
+Note: KUBECTL_APPLY_EXTRA_ARGS=--validate=false only skips schema validation; kubectl apply still needs a running API.
+EOF
+  exit 1
 }
 
 wait_namespace_gone() {
@@ -78,6 +99,7 @@ wait_namespace_gone() {
 
 # Wait until all app.kubernetes.io/part-of=demo-hub Deployments are Available and Cassandra StatefulSet is rolled out.
 cmd_wait_ready() {
+  kubectl_require_cluster
   if ! kubectl get ns "$NS" &>/dev/null; then
     echo "Namespace $NS not found. Apply manifests first." >&2
     exit 1
@@ -97,7 +119,8 @@ maybe_apply_cassandra_cql_nodeport() {
     return 0
   fi
   echo "=== Optional: Cassandra CQL NodePort (DBeaver / local CQL on node :30942) ==="
-  kubectl apply -f "$f"
+  # shellcheck disable=SC2086
+  kubectl apply ${KUBECTL_APPLY_EXTRA_ARGS:-} -f "$f"
 }
 
 cmd_port_forward() {
@@ -108,6 +131,7 @@ cmd_port_forward() {
 
 cmd_stop() {
   echo "=== STOP: delete namespace $NS ==="
+  kubectl_require_cluster
   if ! kubectl get ns "$NS" &>/dev/null; then
     echo "Namespace $NS does not exist — nothing to delete."
     return 0
@@ -125,8 +149,11 @@ cmd_start() {
     regen_manifests
   fi
 
+  kubectl_require_cluster
+
   echo "=== START: kubectl apply (single bundle) ==="
-  kubectl apply -f "$ALL_YAML"
+  # shellcheck disable=SC2086
+  kubectl apply ${KUBECTL_APPLY_EXTRA_ARGS:-} -f "$ALL_YAML"
 
   if [[ "${SKIP_BOOTSTRAP:-}" == "1" ]]; then
     echo "SKIP_BOOTSTRAP=1 — skipping apply-data-bootstrap.sh"
@@ -155,6 +182,10 @@ cmd_restart() {
 }
 
 cmd_status() {
+  if ! kubectl cluster-info &>/dev/null; then
+    echo "Cannot reach Kubernetes API — enable local Kubernetes (e.g. OrbStack), then: kubectl cluster-info" >&2
+    exit 1
+  fi
   if ! kubectl get ns "$NS" &>/dev/null; then
     echo "Namespace $NS does not exist. Run: $0 start"
     exit 0

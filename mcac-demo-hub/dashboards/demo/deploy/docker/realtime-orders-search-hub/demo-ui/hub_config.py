@@ -37,6 +37,15 @@ def _env_cassandra_hosts() -> tuple[str, ...]:
 @dataclass(frozen=True)
 class HubRuntimeConfig:
     postgres_dsn: str
+    """Application user DSN for ``demo`` on primary (inserts, row counts)."""
+    postgres_admin_dsn: str
+    """Superuser DSN on primary (logical publisher DDL)."""
+    postgres_replica_read_dsn: str
+    """Optional: primary standby ``demo_logical_pub`` — publisher lag/compare."""
+    postgres_logical_sub_dsn: str
+    """Application ``demo`` DSN base on logical subscriber pod (``postgres-sub`` in K8s)."""
+    postgres_logical_sub_admin_dsn: str
+    """Superuser DSN on logical subscriber pod."""
     mongo_uri: str
     redis_url: str
     opensearch_url: str
@@ -46,14 +55,29 @@ class HubRuntimeConfig:
     opensearch_workload_index: str
     scenario_opensearch_index: str
     workload_redis_prefix: str
+    trino_http_url: str
+    """Trino coordinator HTTP base (e.g. ``http://trino:8080``). Empty disables hub SQL runner."""
 
     @classmethod
     def from_env(cls) -> HubRuntimeConfig:
+        pg_dsn = os.environ.get(
+            "POSTGRES_DSN",
+            "postgresql://demo:demopass@postgresql-primary:5432/demo",
+        )
+        pg_admin = os.environ.get(
+            "POSTGRES_ADMIN_DSN",
+            "postgresql://postgres:postgres@postgresql-primary:5432/postgres",
+        )
+        sub_dsn = os.environ.get("POSTGRES_LOGICAL_SUB_DSN", "").strip()
+        sub_admin = os.environ.get("POSTGRES_LOGICAL_SUB_ADMIN_DSN", "").strip()
         return cls(
-            postgres_dsn=os.environ.get(
-                "POSTGRES_DSN",
-                "postgresql://demo:demopass@postgresql-primary:5432/demo",
-            ),
+            postgres_dsn=pg_dsn,
+            postgres_admin_dsn=pg_admin,
+            postgres_replica_read_dsn=os.environ.get(
+                "POSTGRES_REPLICA_READ_DSN", ""
+            ).strip(),
+            postgres_logical_sub_dsn=sub_dsn or pg_dsn,
+            postgres_logical_sub_admin_dsn=sub_admin or pg_admin,
             mongo_uri=os.environ.get("MONGO_URI", "mongodb://mongo-mongos1:27017"),
             redis_url=os.environ.get(
                 "REDIS_URL", "redis://:demoredispass@redis:6379/0"
@@ -73,6 +97,7 @@ class HubRuntimeConfig:
             workload_redis_prefix=os.environ.get(
                 "WORKLOAD_REDIS_PREFIX", "hub:wl:"
             ),
+            trino_http_url=os.environ.get("TRINO_HTTP", "").strip(),
         )
 
     def merge_session(self, session: dict[str, Any]) -> HubRuntimeConfig:
@@ -104,6 +129,10 @@ class HubRuntimeConfig:
 
         return HubRuntimeConfig(
             postgres_dsn=pick(SK_POSTGRES_DSN, self.postgres_dsn),
+            postgres_admin_dsn=self.postgres_admin_dsn,
+            postgres_replica_read_dsn=self.postgres_replica_read_dsn,
+            postgres_logical_sub_dsn=self.postgres_logical_sub_dsn,
+            postgres_logical_sub_admin_dsn=self.postgres_logical_sub_admin_dsn,
             mongo_uri=pick(SK_MONGO_URI, self.mongo_uri),
             redis_url=pick(SK_REDIS_URL, self.redis_url),
             opensearch_url=pick(SK_OS_URL, self.opensearch_url).rstrip("/"),
@@ -117,6 +146,7 @@ class HubRuntimeConfig:
                 SK_SCENARIO_OS_INDEX, self.scenario_opensearch_index
             ),
             workload_redis_prefix=self.workload_redis_prefix,
+            trino_http_url=self.trino_http_url,
         )
 
     def is_default_cassandra(self, env_base: HubRuntimeConfig) -> bool:

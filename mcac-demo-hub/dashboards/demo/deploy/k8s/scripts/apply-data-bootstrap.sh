@@ -9,6 +9,9 @@ echo "Waiting for PostgreSQL primary..."
 echo "  (If this hangs: the primary pod is not Ready — usually Pending scheduling, image pull, or crash. In another terminal: kubectl get pods -n $NS; kubectl describe pod -n $NS -l app.kubernetes.io/name=postgresql-primary)"
 kubectl rollout status deployment/postgresql-primary -n "$NS" --timeout=420s
 
+echo "Waiting for logical subscriber postgres-sub..."
+kubectl rollout status deployment/postgres-sub -n "$NS" --timeout=420s
+
 echo "Waiting for Cassandra StatefulSet (rollout)..."
 echo "  (If this hangs: build MCAC init image first — chmod +x deploy/k8s/scripts/build-mcac-init-image.sh && ./deploy/k8s/scripts/build-mcac-init-image.sh; initContainer uses imagePullPolicy:Never + tag mcac-demo/mcac-init:local)"
 kubectl rollout status statefulset/cassandra -n "$NS" --timeout=600s
@@ -22,6 +25,11 @@ fi
 echo "Applying Postgres bootstrap Job..."
 kubectl apply -f "$GEN/45-postgres-bootstrap-job.yaml"
 kubectl wait --for=condition=complete job/postgres-demo-bootstrap -n "$NS" --timeout=3600s
+
+echo "Applying Postgres logical-subscriber bootstrap Job (demo role on postgres-sub)..."
+kubectl delete job postgres-sub-bootstrap -n "$NS" --ignore-not-found=true
+kubectl apply -f "$GEN/46-postgres-sub-bootstrap-job.yaml"
+kubectl wait --for=condition=complete job/postgres-sub-bootstrap -n "$NS" --timeout=600s
 
 echo "Applying Cassandra schema Job (targets cassandra-0 via headless DNS)..."
 kubectl delete job cassandra-demo-schema -n "$NS" --ignore-not-found=true
@@ -41,6 +49,7 @@ echo "Waiting for Kafka Connect (MSSQL connector registration)..."
 kubectl rollout status deployment/kafka-connect -n "$NS" --timeout=600s
 
 echo "Applying MSSQL schema + connector registration Job..."
+echo "  (Requires image mcac-demo/mssql-tools:22.04 — build: deploy/k8s/scripts/build-mssql-tools-image.sh)"
 kubectl delete job mssql-demo-bootstrap -n "$NS" --ignore-not-found=true
 kubectl apply -f "$GEN/62-mssql.yaml"
 kubectl wait --for=condition=complete job/mssql-demo-bootstrap -n "$NS" --timeout=3600s

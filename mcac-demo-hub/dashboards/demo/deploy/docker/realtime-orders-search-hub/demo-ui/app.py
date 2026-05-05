@@ -1,15 +1,19 @@
 """
 Browser UI + API: single-order ingest and configurable multi-DB workload generator.
 """
+import asyncio
+import decimal
 import json
 import os
+import re
 import secrets
+from urllib.parse import unquote, urlparse
 import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Any, Literal
 
 import httpx
 import psycopg
@@ -22,7 +26,12 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from pymongo import MongoClient
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.sessions import SessionMiddleware
+from trino.dbapi import connect as trino_connect
+from trino.exceptions import TrinoConnectionError, TrinoUserError
 
+import postgres_logical_demo as pg_logical
+import postgres_faker_schema as pg_faker_schema
+import postgres_schema_clone as pg_schema_clone
 import scenario
 from hub_config import (
     SK_CASSANDRA_HOSTS,
@@ -143,6 +152,142 @@ _cassandra_insert_prep = None
 ALLOWED_TARGETS = frozenset(
     {"postgres", "mongo", "redis", "cassandra", "opensearch", "mssql"}
 )
+
+TRINO_ALLOWED_CATALOGS = frozenset(
+    {"demo_pg", "demo_mongo", "demo_es", "demo_sqlserver", "memory"}
+)
+TRINO_ROW_CAP = max(1, min(2000, int(os.environ.get("TRINO_QUERY_ROW_CAP", "500"))))
+_TRINO_FORBIDDEN_KW = re.compile(
+    r"\b(INSERT|UPDATE|DELETE|MERGE|CREATE|DROP|ALTER|TRUNCATE|GRANT|REVOKE)\b",
+    re.I,
+)
+_TRINO_ALLOWED_START = re.compile(
+    r"^\s*(SELECT\b|WITH\b|SHOW\b|DESCRIBE\b|DESC\b|TABLE\b|EXPLAIN\b)",
+    re.I | re.DOTALL,
+)
+
+
+def _trino_sql_guard(sql: str) -> None:
+    core = sql.strip().rstrip(";").strip()
+    if not core:
+        raise HTTPException(status_code=400, detail="empty SQL")
+    parts = [p.strip() for p in sql.split(";") if p.strip()]
+    if len(parts) != 1:
+        raise HTTPException(
+            status_code=400, detail="exactly one SQL statement (no multiple ; chunks)",
+        )
+    if _TRINO_FORBIDDEN_KW.search(core):
+        raise HTTPException(
+            status_code=400,
+            detail="mutating SQL keywords are not allowed from this hub",
+        )
+    if not _TRINO_ALLOWED_START.match(core):
+        raise HTTPException(
+            status_code=400,
+            detail="only SELECT, WITH, SHOW, DESCRIBE, TABLE, or EXPLAIN …",
+        )
+
+
+def _trino_cell_json(v: Any) -> Any:
+    if v is None:
+        return None
+    if isinstance(v, decimal.Decimal):
+        return str(v)
+    if isinstance(v, datetime):
+        return v.isoformat()
+    if isinstance(v, (bytes, bytearray)):
+        return bytes(v).decode("utf-8", errors="replace")
+    if isinstance(v, (list, dict)):
+        return json.loads(json.dumps(v, default=str))
+    return v
+
+
+def _parse_trino_http(base: str) -> tuple[str, int, str]:
+    u = urlparse(base.strip())
+    if u.scheme not in ("http", "https") or not u.hostname:
+        raise HTTPException(
+            status_code=500,
+            detail="TRINO_HTTP must be like http://trino:8080",
+        )
+    host = u.hostname
+    assert host is not None
+    if u.port is not None:
+        port = u.port
+    else:
+        port = 443 if u.scheme == "https" else 8080
+    return host, port, u.scheme
+
+
+def _execute_trino_query(
+    cfg,
+    sql: str,
+    catalog: str | None,
+    schema: str | None,
+) -> dict[str, Any]:
+    if not (cfg.trino_http_url or "").strip():
+        raise HTTPException(
+            status_code=503,
+            detail="Trino not configured (TRINO_HTTP is empty). Kubernetes demo-hub sets it to http://trino:8080.",
+        )
+    cat = (catalog or "demo_pg").strip()
+    if cat not in TRINO_ALLOWED_CATALOGS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"catalog must be one of {sorted(TRINO_ALLOWED_CATALOGS)}",
+        )
+    sch_raw = (schema or "").strip()
+    sch = sch_raw or None
+    if sch is not None and not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", sch):
+        raise HTTPException(status_code=400, detail="invalid schema identifier")
+
+    host, port, scheme = _parse_trino_http(cfg.trino_http_url)
+    conn = trino_connect(
+        host=host,
+        port=port,
+        user="hub-demo-ui",
+        catalog=cat,
+        schema=sch,
+        http_scheme=scheme,
+        request_timeout=120.0,
+    )
+    try:
+        cur = conn.cursor()
+        cur.execute(sql)
+        cols = [d[0] for d in cur.description] if cur.description else []
+        truncated = False
+        rows: list[list[Any]] = []
+        while len(rows) < TRINO_ROW_CAP:
+            batch = cur.fetchmany(min(256, TRINO_ROW_CAP - len(rows)))
+            if not batch:
+                break
+            for r in batch:
+                rows.append([_trino_cell_json(c) for c in r])
+                if len(rows) >= TRINO_ROW_CAP:
+                    truncated = True
+                    break
+            if truncated:
+                break
+        if truncated:
+            while cur.fetchmany(512):
+                pass
+        return {
+            "ok": True,
+            "catalog": cat,
+            "schema": sch,
+            "columns": cols,
+            "rows": rows,
+            "row_count": len(rows),
+            "truncated": truncated,
+        }
+    except TrinoUserError as e:
+        raise HTTPException(status_code=400, detail=e.message) from e
+    except TrinoConnectionError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def _make_pad(payload_kb: int) -> str:
@@ -353,8 +498,19 @@ NAV = """
   <nav style="margin-bottom:1rem;font-size:0.95rem;">
     <a href="/">Single order</a> · <a href="/workload">Workload</a> ·
     <a href="/reads">Read-back</a> · <a href="/scenario">Scenario</a> ·
+    <a href="/postgres">Postgres</a> · <a href="/trino">Trino</a> ·
     <a href="/connections">External DBs</a>
   </nav>
+"""
+
+# Shown under main NAV on Postgres-specific pages (breadcrumb + sub-links).
+POSTGRES_BAR = """
+  <div style="margin:0 0 1rem;font-size:0.88rem;color:#8899a6;line-height:1.5;">
+    <span style="color:#71767b">Postgres hub</span>
+    · <a href="/postgres">Overview</a>
+    · <a href="/postgres/logical">Logical replication</a>
+    · <a href="/postgres/faker-schema">Faker schema objects</a>
+  </div>
 """
 
 PAGE = f"""<!DOCTYPE html>
@@ -1274,6 +1430,1281 @@ CONNECTIONS_PAGE = f"""<!DOCTYPE html>
 """
 
 
+TRINO_PAGE = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Trino SQL — hub demo</title>
+  <style>
+    :root {{ font-family: ui-sans-serif, system-ui, sans-serif; background: #0f1419; color: #e7e9ea; }}
+    body {{ max-width: 52rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }}
+    a {{ color: #6cb5f4; }}
+    h1 {{ font-size: 1.35rem; font-weight: 600; }}
+    p.note {{ color: #8899a6; font-size: 0.9rem; }}
+    label {{ display: block; margin: 0.5rem 0 0.25rem; font-size: 0.85rem; color: #c8d0d8; }}
+    select, textarea {{
+      width: 100%; box-sizing: border-box; border-radius: 8px;
+      border: 1px solid #38444d; background: #16181c; color: #e7e9ea;
+      font-family: ui-monospace, monospace; font-size: 0.82rem;
+    }}
+    textarea {{ min-height: 9rem; padding: 0.65rem; resize: vertical; }}
+    select {{ padding: 0.45rem 0.5rem; }}
+    button {{
+      background: #1d9bf0; color: #fff; border: 0; border-radius: 9999px;
+      padding: 0.55rem 1.2rem; font-size: 0.95rem; font-weight: 600; cursor: pointer; margin-top: 0.85rem;
+    }}
+    button:disabled {{ opacity: 0.5; cursor: not-allowed; }}
+    #status {{ margin-top: 0.75rem; font-size: 0.9rem; }}
+    #status.ok {{ color: #7af87a; }}
+    #status.err {{ color: #f66; }}
+    pre {{ background: #16181c; border: 1px solid #2f3336; border-radius: 8px; padding: 1rem; overflow: auto; font-size: 0.76rem; }}
+  </style>
+</head>
+<body>
+  {NAV}
+  <h1>Trino (federated SQL)</h1>
+  <p class="note">Kubernetes stacks expose catalogs <code>demo_pg</code>, <code>demo_mongo</code>,
+    <code>demo_es</code> (OpenSearch via Elasticsearch connector), <code>demo_sqlserver</code>, and <code>memory</code>.
+    The hub only allows read-only statements (<code>SELECT</code>, <code>SHOW</code>, <code>DESCRIBE</code>, …).
+    Set env <code>TRINO_HTTP</code> (empty in plain Docker Compose unless you add Trino).</p>
+  <label>Catalog</label>
+  <select id="catalog">
+    <option value="demo_pg">demo_pg (Postgres)</option>
+    <option value="demo_mongo">demo_mongo</option>
+    <option value="demo_es">demo_es</option>
+    <option value="demo_sqlserver">demo_sqlserver</option>
+    <option value="memory">memory</option>
+  </select>
+  <label>Schema <span style="color:#71767b">(optional, e.g. public)</span></label>
+  <input id="schema" type="text" placeholder="public" autocomplete="off"
+    style="width:100%;box-sizing:border-box;padding:0.45rem 0.55rem;border-radius:8px;border:1px solid #38444d;background:#16181c;color:#e7e9ea;font-family:ui-monospace,monospace;font-size:0.82rem;"/>
+  <label>SQL</label>
+  <textarea id="sql" spellcheck="false">SELECT table_schema, table_name FROM demo_pg.information_schema.tables WHERE table_schema NOT IN ('pg_catalog','information_schema') ORDER BY 1,2 LIMIT 30</textarea>
+  <button type="button" id="run">Run</button>
+  <p id="status"></p>
+  <pre id="out">Results appear here.</pre>
+  <script>
+    document.getElementById("run").onclick = async () => {{
+      const st = document.getElementById("status");
+      const out = document.getElementById("out");
+      const sql = document.getElementById("sql").value;
+      const catalog = document.getElementById("catalog").value;
+      const schema = document.getElementById("schema").value.trim();
+      st.textContent = "Running…";
+      st.className = "";
+      out.textContent = "";
+      try {{
+        const r = await fetch("/api/trino/query", {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{ sql, catalog, schema: schema || null }}),
+        }});
+        const data = await r.json().catch(() => ({{ detail: r.statusText }}));
+        if (!r.ok) {{
+          st.textContent = data.detail || r.statusText;
+          st.className = "err";
+          out.textContent = JSON.stringify(data, null, 2);
+          return;
+        }}
+        st.textContent = data.truncated ? `OK (${{data.row_count}} rows, truncated)` : `OK (${{data.row_count}} rows)`;
+        st.className = "ok";
+        out.textContent = JSON.stringify(data, null, 2);
+      }} catch (e) {{
+        st.textContent = String(e);
+        st.className = "err";
+      }}
+    }};
+  </script>
+</body>
+</html>
+"""
+
+
+POSTGRES_LANDING_PAGE = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Postgres — hub demo</title>
+  <style>
+    :root {{ font-family: ui-sans-serif, system-ui, sans-serif; background: #0f1419; color: #e7e9ea; }}
+    body {{ max-width: 48rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.55; }}
+    a {{ color: #6cb5f4; }}
+    h1 {{ font-size: 1.4rem; font-weight: 600; margin-bottom: 0.35rem; }}
+    p.lead {{ color: #8899a6; font-size: 0.95rem; margin: 0 0 1.25rem; }}
+    .tiles {{ display: grid; gap: 1rem; grid-template-columns: 1fr; }}
+    @media (min-width: 560px) {{ .tiles {{ grid-template-columns: 1fr 1fr; }} }}
+    .tile {{
+      display: block; padding: 1rem 1.15rem; border-radius: 12px;
+      border: 1px solid #38444d; background: #16181c; text-decoration: none; color: inherit;
+      transition: border-color 0.15s ease, background 0.15s ease;
+    }}
+    .tile:hover {{ border-color: #6cb5f4; background: #1a1f26; }}
+    .tile h2 {{ font-size: 1.05rem; margin: 0 0 0.35rem; color: #e7e9ea; }}
+    .tile p {{ margin: 0; font-size: 0.88rem; color: #8899a6; line-height: 1.45; }}
+    .tile .tag {{ display: inline-block; margin-top: 0.65rem; font-size: 0.72rem; letter-spacing: 0.03em;
+      text-transform: uppercase; color: #6cb5f4; }}
+    ul.more {{ margin: 1.5rem 0 0; padding-left: 1.15rem; color: #8899a6; font-size: 0.9rem; }}
+    ul.more li {{ margin: 0.35rem 0; }}
+    code {{ font-size: 0.88em; background: #252a30; padding: 0.1em 0.35em; border-radius: 4px; }}
+  </style>
+</head>
+<body>
+  {NAV}
+  <h1>Postgres</h1>
+  <p class="lead">Demos and shortcuts that only involve PostgreSQL in this stack (HA primary + replicas, Debezium elsewhere on <code>demo</code>).</p>
+  <div class="tiles">
+    <a class="tile" href="/postgres/logical">
+      <h2>Logical replication</h2>
+      <p>Publisher on <code>postgresql-primary</code> (<code>demo_logical_pub</code>), subscriber on <code>postgres-sub</code>
+        (<code>demo_logical_sub</code>); streaming replicas follow the primary only. Browser inserts + optional replica publisher counts.</p>
+      <span class="tag">Publisher / subscriber</span>
+    </a>
+    <a class="tile" href="/scenario/data/postgres">
+      <h2>Scenario · Postgres data</h2>
+      <p>Peek at relational mirror + orders + fulfillment tables populated by the multi-DB scenario pipeline.</p>
+      <span class="tag">Read-only JSON</span>
+    </a>
+    <a class="tile" href="/postgres/faker-schema">
+      <h2>Faker · Schema objects</h2>
+      <p>Create templated tables, sequences, views, materialized views, SQL functions, and procedures — names/layout driven by Faker presets on <code>demo_logical_pub</code> or <code>demo_logical_sub</code>.</p>
+      <span class="tag">DDL playground</span>
+    </a>
+  </div>
+  <ul class="more">
+    <li><a href="/">Single order</a> — writes <code>demo_items</code> (plus other backends).</li>
+    <li><a href="/workload">Workload</a> — batch load <code>demo_items</code> when Postgres is selected.</li>
+    <li><a href="/reads">Read-back</a> — sample workload rows from Postgres among other stores.</li>
+    <li><a href="/connections">External DBs</a> — session override for <code>POSTGRES_DSN</code>.</li>
+  </ul>
+</body>
+</html>
+"""
+
+
+POSTGRES_FAKER_SCHEMA_PAGE = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Postgres — Faker schema objects</title>
+  <style>
+    :root {{ font-family: ui-sans-serif, system-ui, sans-serif; background: #0f1419; color: #e7e9ea; }}
+    body {{ max-width: 46rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.55; }}
+    a {{ color: #6cb5f4; }}
+    h1 {{ font-size: 1.35rem; font-weight: 600; }}
+    p.note {{ color: #8899a6; font-size: 0.9rem; }}
+    label {{ display: block; margin: 0.65rem 0 0.25rem; font-size: 0.85rem; color: #8899a6; }}
+    input[type="number"] {{
+      width: 4.5rem; padding: 0.35rem 0.4rem; border-radius: 6px;
+      border: 1px solid #38444d; background: #16181c; color: #e7e9ea;
+    }}
+    select {{
+      max-width: 28rem; padding: 0.45rem; border-radius: 6px;
+      border: 1px solid #38444d; background: #16181c; color: #e7e9ea;
+    }}
+    button {{
+      background: #1d9bf0; color: #fff; border: 0; border-radius: 9999px;
+      padding: 0.55rem 1.15rem; font-size: 0.95rem; font-weight: 600; cursor: pointer; margin-top: 1rem;
+    }}
+    button.secondary {{ background: #38444d; }}
+    pre {{
+      background: #16181c; border: 1px solid #2f3336; border-radius: 8px;
+      padding: 1rem; overflow: auto; font-size: 0.78rem; max-height: 28rem; white-space: pre-wrap;
+    }}
+    .ok {{ color: #7af87a; }} .err {{ color: #f66; }}
+    #st {{ margin-top: 0.75rem; font-size: 0.9rem; }}
+    .grid {{
+      display: grid; gap: 0.35rem 1.25rem; grid-template-columns: 1fr auto;
+      align-items: center; max-width: 28rem; margin-top: 0.35rem;
+    }}
+    .grid label {{ margin: 0; }}
+    code {{ font-size: 0.88em; background: #252a30; padding: 0.08em 0.32em; border-radius: 4px; }}
+    hr.sep {{ border: 0; border-top: 1px solid #2f3336; margin: 1.35rem 0; }}
+    h2.sec {{ font-size: 1.05rem; font-weight: 600; margin: 0 0 0.35rem; }}
+    textarea.input-lg {{
+      width: 100%; max-width: 36rem; min-height: 6.5rem; padding: 0.45rem; border-radius: 6px;
+      border: 1px solid #38444d; background: #16181c; color: #e7e9ea;
+      font-family: ui-monospace, monospace; font-size: 0.78rem; box-sizing: border-box;
+    }}
+    input[type="text"].tbl-name {{
+      width: 100%; max-width: 28rem; padding: 0.4rem 0.45rem; border-radius: 6px;
+      border: 1px solid #38444d; background: #16181c; color: #e7e9ea; box-sizing: border-box;
+    }}
+    .chk-row {{ margin: 0.45rem 0; font-size: 0.88rem; color: #e7e9ea; }}
+    .chk-row input {{ margin-right: 0.35rem; vertical-align: middle; }}
+    .faker-row {{
+      display: flex; flex-wrap: wrap; gap: 0.65rem 1rem; align-items: flex-end;
+    }}
+    .faker-row label {{ margin: 0; font-size: 0.82rem; color: #8899a6; }}
+    .faker-row input[type="number"] {{
+      width: 5.25rem; padding: 0.35rem 0.4rem; border-radius: 6px;
+      border: 1px solid #38444d; background: #16181c; color: #e7e9ea; box-sizing: border-box;
+    }}
+  </style>
+</head>
+<body>
+  {NAV}
+  {POSTGRES_BAR}
+  <h1>Faker-driven schema objects</h1>
+  <p class="note"><strong>Quick bundle:</strong> preset tables + sequences/views/MVs/functions/procedures.
+    <strong>Custom table:</strong> define column types in JSON, optional <code>UNIQUE</code> groups and <code>FOREIGN KEY</code>s (reference existing tables). <strong>Faker inserts:</strong> generate sample rows into the selected DB using the demo user.</p>
+  <p class="note">Runs as the hub admin connection for DDL and <code>demo</code> for inserts. Objects use random names where noted and <strong>accumulate</strong> across runs (no drop).</p>
+  <p class="note">Logical replication is unaffected unless you add new tables to your publication yourself.</p>
+  <label for="fsDb">Database</label>
+  <select id="fsDb" aria-label="Target database">
+    <option value="demo_logical_pub">demo_logical_pub (publisher primary)</option>
+    <option value="demo_logical_sub">demo_logical_sub (logical subscriber)</option>
+  </select>
+  <label for="fsPreset">Table preset (when tables &gt; 0)</label>
+  <select id="fsPreset">
+    <option value="mixed">mixed</option>
+    <option value="people">people</option>
+    <option value="commerce">commerce</option>
+  </select>
+  <label for="fsSeed">Seed (optional, tables only)</label>
+  <input type="number" id="fsSeed" placeholder="random" style="max-width:10rem"/>
+  <p class="note" style="margin-top:1rem;margin-bottom:0.25rem">How many objects to create this run (caps enforced server-side):</p>
+  <div class="grid">
+    <label for="fsTables">Tables</label><input type="number" id="fsTables" min="0" max="3" value="1"/>
+    <label for="fsSeq">Sequences</label><input type="number" id="fsSeq" min="0" max="6" value="0"/>
+    <label for="fsViews">Views</label><input type="number" id="fsViews" min="0" max="4" value="0"/>
+    <label for="fsMv">Materialized views</label><input type="number" id="fsMv" min="0" max="3" value="0"/>
+    <label for="fsFn">Functions (SQL)</label><input type="number" id="fsFn" min="0" max="4" value="0"/>
+    <label for="fsProc">Procedures (plpgsql)</label><input type="number" id="fsProc" min="0" max="4" value="0"/>
+  </div>
+  <button type="button" id="fsApply">Create quick bundle</button>
+
+  <hr class="sep"/>
+  <h2 class="sec">Multi-schema tables (readable names)</h2>
+  <p class="note">Uses the <strong>Database</strong> and <strong>Table preset</strong> above. Creates each schema if missing, then adds <code>tables_per_schema</code> Faker tables per schema (names like <code>phrase_company_sales_ab12</code>, capped at 63 chars). Duplicates in the list are ignored. Server caps: 8 schemas, 4 tables per schema.</p>
+  <label for="fsMultiSchemas">Schema names (one per line)</label>
+  <textarea id="fsMultiSchemas" class="input-lg" spellcheck="false">sales
+inventory</textarea>
+  <div class="faker-row" style="margin-top:0.5rem">
+    <label>Tables per schema<br/><input type="number" id="fsMultiTps" min="1" max="4" value="1"/></label>
+    <button type="button" class="secondary" id="fsMultiApply">Create multi-schema tables</button>
+  </div>
+
+  <hr class="sep"/>
+  <h2 class="sec">Clone / export schema (DDL for another cluster)</h2>
+  <p class="note">Uses the <strong>hub admin</strong> connection to read <code>pg_catalog</code> and emit a SQL script: schema, sequences, tables (dependency order when possible), constraints, optional views/MVs/functions/procedures. Copy and run on a target cluster after reviewing extensions, roles, and cross-schema FKs. Empty table list = whole schema; tables-only export skips views/MVs (they often reference other tables).</p>
+  <label for="fsCloneSch">Schema to export</label>
+  <input type="text" class="tbl-name" id="fsCloneSch" value="public" maxlength="63" autocomplete="off"/>
+  <label for="fsCloneTbls">Tables (optional — comma or newline separated; leave empty for all base tables)</label>
+  <textarea id="fsCloneTbls" class="input-lg" spellcheck="false" style="min-height:4rem" placeholder="e.g. parents, line_items"></textarea>
+  <div class="chk-row"><label><input type="checkbox" id="fsCloneSeq" checked/> Sequences</label></div>
+  <div class="chk-row"><label><input type="checkbox" id="fsCloneTbl" checked/> Tables</label></div>
+  <div class="chk-row"><label><input type="checkbox" id="fsCloneVw" checked/> Views</label></div>
+  <div class="chk-row"><label><input type="checkbox" id="fsCloneMv" checked/> Materialized views</label></div>
+  <div class="chk-row"><label><input type="checkbox" id="fsCloneFn" checked/> Functions</label></div>
+  <div class="chk-row"><label><input type="checkbox" id="fsCloneProc" checked/> Procedures</label></div>
+  <div class="chk-row"><label><input type="checkbox" id="fsCloneGrants"/> Table grants (demo-specific roles)</label></div>
+  <div class="faker-row" style="margin-top:0.5rem">
+    <button type="button" class="secondary" id="fsCloneExport">Generate clone SQL</button>
+    <button type="button" class="secondary" id="fsCloneCopy">Copy SQL to clipboard</button>
+  </div>
+  <label for="fsCloneSqlOut">Generated SQL</label>
+  <textarea id="fsCloneSqlOut" class="input-lg" spellcheck="false" readonly style="min-height:14rem;opacity:0.95" placeholder="Export appears here…"></textarea>
+
+  <hr class="sep"/>
+  <h2 class="sec">Custom table — column types + PK / UNIQUE / FK</h2>
+  <p class="note">Uses the same whitelisted types as logical replication: <code>TEXT</code>, <code>INTEGER</code>, <code>BIGINT</code>, <code>BOOLEAN</code>, <code>NUMERIC</code>, <code>DOUBLE PRECISION</code>, <code>TIMESTAMPTZ</code>.
+    <strong>PK</strong> defaults to <code>BIGSERIAL id</code> when enabled. <strong>FK</strong> targets must already exist in the chosen database (create parent table first). Default schema is <code>public</code>; optional <code>ref_schema</code> on each FK (defaults to <code>public</code>).</p>
+  <label for="fsCustSch">Schema</label>
+  <input type="text" class="tbl-name" id="fsCustSch" value="public" maxlength="63" autocomplete="off"/>
+  <label for="fsCustTbl">Table name</label>
+  <input type="text" class="tbl-name" id="fsCustTbl" placeholder="e.g. line_items" maxlength="63" autocomplete="off"/>
+  <div class="chk-row"><label><input type="checkbox" id="fsCustPk" checked/> <code>BIGSERIAL</code> surrogate primary key (<code>id</code>)</label></div>
+  <div class="chk-row"><label><input type="checkbox" id="fsCustRif"/> <code>REPLICA IDENTITY FULL</code></label></div>
+  <label for="fsCustCols">Columns JSON</label>
+  <textarea id="fsCustCols" class="input-lg" spellcheck="false">[
+  {{"name": "sku", "pg_type": "TEXT", "not_null": true}},
+  {{"name": "qty", "pg_type": "INTEGER", "not_null": false}},
+  {{"name": "parent_id", "pg_type": "BIGINT", "not_null": false}}
+]</textarea>
+  <label for="fsCustUq"><code>UNIQUE</code> constraints (JSON array of column lists)</label>
+  <textarea id="fsCustUq" class="input-lg" spellcheck="false">[
+  ["sku"]
+]</textarea>
+  <label for="fsCustFk"><code>FOREIGN KEY</code> definitions (JSON array)</label>
+  <textarea id="fsCustFk" class="input-lg" spellcheck="false">[]</textarea>
+  <p class="note" style="margin-top:0.25rem">FK example (parent <code>parents</code> with <code>id</code> in <code>public</code>): <code>[{{"columns":["parent_id"],"ref_schema":"public","ref_table":"parents","ref_columns":["id"]}}]</code></p>
+  <button type="button" class="secondary" id="fsCustApply">Create custom table</button>
+
+  <hr class="sep"/>
+  <h2 class="sec">Faker inserts (demo role)</h2>
+  <p class="note"><strong>Manual columns:</strong> Columns JSON drives value shapes; omit <code>id</code> when using <code>BIGSERIAL</code>.
+    <strong>Catalog mode:</strong> the hub reads the table from Postgres, discovers outgoing foreign keys, pulls matching keys from referenced tables (existing rows or auto-seeded parents), and Faker-fills only the remaining writable columns.</p>
+  <div class="chk-row"><label><input type="checkbox" id="fsInsCatalog"/> Use live catalog (<code>information_schema</code>) — FK-aware; Columns JSON ignored</label></div>
+  <div class="chk-row"><label><input type="checkbox" id="fsInsEnsureParents" checked/> In catalog mode: insert minimal rows into empty referenced tables (recursive)</label></div>
+  <button type="button" class="secondary" id="fsInsPreview">Preview columns + FKs</button>
+  <label for="fsInsSch">Schema</label>
+  <input type="text" class="tbl-name" id="fsInsSch" value="public" maxlength="63" autocomplete="off"/>
+  <label for="fsInsTbl">Table name</label>
+  <input type="text" class="tbl-name" id="fsInsTbl" placeholder="same as custom table" maxlength="63" autocomplete="off"/>
+  <label for="fsInsCols">Columns JSON (for Faker value shapes)</label>
+  <textarea id="fsInsCols" class="input-lg" spellcheck="false">[
+  {{"name": "sku", "pg_type": "TEXT", "not_null": true}},
+  {{"name": "qty", "pg_type": "INTEGER", "not_null": false}}
+]</textarea>
+  <div class="faker-row" style="margin-top:0.5rem">
+    <label># rows<br/><input type="number" id="fsInsRows" min="1" max="80" value="8"/></label>
+    <label>Seed<br/><input type="number" id="fsInsSeed" placeholder="random"/></label>
+    <button type="button" class="secondary" id="fsFakerIns">Insert Faker rows</button>
+  </div>
+
+  <p id="st"></p>
+  <pre id="fsOut">{{}}</pre>
+  <script>
+    const st = document.getElementById("st");
+    const fsOut = document.getElementById("fsOut");
+    async function j(method, url, body) {{
+      const opt = {{ method, headers: {{}} }};
+      if (body !== undefined) {{
+        opt.headers["Content-Type"] = "application/json";
+        opt.body = JSON.stringify(body);
+      }}
+      const r = await fetch(url, opt);
+      const data = await r.json().catch(() => ({{ detail: r.statusText }}));
+      return {{ r, data }};
+    }}
+    document.getElementById("fsApply").addEventListener("click", async () => {{
+      const body = {{
+        database: document.getElementById("fsDb").value,
+        preset: document.getElementById("fsPreset").value,
+        tables: Number(document.getElementById("fsTables").value),
+        sequences: Number(document.getElementById("fsSeq").value),
+        views: Number(document.getElementById("fsViews").value),
+        materialized_views: Number(document.getElementById("fsMv").value),
+        functions: Number(document.getElementById("fsFn").value),
+        procedures: Number(document.getElementById("fsProc").value),
+      }};
+      const rawSeed = document.getElementById("fsSeed").value.trim();
+      if (rawSeed !== "") {{
+        const n = Number(rawSeed);
+        if (!Number.isFinite(n)) {{
+          st.textContent = "Seed must be empty or a number.";
+          st.className = "err";
+          return;
+        }}
+        body.seed = Math.trunc(n);
+      }}
+      st.textContent = "Applying…";
+      st.className = "";
+      const {{ r, data }} = await j("POST", "/api/postgres/faker-schema/apply", body);
+      fsOut.textContent = JSON.stringify(data, null, 2);
+      const ok = r.ok && data && data.ok === true;
+      st.textContent = ok ? "Done." : "Failed — see JSON.";
+      st.className = ok ? "ok" : "err";
+    }});
+    document.getElementById("fsMultiApply").addEventListener("click", async () => {{
+      const raw = document.getElementById("fsMultiSchemas").value.trim();
+      const schemas = raw.split(/\\r?\\n/).map((s) => s.trim()).filter(Boolean);
+      if (schemas.length === 0) {{
+        st.textContent = "Enter at least one schema name (one per line).";
+        st.className = "err";
+        return;
+      }}
+      if (schemas.length > 8) {{
+        st.textContent = "At most 8 schema names.";
+        st.className = "err";
+        return;
+      }}
+      const body = {{
+        database: document.getElementById("fsDb").value,
+        preset: document.getElementById("fsPreset").value,
+        schemas,
+        tables_per_schema: Number(document.getElementById("fsMultiTps").value),
+      }};
+      if (!fsAppendSeed(body, document.getElementById("fsSeed"))) return;
+      st.textContent = "Creating multi-schema tables…";
+      st.className = "";
+      const {{ r, data }} = await j("POST", "/api/postgres/faker-schema/multi-schema-tables", body);
+      fsOut.textContent = JSON.stringify(data, null, 2);
+      const ok = r.ok && data && data.ok === true;
+      st.textContent = ok ? "Multi-schema tables OK." : "Multi-schema failed — see JSON.";
+      st.className = ok ? "ok" : "err";
+    }});
+    function fsParseTableNames(raw) {{
+      const parts = String(raw || "").split(/[\\n,]+/).map((s) => s.trim()).filter(Boolean);
+      return parts.length ? parts : null;
+    }}
+    document.getElementById("fsCloneExport").addEventListener("click", async () => {{
+      const schema_name = document.getElementById("fsCloneSch").value.trim() || "public";
+      const table_names = fsParseTableNames(document.getElementById("fsCloneTbls").value);
+      const body = {{
+        database: document.getElementById("fsDb").value,
+        schema_name,
+        table_names,
+        include_sequences: document.getElementById("fsCloneSeq").checked,
+        include_tables: document.getElementById("fsCloneTbl").checked,
+        include_views: document.getElementById("fsCloneVw").checked,
+        include_materialized_views: document.getElementById("fsCloneMv").checked,
+        include_functions: document.getElementById("fsCloneFn").checked,
+        include_procedures: document.getElementById("fsCloneProc").checked,
+        include_grants: document.getElementById("fsCloneGrants").checked,
+      }};
+      st.textContent = "Generating clone SQL…";
+      st.className = "";
+      const sqlEl = document.getElementById("fsCloneSqlOut");
+      const {{ r, data }} = await j("POST", "/api/postgres/faker-schema/clone-export", body);
+      const ok = r.ok && data && data.ok === true && data.sql;
+      if (ok) {{
+        sqlEl.value = data.sql;
+        const summary = {{ ...data }};
+        delete summary.sql;
+        fsOut.textContent = JSON.stringify(summary, null, 2);
+        st.textContent = "Clone SQL ready — large script is in the textarea; metadata below.";
+        st.className = "ok";
+      }} else {{
+        sqlEl.value = "";
+        fsOut.textContent = JSON.stringify(data, null, 2);
+        st.textContent = "Clone export failed — see JSON.";
+        st.className = "err";
+      }}
+    }});
+    document.getElementById("fsCloneCopy").addEventListener("click", async () => {{
+      const t = document.getElementById("fsCloneSqlOut").value;
+      if (!t) {{
+        st.textContent = "Generate SQL first.";
+        st.className = "err";
+        return;
+      }}
+      try {{
+        await navigator.clipboard.writeText(t);
+        st.textContent = "SQL copied to clipboard.";
+        st.className = "ok";
+      }} catch (e) {{
+        st.textContent = "Clipboard unavailable — select the SQL textarea manually.";
+        st.className = "err";
+      }}
+    }});
+    function fsAppendSeed(body, el) {{
+      const raw = el.value.trim();
+      if (raw === "") return true;
+      const n = Number(raw);
+      if (!Number.isFinite(n)) {{
+        st.textContent = "Seed must be empty or a number.";
+        st.className = "err";
+        return false;
+      }}
+      body.seed = Math.trunc(n);
+      return true;
+    }}
+    document.getElementById("fsCustApply").addEventListener("click", async () => {{
+      const table_name = document.getElementById("fsCustTbl").value.trim();
+      let columns, unique_constraints, foreign_keys;
+      try {{
+        columns = JSON.parse(document.getElementById("fsCustCols").value);
+        unique_constraints = JSON.parse(document.getElementById("fsCustUq").value);
+        foreign_keys = JSON.parse(document.getElementById("fsCustFk").value);
+      }} catch (e) {{
+        st.textContent = "Custom table JSON parse error: " + e;
+        st.className = "err";
+        return;
+      }}
+      if (!Array.isArray(columns)) {{
+        st.textContent = "Columns JSON must be an array.";
+        st.className = "err";
+        return;
+      }}
+      if (!Array.isArray(unique_constraints)) {{
+        st.textContent = "UNIQUE constraints must be a JSON array.";
+        st.className = "err";
+        return;
+      }}
+      if (!Array.isArray(foreign_keys)) {{
+        st.textContent = "FK definitions must be a JSON array.";
+        st.className = "err";
+        return;
+      }}
+      const body = {{
+        database: document.getElementById("fsDb").value,
+        schema_name: (document.getElementById("fsCustSch").value.trim() || "public"),
+        table_name,
+        columns,
+        include_bigserial_pk: document.getElementById("fsCustPk").checked,
+        replica_identity_full: document.getElementById("fsCustRif").checked,
+        unique_constraints,
+        foreign_keys,
+      }};
+      st.textContent = "Creating custom table…";
+      st.className = "";
+      const {{ r, data }} = await j("POST", "/api/postgres/faker-schema/custom-table", body);
+      fsOut.textContent = JSON.stringify(data, null, 2);
+      const ok = r.ok && data && data.ok === true;
+      st.textContent = ok ? "Custom table OK." : "Custom table failed — see JSON.";
+      st.className = ok ? "ok" : "err";
+      if (ok && table_name) {{
+        document.getElementById("fsInsTbl").value = table_name;
+        document.getElementById("fsInsSch").value = (document.getElementById("fsCustSch").value.trim() || "public");
+        document.getElementById("fsInsCols").value = document.getElementById("fsCustCols").value;
+      }}
+    }});
+    document.getElementById("fsInsPreview").addEventListener("click", async () => {{
+      const table_name = document.getElementById("fsInsTbl").value.trim();
+      if (!table_name) {{
+        st.textContent = "Table name required for catalog preview.";
+        st.className = "err";
+        return;
+      }}
+      const body = {{
+        database: document.getElementById("fsDb").value,
+        schema_name: (document.getElementById("fsInsSch").value.trim() || "public"),
+        table_name,
+      }};
+      st.textContent = "Loading catalog…";
+      st.className = "";
+      const {{ r, data }} = await j("POST", "/api/postgres/faker-schema/table-catalog", body);
+      fsOut.textContent = JSON.stringify(data, null, 2);
+      const ok = r.ok && data && data.ok === true;
+      st.textContent = ok ? "Catalog loaded." : "Catalog preview failed — see JSON.";
+      st.className = ok ? "ok" : "err";
+    }});
+    document.getElementById("fsFakerIns").addEventListener("click", async () => {{
+      const table_name = document.getElementById("fsInsTbl").value.trim();
+      const from_catalog = document.getElementById("fsInsCatalog").checked;
+      let columns = [];
+      if (!from_catalog) {{
+        try {{
+          columns = JSON.parse(document.getElementById("fsInsCols").value);
+        }} catch (e) {{
+          st.textContent = "Insert columns JSON parse error: " + e;
+          st.className = "err";
+          return;
+        }}
+        if (!Array.isArray(columns) || columns.length === 0) {{
+          st.textContent = "Insert columns must be a non-empty array (or enable catalog mode).";
+          st.className = "err";
+          return;
+        }}
+      }}
+      const body = {{
+        database: document.getElementById("fsDb").value,
+        schema_name: (document.getElementById("fsInsSch").value.trim() || "public"),
+        table_name,
+        row_count: Number(document.getElementById("fsInsRows").value),
+        from_catalog,
+        ensure_parent_rows: document.getElementById("fsInsEnsureParents").checked,
+      }};
+      if (!from_catalog) body.columns = columns;
+      if (!fsAppendSeed(body, document.getElementById("fsInsSeed"))) return;
+      st.textContent = "Inserting Faker rows…";
+      st.className = "";
+      const {{ r, data }} = await j("POST", "/api/postgres/faker-schema/faker-insert", body);
+      fsOut.textContent = JSON.stringify(data, null, 2);
+      const ok = r.ok && data && data.ok === true;
+      st.textContent = ok ? "Faker insert OK." : "Faker insert failed — see JSON.";
+      st.className = ok ? "ok" : "err";
+    }});
+  </script>
+</body>
+</html>
+"""
+
+
+POSTGRES_LOGICAL_PAGE = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Postgres logical replication — hub demo</title>
+  <style>
+    :root {{ font-family: ui-sans-serif, system-ui, sans-serif; background: #0f1419; color: #e7e9ea; }}
+    body {{ max-width: 46rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.55; }}
+    a {{ color: #6cb5f4; }}
+    h1 {{ font-size: 1.35rem; font-weight: 600; }}
+    p.note {{ color: #8899a6; font-size: 0.9rem; }}
+    label {{ display: block; margin: 0.75rem 0 0.25rem; font-size: 0.88rem; color: #8899a6; }}
+    input[type="text"] {{
+      width: 100%; max-width: 28rem; padding: 0.45rem; border-radius: 6px;
+      border: 1px solid #38444d; background: #16181c; color: #e7e9ea; box-sizing: border-box;
+    }}
+    button {{
+      background: #1d9bf0; color: #fff; border: 0; border-radius: 9999px;
+      padding: 0.55rem 1.15rem; font-size: 0.95rem; font-weight: 600; cursor: pointer; margin: 0.35rem 0.5rem 0 0;
+    }}
+    button.secondary {{ background: #38444d; }}
+    button:disabled {{ opacity: 0.5; cursor: not-allowed; }}
+    pre {{
+      background: #16181c; border: 1px solid #2f3336; border-radius: 8px;
+      padding: 1rem; overflow: auto; font-size: 0.78rem; max-height: 28rem; white-space: pre-wrap;
+    }}
+    .ok {{ color: #7af87a; }} .err {{ color: #f66; }}
+    #st {{ margin-top: 0.75rem; font-size: 0.9rem; }}
+    h2.sec {{ font-size: 1.05rem; font-weight: 600; margin: 1.5rem 0 0.35rem; }}
+    hr.sep {{ border: 0; border-top: 1px solid #2f3336; margin: 1.5rem 0; }}
+    textarea.input-lg {{
+      width: 100%; max-width: 36rem; min-height: 7rem; padding: 0.45rem; border-radius: 6px;
+      border: 1px solid #38444d; background: #16181c; color: #e7e9ea;
+      font-family: ui-monospace, monospace; font-size: 0.78rem; box-sizing: border-box;
+    }}
+    select {{
+      display: block; max-width: 28rem; padding: 0.45rem; border-radius: 6px;
+      border: 1px solid #38444d; background: #16181c; color: #e7e9ea;
+    }}
+    .hint-toolbar {{ display: flex; flex-wrap: wrap; gap: 0.35rem; align-items: center; margin: 0.35rem 0 0.5rem; }}
+    button.info-icon {{
+      cursor: help; border: 1px solid #38444d; background: #16181c; color: #6cb5f4;
+      border-radius: 9999px; width: 1.65rem; height: 1.65rem; padding: 0; font-size: 0.95rem;
+      line-height: 1; margin: 0 0.15rem 0 0; font-weight: 600;
+    }}
+    .hint-pop {{
+      display: none; font-size: 0.82rem; color: #c8cdd2; margin: 0 0 0.85rem;
+      padding: 0.55rem 0.65rem; border-left: 3px solid #38444d; background: #16181c; border-radius: 0 6px 6px 0;
+    }}
+    .hint-pop.open {{ display: block; }}
+    .chk-row {{ margin: 0.5rem 0; font-size: 0.88rem; color: #e7e9ea; }}
+    .chk-row input {{ margin-right: 0.35rem; vertical-align: middle; }}
+    .faker-row {{
+      display: flex; flex-wrap: wrap; gap: 0.65rem 1rem; align-items: flex-end;
+      margin: 0.25rem 0 0.65rem;
+    }}
+    .faker-row label {{ margin: 0; font-size: 0.82rem; color: #8899a6; }}
+    .faker-row input[type="number"] {{
+      width: 5.25rem; padding: 0.35rem 0.4rem; border-radius: 6px;
+      border: 1px solid #38444d; background: #16181c; color: #e7e9ea; box-sizing: border-box;
+    }}
+  </style>
+</head>
+<body>
+  {NAV}
+  {POSTGRES_BAR}
+  <h1>PostgreSQL logical replication</h1>
+  <p class="note"><strong>Publisher</strong> database <code>demo_logical_pub</code> lives on <code>postgresql-primary</code>;
+    <strong>subscriber</strong> database <code>demo_logical_sub</code> on <code>postgres-sub</code> (logical subscription pulls from the primary).
+    <code>postgresql-replica-*</code> are physical standbys of the primary only (they replicate <code>demo_logical_pub</code>, not <code>demo_logical_sub</code>).
+    Optional <code>POSTGRES_REPLICA_READ_DSN</code> should target database <code>demo_logical_pub</code> on a replica to compare publisher row counts vs the primary.</p>
+  <p class="note" style="margin-top:0.5rem"><strong>Setup can take 1–4 minutes</strong> — Postgres may wait for open transactions before creating the replication slot. If the button stays busy longer than that, it&apos;s waiting on the server; we abort the HTTP request after 4 minutes so you get an error instead of a frozen UI (check primary logs).</p>
+  <div>
+    <button type="button" id="setup">Run setup (wait for completion)</button>
+    <button type="button" class="secondary" id="statusBtn">Refresh status</button>
+  </div>
+  <label>Note for next insert</label>
+  <input type="text" id="note" placeholder="optional label" maxlength="4000"/>
+  <div style="margin-top:0.75rem">
+    <button type="button" id="insert">Insert row (publisher)</button>
+  </div>
+  <hr class="sep"/>
+  <h2 class="sec">Custom table</h2>
+  <p class="note">Extra tables with whitelisted types on publisher and/or subscriber. Hints link to the current PostgreSQL manual (paraphrased summaries).</p>
+  <div class="hint-toolbar">
+    <span style="font-size:0.82rem;color:#8899a6;">Hints (PostgreSQL docs):</span>
+    <button type="button" class="info-icon" title="Logical replication" aria-label="Logical replication hint" onclick="toggleHint('logical_replication')">ℹ</button>
+    <button type="button" class="info-icon" title="CREATE TABLE" aria-label="CREATE TABLE hint" onclick="toggleHint('create_table')">ℹ</button>
+    <button type="button" class="info-icon" title="CREATE PUBLICATION" aria-label="CREATE PUBLICATION hint" onclick="toggleHint('create_publication')">ℹ</button>
+    <button type="button" class="info-icon" title="ALTER SUBSCRIPTION" aria-label="ALTER SUBSCRIPTION hint" onclick="toggleHint('alter_subscription')">ℹ</button>
+    <button type="button" class="info-icon" title="Replica identity" aria-label="Replica identity hint" onclick="toggleHint('replica_identity')">ℹ</button>
+  </div>
+  <div id="hint-slot-logical_replication" class="hint-pop"></div>
+  <div id="hint-slot-create_table" class="hint-pop"></div>
+  <div id="hint-slot-create_publication" class="hint-pop"></div>
+  <div id="hint-slot-alter_subscription" class="hint-pop"></div>
+  <div id="hint-slot-replica_identity" class="hint-pop"></div>
+  <label for="customTbl">Table name</label>
+  <input type="text" id="customTbl" placeholder="e.g. zoo_counts" maxlength="63" autocomplete="off"/>
+  <label for="customTarget">Apply <code>CREATE TABLE</code> on</label>
+  <select id="customTarget">
+    <option value="publisher">Publisher only (<code>demo_logical_pub</code>)</option>
+    <option value="subscriber">Subscriber only (<code>demo_logical_sub</code>)</option>
+    <option value="both">Both</option>
+  </select>
+  <div class="chk-row"><label><input type="checkbox" id="customPk" checked/> Add <code>BIGSERIAL</code> primary key column <code>id</code></label></div>
+  <div class="chk-row"><label><input type="checkbox" id="customRif" checked/> <code>REPLICA IDENTITY FULL</code></label></div>
+  <label for="customCols">Columns JSON</label>
+  <div class="faker-row">
+    <label>Preset<br/>
+      <select id="fakerPreset" aria-label="Faker preset for columns">
+        <option value="mixed">mixed</option>
+        <option value="people">people</option>
+        <option value="commerce">commerce</option>
+      </select>
+    </label>
+    <label># columns<br/><input type="number" id="fakerColCount" min="1" max="16" value="5"/></label>
+    <label>Seed<br/><input type="number" id="fakerSeedCols" placeholder="random" aria-label="Optional RNG seed"/></label>
+    <button type="button" class="secondary" id="fakerFillCols">Fill columns (Faker)</button>
+  </div>
+  <textarea id="customCols" class="input-lg" spellcheck="false">[
+  {{"name": "species", "pg_type": "TEXT", "not_null": true}},
+  {{"name": "cnt", "pg_type": "INTEGER", "not_null": false}}
+]</textarea>
+  <div style="margin-top:0.55rem">
+    <button type="button" class="secondary" id="customCreate">Create table (IF NOT EXISTS)</button>
+  </div>
+  <hr class="sep"/>
+  <h2 class="sec">Custom insert (publisher)</h2>
+  <p class="note">Runs as <code>demo</code> on <code>demo_logical_pub</code>. Keys must match table columns (omit <code>id</code> to let <code>BIGSERIAL</code> default).</p>
+  <label for="customInsTbl">Table name</label>
+  <input type="text" id="customInsTbl" placeholder="same as table above" maxlength="63" autocomplete="off"/>
+  <label for="customRows">Rows JSON</label>
+  <div class="faker-row">
+    <label># rows<br/><input type="number" id="fakerRowCount" min="1" max="80" value="6"/></label>
+    <label>Seed<br/><input type="number" id="fakerSeedRows" placeholder="random" aria-label="Optional RNG seed for rows"/></label>
+    <button type="button" class="secondary" id="fakerFillRows">Fill rows (Faker)</button>
+  </div>
+  <p class="note" style="margin-bottom:0.35rem">Row filler uses <strong>Columns JSON</strong> above; omit <code>id</code> when the table uses the generated <code>BIGSERIAL</code> PK.</p>
+  <textarea id="customRows" class="input-lg" spellcheck="false">[
+  {{"species": "cat", "cnt": 1}},
+  {{"species": "dog", "cnt": 2}}
+]</textarea>
+  <div style="margin-top:0.55rem">
+    <button type="button" class="secondary" id="customInsert">Insert rows</button>
+  </div>
+  <p id="st"></p>
+  <pre id="out">Click Run setup once, then Insert or Refresh status.</pre>
+  <script>
+    const out = document.getElementById("out");
+    const st = document.getElementById("st");
+    function escapeHtml(s) {{
+      return String(s)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }}
+    function toggleHint(key) {{
+      const el = document.getElementById("hint-slot-" + key);
+      if (!el) return;
+      const wasOpen = el.classList.contains("open");
+      document.querySelectorAll(".hint-pop").forEach((e) => e.classList.remove("open"));
+      if (!wasOpen) el.classList.add("open");
+    }}
+    async function j(method, url, body) {{
+      const opt = {{ method, headers: {{}} }};
+      if (body !== undefined) {{
+        opt.headers["Content-Type"] = "application/json";
+        opt.body = JSON.stringify(body);
+      }}
+      const r = await fetch(url, opt);
+      const data = await r.json().catch(() => ({{ detail: r.statusText }}));
+      return {{ r, data }};
+    }}
+    async function loadPgDocs() {{
+      const {{ r, data }} = await j("GET", "/api/postgres-logical/docs");
+      if (!r.ok || !data) return;
+      for (const [k, v] of Object.entries(data)) {{
+        const slot = document.getElementById("hint-slot-" + k);
+        if (!slot || !v || !v.hint) continue;
+        slot.innerHTML =
+          "<p>" +
+          escapeHtml(v.hint) +
+          '</p><p><a href="' +
+          escapeHtml(v.url) +
+          '" target="_blank" rel="noopener">' +
+          escapeHtml(v.title) +
+          " — PostgreSQL Documentation</a></p>";
+      }}
+    }}
+    async function refreshStatus() {{
+      st.textContent = "Loading…";
+      st.className = "";
+      const {{ r, data }} = await j("GET", "/api/postgres-logical/status");
+      out.textContent = JSON.stringify(data, null, 2);
+      st.textContent = r.ok ? "Status OK." : (data.detail || "Error");
+      st.className = r.ok ? "ok" : "err";
+    }}
+    document.getElementById("setup").addEventListener("click", async () => {{
+      const btn = document.getElementById("setup");
+      const SETUP_MS = 240000;
+      btn.disabled = true;
+      st.textContent = "Running setup… (often 30s–3min; Postgres may wait on snapshots)";
+      st.className = "";
+      const ac = new AbortController();
+      const kill = setTimeout(() => ac.abort(), SETUP_MS);
+      try {{
+        const r = await fetch("/api/postgres-logical/setup", {{
+          method: "POST",
+          signal: ac.signal,
+        }});
+        let data;
+        try {{
+          data = await r.json();
+        }} catch (e) {{
+          data = {{ detail: await r.text().catch(() => r.statusText), parse_error: String(e) }};
+        }}
+        out.textContent = JSON.stringify(data, null, 2);
+        const ok = r.ok && data && data.ok;
+        st.textContent = ok ? "Setup finished." : "Setup reported issues — see JSON.";
+        st.className = ok ? "ok" : "err";
+      }} catch (e) {{
+        const aborted = e && (e.name === "AbortError" || e.message === "signal is aborted without reason");
+        const msg = aborted
+          ? "Stopped waiting after " + (SETUP_MS / 1000) + "s — Postgres is still running CREATE SUBSCRIPTION (often blocked by open transactions). Check primary logs / terminate old sessions, then retry."
+          : String(e);
+        st.textContent = msg;
+        st.className = "err";
+        out.textContent = JSON.stringify({{
+          ok: false,
+          client_error: msg,
+          hint: "CREATE SUBSCRIPTION blocks until logical decoding can take a snapshot; idle-in-transaction backends delay this.",
+        }}, null, 2);
+      }} finally {{
+        clearTimeout(kill);
+        btn.disabled = false;
+      }}
+    }});
+    document.getElementById("insert").addEventListener("click", async () => {{
+      const note = document.getElementById("note").value.trim();
+      st.textContent = "Inserting…";
+      const {{ r, data }} = await j("POST", "/api/postgres-logical/insert", {{ note }});
+      out.textContent = JSON.stringify(data, null, 2);
+      const insertOk = data && data.ok === true;
+      st.textContent = insertOk ? "Insert OK." : "Insert failed — see JSON.";
+      st.className = insertOk ? "ok" : "err";
+    }});
+    function appendOptionalSeed(body, inputEl) {{
+      const raw = inputEl.value.trim();
+      if (raw === "") return true;
+      const n = Number(raw);
+      if (!Number.isFinite(n)) {{
+        st.textContent = "Seed must be empty or a valid number.";
+        st.className = "err";
+        return false;
+      }}
+      body.seed = Math.trunc(n);
+      return true;
+    }}
+    document.getElementById("fakerFillCols").addEventListener("click", async () => {{
+      const column_count = Number(document.getElementById("fakerColCount").value);
+      const body = {{
+        preset: document.getElementById("fakerPreset").value,
+        column_count: Number.isFinite(column_count) ? column_count : 5,
+      }};
+      if (!appendOptionalSeed(body, document.getElementById("fakerSeedCols"))) return;
+      st.textContent = "Generating columns…";
+      st.className = "";
+      const {{ r, data }} = await j("POST", "/api/postgres-logical/faker-columns", body);
+      out.textContent = JSON.stringify(data, null, 2);
+      if (r.ok && data.columns) {{
+        document.getElementById("customCols").value = JSON.stringify(data.columns, null, 2);
+        const tn = document.getElementById("customTbl").value.trim();
+        if (!tn && data.table_name_suggestion) {{
+          document.getElementById("customTbl").value = data.table_name_suggestion;
+        }}
+        st.textContent = "Faker columns filled.";
+        st.className = "ok";
+      }} else {{
+        st.textContent = "Faker columns failed — see JSON.";
+        st.className = "err";
+      }}
+    }});
+    document.getElementById("fakerFillRows").addEventListener("click", async () => {{
+      let columns;
+      try {{
+        columns = JSON.parse(document.getElementById("customCols").value);
+      }} catch (e) {{
+        st.textContent = "Fix Columns JSON before generating rows: " + e;
+        st.className = "err";
+        return;
+      }}
+      if (!Array.isArray(columns) || columns.length === 0) {{
+        st.textContent = "Columns JSON must be a non-empty array.";
+        st.className = "err";
+        return;
+      }}
+      const row_count = Number(document.getElementById("fakerRowCount").value);
+      const body = {{
+        columns,
+        row_count: Number.isFinite(row_count) ? row_count : 6,
+      }};
+      if (!appendOptionalSeed(body, document.getElementById("fakerSeedRows"))) return;
+      st.textContent = "Generating rows…";
+      st.className = "";
+      const {{ r, data }} = await j("POST", "/api/postgres-logical/faker-rows", body);
+      out.textContent = JSON.stringify(data, null, 2);
+      if (r.ok && data.rows) {{
+        document.getElementById("customRows").value = JSON.stringify(data.rows, null, 2);
+        const ins = document.getElementById("customInsTbl").value.trim();
+        const tbl = document.getElementById("customTbl").value.trim();
+        if (!ins && tbl) document.getElementById("customInsTbl").value = tbl;
+        st.textContent = "Faker rows filled.";
+        st.className = "ok";
+      }} else {{
+        st.textContent = "Faker rows failed — see JSON.";
+        st.className = "err";
+      }}
+    }});
+    document.getElementById("customCreate").addEventListener("click", async () => {{
+      const table_name = document.getElementById("customTbl").value.trim();
+      let columns;
+      try {{
+        columns = JSON.parse(document.getElementById("customCols").value);
+      }} catch (e) {{
+        st.textContent = "Columns JSON parse error: " + e;
+        st.className = "err";
+        return;
+      }}
+      if (!Array.isArray(columns)) {{
+        st.textContent = "Columns JSON must be an array.";
+        st.className = "err";
+        return;
+      }}
+      const body = {{
+        table_name,
+        columns,
+        target: document.getElementById("customTarget").value,
+        include_bigserial_pk: document.getElementById("customPk").checked,
+        replica_identity_full: document.getElementById("customRif").checked,
+      }};
+      st.textContent = "Creating table…";
+      st.className = "";
+      const {{ r, data }} = await j("POST", "/api/postgres-logical/custom-table", body);
+      out.textContent = JSON.stringify(data, null, 2);
+      const ok = r.ok && data && data.ok === true;
+      st.textContent = ok ? "Custom table OK." : "Custom table failed — see JSON.";
+      st.className = ok ? "ok" : "err";
+    }});
+    document.getElementById("customInsert").addEventListener("click", async () => {{
+      const table_name = document.getElementById("customInsTbl").value.trim();
+      let rows;
+      try {{
+        rows = JSON.parse(document.getElementById("customRows").value);
+      }} catch (e) {{
+        st.textContent = "Rows JSON parse error: " + e;
+        st.className = "err";
+        return;
+      }}
+      if (!Array.isArray(rows)) {{
+        st.textContent = "Rows JSON must be an array.";
+        st.className = "err";
+        return;
+      }}
+      st.textContent = "Inserting…";
+      st.className = "";
+      const {{ r, data }} = await j("POST", "/api/postgres-logical/custom-insert", {{ table_name, rows }});
+      out.textContent = JSON.stringify(data, null, 2);
+      const ok = r.ok && data && data.ok === true;
+      st.textContent = ok ? "Custom insert OK." : "Custom insert failed — see JSON.";
+      st.className = ok ? "ok" : "err";
+    }});
+    document.getElementById("statusBtn").addEventListener("click", refreshStatus);
+    loadPgDocs();
+    refreshStatus();
+  </script>
+</body>
+</html>
+"""
+
+
+def _pg_password_from_dsn(dsn: str) -> str:
+    p = urlparse(dsn)
+    return unquote(p.password) if p.password else ""
+
+
+def _normalize_hub_pg_identifier(v: object) -> object:
+    """Lowercase + strip so camelCase UI input matches PostgreSQL unquoted rules."""
+    if isinstance(v, str):
+        return v.strip().lower()
+    return v
+
+
+class TrinoQueryBody(BaseModel):
+    sql: str = Field(..., min_length=1, max_length=96_000)
+    catalog: str | None = Field(None, max_length=64)
+    schema: str | None = Field(None, max_length=128)
+
+
+class PostgresLogicalInsertBody(BaseModel):
+    note: str = ""
+
+
+class PostgresLogicalCustomColumn(BaseModel):
+    name: str = Field(..., pattern=r"^[a-z][a-z0-9_]{0,62}$")
+    pg_type: Literal[
+        "TEXT",
+        "INTEGER",
+        "BIGINT",
+        "BOOLEAN",
+        "NUMERIC",
+        "DOUBLE PRECISION",
+        "TIMESTAMPTZ",
+    ]
+    not_null: bool = False
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def normalize_column_name(cls, v: object) -> object:
+        return _normalize_hub_pg_identifier(v)
+
+
+class PostgresLogicalCustomTableBody(BaseModel):
+    table_name: str = Field(..., pattern=r"^[a-z][a-z0-9_]{0,62}$")
+    columns: list[PostgresLogicalCustomColumn] = Field(default_factory=list, max_length=16)
+    target: Literal["publisher", "subscriber", "both"] = "publisher"
+    include_bigserial_pk: bool = True
+    replica_identity_full: bool = True
+
+    @field_validator("table_name", mode="before")
+    @classmethod
+    def normalize_table_name(cls, v: object) -> object:
+        return _normalize_hub_pg_identifier(v)
+
+    @model_validator(mode="after")
+    def pk_or_columns_and_no_id_conflict(self) -> "PostgresLogicalCustomTableBody":
+        if not self.include_bigserial_pk and not self.columns:
+            raise ValueError(
+                "either include_bigserial_pk or at least one column is required"
+            )
+        if self.include_bigserial_pk:
+            for c in self.columns:
+                if c.name == "id":
+                    raise ValueError(
+                        'column name "id" conflicts with include_bigserial_pk; '
+                        "rename the column or disable the generated PK"
+                    )
+        return self
+
+
+class PostgresLogicalCustomInsertBody(BaseModel):
+    table_name: str = Field(..., pattern=r"^[a-z][a-z0-9_]{0,62}$")
+    rows: list[dict[str, Any]] = Field(..., min_length=1, max_length=80)
+
+    @field_validator("table_name", mode="before")
+    @classmethod
+    def normalize_table_name(cls, v: object) -> object:
+        return _normalize_hub_pg_identifier(v)
+
+
+class PostgresLogicalFakerColumnsBody(BaseModel):
+    preset: Literal["mixed", "people", "commerce"] = "mixed"
+    column_count: int = Field(5, ge=1, le=16)
+    seed: int | None = Field(None, ge=0, le=2_147_483_647)
+
+
+class PostgresLogicalFakerRowsBody(BaseModel):
+    columns: list[PostgresLogicalCustomColumn] = Field(..., min_length=1, max_length=16)
+    row_count: int = Field(6, ge=1, le=80)
+    seed: int | None = Field(None, ge=0, le=2_147_483_647)
+
+
+class PostgresFakerSchemaBody(BaseModel):
+    database: Literal["demo_logical_pub", "demo_logical_sub"] = "demo_logical_pub"
+    preset: Literal["mixed", "people", "commerce"] = "mixed"
+    seed: int | None = Field(None, ge=0, le=2_147_483_647)
+    tables: int = Field(0, ge=0, le=3)
+    sequences: int = Field(0, ge=0, le=6)
+    views: int = Field(0, ge=0, le=4)
+    materialized_views: int = Field(0, ge=0, le=3)
+    functions: int = Field(0, ge=0, le=4)
+    procedures: int = Field(0, ge=0, le=4)
+
+    @model_validator(mode="after")
+    def nonempty_counts(self) -> "PostgresFakerSchemaBody":
+        if (
+            self.tables
+            + self.sequences
+            + self.views
+            + self.materialized_views
+            + self.functions
+            + self.procedures
+        ) == 0:
+            raise ValueError("set at least one object count above zero")
+        return self
+
+
+class PostgresFakerSchemaForeignKeyBody(BaseModel):
+    columns: list[str] = Field(..., min_length=1, max_length=8)
+    ref_schema: str = Field("public", pattern=r"^[a-z][a-z0-9_]{0,62}$")
+    ref_table: str = Field(..., pattern=r"^[a-z][a-z0-9_]{0,62}$")
+    ref_columns: list[str] = Field(..., min_length=1, max_length=8)
+
+    @field_validator("columns", "ref_columns", mode="before")
+    @classmethod
+    def normalize_key_lists(cls, v: object) -> object:
+        if isinstance(v, list):
+            return [_normalize_hub_pg_identifier(str(x)) for x in v]
+        return v
+
+    @field_validator("ref_schema", mode="before")
+    @classmethod
+    def normalize_ref_schema(cls, v: object) -> object:
+        return _normalize_hub_pg_identifier(v)
+
+    @field_validator("ref_table", mode="before")
+    @classmethod
+    def normalize_ref_table(cls, v: object) -> object:
+        return _normalize_hub_pg_identifier(v)
+
+
+class PostgresFakerSchemaCustomTableBody(BaseModel):
+    database: Literal["demo_logical_pub", "demo_logical_sub"]
+    schema_name: str = Field("public", pattern=r"^[a-z][a-z0-9_]{0,62}$")
+    table_name: str = Field(..., pattern=r"^[a-z][a-z0-9_]{0,62}$")
+    columns: list[PostgresLogicalCustomColumn] = Field(default_factory=list, max_length=16)
+    include_bigserial_pk: bool = True
+    replica_identity_full: bool = False
+    unique_constraints: list[list[str]] = Field(default_factory=list, max_length=8)
+    foreign_keys: list[PostgresFakerSchemaForeignKeyBody] = Field(
+        default_factory=list, max_length=8
+    )
+
+    @field_validator("schema_name", mode="before")
+    @classmethod
+    def normalize_custom_schema(cls, v: object) -> object:
+        return _normalize_hub_pg_identifier(v)
+
+    @field_validator("table_name", mode="before")
+    @classmethod
+    def normalize_table_name(cls, v: object) -> object:
+        return _normalize_hub_pg_identifier(v)
+
+    @field_validator("unique_constraints", mode="before")
+    @classmethod
+    def normalize_unique_constraints(cls, v: object) -> object:
+        if not isinstance(v, list):
+            return v
+        out: list[list[str]] = []
+        for group in v:
+            if not isinstance(group, list):
+                raise ValueError("unique_constraints must be a list of column lists")
+            out.append([_normalize_hub_pg_identifier(str(x)) for x in group])
+        return out
+
+    @model_validator(mode="after")
+    def pk_and_constraint_columns(self) -> "PostgresFakerSchemaCustomTableBody":
+        if not self.include_bigserial_pk and not self.columns:
+            raise ValueError(
+                "either include_bigserial_pk or at least one column is required"
+            )
+        if self.include_bigserial_pk:
+            for c in self.columns:
+                if c.name == "id":
+                    raise ValueError(
+                        'column name "id" conflicts with include_bigserial_pk'
+                    )
+        names = {c.name for c in self.columns}
+        if self.include_bigserial_pk:
+            names.add("id")
+        for i, uq in enumerate(self.unique_constraints):
+            if not uq:
+                raise ValueError(f"unique_constraints[{i}] cannot be empty")
+            for col in uq:
+                if col not in names:
+                    raise ValueError(
+                        f"unique_constraints[{i}] references unknown column {col!r}"
+                    )
+        for i, fk in enumerate(self.foreign_keys):
+            for col in fk.columns:
+                if col not in names:
+                    raise ValueError(
+                        f"foreign_keys[{i}] references unknown column {col!r}"
+                    )
+        return self
+
+
+class PostgresFakerSchemaFakerInsertBody(BaseModel):
+    database: Literal["demo_logical_pub", "demo_logical_sub"]
+    schema_name: str = Field("public", pattern=r"^[a-z][a-z0-9_]{0,62}$")
+    table_name: str = Field(..., pattern=r"^[a-z][a-z0-9_]{0,62}$")
+    columns: list[PostgresLogicalCustomColumn] = Field(default_factory=list, max_length=16)
+    row_count: int = Field(8, ge=1, le=80)
+    seed: int | None = Field(None, ge=0, le=2_147_483_647)
+    from_catalog: bool = False
+    ensure_parent_rows: bool = True
+
+    @model_validator(mode="after")
+    def columns_required_without_catalog(self) -> "PostgresFakerSchemaFakerInsertBody":
+        if self.from_catalog:
+            return self
+        if len(self.columns) < 1:
+            raise ValueError(
+                "columns must be a non-empty JSON array unless from_catalog is true"
+            )
+        return self
+
+    @field_validator("schema_name", mode="before")
+    @classmethod
+    def normalize_insert_schema(cls, v: object) -> object:
+        return _normalize_hub_pg_identifier(v)
+
+    @field_validator("table_name", mode="before")
+    @classmethod
+    def normalize_table_name_insert(cls, v: object) -> object:
+        return _normalize_hub_pg_identifier(v)
+
+
+class PostgresFakerSchemaTableCatalogBody(BaseModel):
+    database: Literal["demo_logical_pub", "demo_logical_sub"]
+    schema_name: str = Field("public", pattern=r"^[a-z][a-z0-9_]{0,62}$")
+    table_name: str = Field(..., pattern=r"^[a-z][a-z0-9_]{0,62}$")
+
+    @field_validator("schema_name", mode="before")
+    @classmethod
+    def normalize_tc_schema(cls, v: object) -> object:
+        return _normalize_hub_pg_identifier(v)
+
+    @field_validator("table_name", mode="before")
+    @classmethod
+    def normalize_tc_table(cls, v: object) -> object:
+        return _normalize_hub_pg_identifier(v)
+
+
+class PostgresSchemaCloneExportBody(BaseModel):
+    database: Literal["demo_logical_pub", "demo_logical_sub"]
+    schema_name: str = Field("public", pattern=r"^[a-z][a-z0-9_]{0,62}$")
+    table_names: list[str] | None = Field(default=None, max_length=48)
+    include_sequences: bool = True
+    include_tables: bool = True
+    include_views: bool = True
+    include_materialized_views: bool = True
+    include_functions: bool = True
+    include_procedures: bool = True
+    include_grants: bool = False
+
+    @field_validator("schema_name", mode="before")
+    @classmethod
+    def normalize_clone_schema(cls, v: object) -> object:
+        return _normalize_hub_pg_identifier(v)
+
+    @field_validator("table_names", mode="before")
+    @classmethod
+    def normalize_clone_tables(cls, v: object) -> object:
+        if v is None:
+            return None
+        if not isinstance(v, list):
+            raise ValueError("table_names must be null or an array of table names")
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in v:
+            s = _normalize_hub_pg_identifier(str(item))
+            if not s:
+                continue
+            if s in seen:
+                continue
+            seen.add(s)
+            out.append(s)
+        return out
+
+
+class PostgresFakerSchemaMultiSchemaBody(BaseModel):
+    database: Literal["demo_logical_pub", "demo_logical_sub"] = "demo_logical_pub"
+    preset: Literal["mixed", "people", "commerce"] = "mixed"
+    seed: int | None = Field(None, ge=0, le=2_147_483_647)
+    schemas: list[str] = Field(..., min_length=1, max_length=8)
+    tables_per_schema: int = Field(1, ge=1, le=4)
+
+    @field_validator("schemas", mode="before")
+    @classmethod
+    def normalize_multi_schemas(cls, v: object) -> object:
+        if not isinstance(v, list):
+            raise ValueError("schemas must be a non-empty JSON array of strings")
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in v:
+            s = _normalize_hub_pg_identifier(str(item))
+            if not s:
+                continue
+            if s in seen:
+                continue
+            seen.add(s)
+            out.append(s)
+        if not out:
+            raise ValueError("provide at least one non-empty schema name")
+        return out
+
+
 class WorkloadRequest(BaseModel):
     total_records: int = Field(100, ge=1, le=100_000)
     batch_size: int = Field(50, ge=1, le=2000)
@@ -1729,6 +3160,306 @@ async def connections_page():
     return HTMLResponse(CONNECTIONS_PAGE)
 
 
+@app.get("/trino", response_class=HTMLResponse)
+async def trino_page():
+    return HTMLResponse(TRINO_PAGE)
+
+
+@app.get("/postgres", response_class=HTMLResponse)
+async def postgres_hub_page():
+    """Landing tab for Postgres-only demos (logical replication, links to scenario PG view, etc.)."""
+    return HTMLResponse(POSTGRES_LANDING_PAGE)
+
+
+@app.get("/postgres/logical", response_class=HTMLResponse)
+async def postgres_logical_page():
+    return HTMLResponse(POSTGRES_LOGICAL_PAGE)
+
+
+@app.get("/postgres/faker-schema", response_class=HTMLResponse)
+async def postgres_faker_schema_page():
+    return HTMLResponse(POSTGRES_FAKER_SCHEMA_PAGE)
+
+
+@app.get("/postgres-logical")
+async def postgres_logical_legacy_redirect():
+    """Old path; keep bookmarks working."""
+    return RedirectResponse(url="/postgres/logical", status_code=307)
+
+
+@app.post("/api/trino/query")
+async def api_trino_query(body: TrinoQueryBody):
+    cfg = get_runtime_config()
+    _trino_sql_guard(body.sql)
+    return await asyncio.to_thread(
+        _execute_trino_query,
+        cfg,
+        body.sql.strip(),
+        body.catalog,
+        body.schema,
+    )
+
+
+@app.post("/api/postgres-logical/setup")
+async def api_postgres_logical_setup():
+    cfg = get_runtime_config()
+    pwd = _pg_password_from_dsn(cfg.postgres_admin_dsn)
+    if not pwd:
+        raise HTTPException(
+            500,
+            "POSTGRES_ADMIN_DSN must include a password (postgresql://user:pass@host/db)",
+        )
+    host, port = pg_logical.parse_host_port(cfg.postgres_dsn)
+    return pg_logical.logical_demo_setup(
+        cfg.postgres_admin_dsn,
+        cfg.postgres_logical_sub_admin_dsn,
+        host,
+        port,
+        pwd,
+    )
+
+
+@app.post("/api/postgres-logical/insert")
+async def api_postgres_logical_insert(body: PostgresLogicalInsertBody):
+    cfg = get_runtime_config()
+    return pg_logical.logical_demo_insert_row(cfg.postgres_dsn, body.note)
+
+
+@app.get("/api/postgres-logical/status")
+async def api_postgres_logical_status():
+    cfg = get_runtime_config()
+    rep = cfg.postgres_replica_read_dsn.strip() or None
+    return pg_logical.logical_demo_status(
+        cfg.postgres_logical_sub_admin_dsn,
+        cfg.postgres_dsn,
+        cfg.postgres_logical_sub_dsn,
+        rep,
+    )
+
+
+@app.get("/api/postgres-logical/docs")
+async def api_postgres_logical_docs():
+    return pg_logical.pg_documentation_links()
+
+
+@app.post("/api/postgres-logical/custom-table")
+async def api_postgres_logical_custom_table(body: PostgresLogicalCustomTableBody):
+    cfg = get_runtime_config()
+    try:
+        cols = [c.model_dump() for c in body.columns]
+        return pg_logical.logical_custom_create_table(
+            cfg.postgres_admin_dsn,
+            cfg.postgres_logical_sub_admin_dsn,
+            body.table_name,
+            cols,
+            target=body.target,
+            include_bigserial_pk=body.include_bigserial_pk,
+            replica_identity_full=body.replica_identity_full,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@app.post("/api/postgres-logical/custom-insert")
+async def api_postgres_logical_custom_insert(body: PostgresLogicalCustomInsertBody):
+    cfg = get_runtime_config()
+    try:
+        return pg_logical.logical_custom_insert_rows(
+            cfg.postgres_dsn,
+            body.table_name,
+            body.rows,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@app.post("/api/postgres-logical/faker-columns")
+async def api_postgres_logical_faker_columns(body: PostgresLogicalFakerColumnsBody):
+    try:
+        return pg_logical.faker_generate_custom_columns(
+            preset=body.preset,
+            column_count=body.column_count,
+            seed=body.seed,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@app.post("/api/postgres-logical/faker-rows")
+async def api_postgres_logical_faker_rows(body: PostgresLogicalFakerRowsBody):
+    try:
+        cols = [c.model_dump() for c in body.columns]
+        return pg_logical.faker_generate_custom_rows(
+            columns=cols,
+            row_count=body.row_count,
+            seed=body.seed,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@app.post("/api/postgres/faker-schema/apply")
+async def api_postgres_faker_schema_apply(body: PostgresFakerSchemaBody):
+    cfg = get_runtime_config()
+    try:
+        return pg_faker_schema.apply_faker_schema_objects(
+            publisher_admin_dsn=cfg.postgres_admin_dsn,
+            subscriber_admin_dsn=cfg.postgres_logical_sub_admin_dsn,
+            database=body.database,
+            preset=body.preset,
+            seed=body.seed,
+            tables=body.tables,
+            sequences=body.sequences,
+            views=body.views,
+            materialized_views=body.materialized_views,
+            functions=body.functions,
+            procedures=body.procedures,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except psycopg.Error as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@app.post("/api/postgres/faker-schema/custom-table")
+async def api_postgres_faker_schema_custom_table(body: PostgresFakerSchemaCustomTableBody):
+    cfg = get_runtime_config()
+    target = (
+        "publisher" if body.database == pg_logical.PUB_DB else "subscriber"
+    )
+    try:
+        cols = [c.model_dump() for c in body.columns]
+        fks = [fk.model_dump() for fk in body.foreign_keys]
+        return pg_logical.logical_custom_create_table(
+            cfg.postgres_admin_dsn,
+            cfg.postgres_logical_sub_admin_dsn,
+            body.table_name,
+            cols,
+            target=target,
+            include_bigserial_pk=body.include_bigserial_pk,
+            replica_identity_full=body.replica_identity_full,
+            unique_constraints=body.unique_constraints,
+            foreign_keys=fks,
+            schema_name=body.schema_name,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@app.post("/api/postgres/faker-schema/faker-insert")
+async def api_postgres_faker_schema_faker_insert(body: PostgresFakerSchemaFakerInsertBody):
+    cfg = get_runtime_config()
+    try:
+        if body.from_catalog:
+            ins = pg_logical.faker_catalog_insert_rows(
+                cfg.postgres_dsn,
+                cfg.postgres_logical_sub_dsn,
+                body.database,
+                body.schema_name,
+                body.table_name,
+                body.row_count,
+                body.seed,
+                ensure_parent_rows=body.ensure_parent_rows,
+            )
+            gen_info = {
+                "from_catalog": True,
+                "seed": body.seed,
+                "ensure_parent_rows": body.ensure_parent_rows,
+            }
+            if ins.get("inserted") is not None:
+                gen_info["rows_generated"] = ins["inserted"]
+            return {"faker": gen_info, **ins}
+
+        cols = [c.model_dump() for c in body.columns]
+        plan = pg_logical.faker_generate_custom_rows(
+            columns=cols,
+            row_count=body.row_count,
+            seed=body.seed,
+        )
+        ins = pg_logical.logical_custom_insert_rows_for_database(
+            cfg.postgres_dsn,
+            cfg.postgres_logical_sub_dsn,
+            body.database,
+            body.table_name,
+            plan["rows"],
+            schema_name=body.schema_name,
+        )
+        return {
+            "faker": {
+                "from_catalog": False,
+                "seed": body.seed,
+                "rows_generated": plan["row_count"],
+            },
+            **ins,
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@app.post("/api/postgres/faker-schema/table-catalog")
+async def api_postgres_faker_schema_table_catalog(body: PostgresFakerSchemaTableCatalogBody):
+    cfg = get_runtime_config()
+    try:
+        demo = (
+            cfg.postgres_dsn
+            if body.database == pg_logical.PUB_DB
+            else cfg.postgres_logical_sub_dsn
+        )
+        return pg_logical.introspect_table_catalog_summary(
+            demo,
+            body.database,
+            body.schema_name,
+            body.table_name,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@app.post("/api/postgres/faker-schema/clone-export")
+async def api_postgres_faker_schema_clone_export(body: PostgresSchemaCloneExportBody):
+    cfg = get_runtime_config()
+    adm = (
+        cfg.postgres_admin_dsn
+        if body.database == pg_logical.PUB_DB
+        else cfg.postgres_logical_sub_admin_dsn
+    )
+    try:
+        return pg_schema_clone.export_schema_clone_sql(
+            adm,
+            body.database,
+            body.schema_name,
+            table_names=body.table_names,
+            include_sequences=body.include_sequences,
+            include_tables=body.include_tables,
+            include_views=body.include_views,
+            include_materialized_views=body.include_materialized_views,
+            include_functions=body.include_functions,
+            include_procedures=body.include_procedures,
+            include_grants=body.include_grants,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@app.post("/api/postgres/faker-schema/multi-schema-tables")
+async def api_postgres_faker_schema_multi_schema(body: PostgresFakerSchemaMultiSchemaBody):
+    cfg = get_runtime_config()
+    try:
+        return pg_faker_schema.apply_multi_schema_meaningful_tables(
+            publisher_admin_dsn=cfg.postgres_admin_dsn,
+            subscriber_admin_dsn=cfg.postgres_logical_sub_admin_dsn,
+            database=body.database,
+            schemas=body.schemas,
+            tables_per_schema=body.tables_per_schema,
+            preset=body.preset,
+            seed=body.seed,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except psycopg.Error as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
 @app.get("/api/connections")
 async def api_connections_get(request: Request):
     base = env_base_config()
@@ -1747,6 +3478,9 @@ async def api_connections_get(request: Request):
             "opensearch_index": rt.opensearch_index,
             "opensearch_workload_index": rt.opensearch_workload_index,
             "scenario_opensearch_index": rt.scenario_opensearch_index,
+            "trino_http_url": mask_connection_hint(rt.trino_http_url)
+            if rt.trino_http_url
+            else "(disabled)",
         },
     }
 

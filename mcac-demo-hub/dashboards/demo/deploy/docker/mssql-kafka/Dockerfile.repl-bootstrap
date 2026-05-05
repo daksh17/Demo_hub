@@ -1,10 +1,20 @@
-# sqlcmd client for MSSQL init / replication bootstrap sidecars (Compose).
-FROM ubuntu:22.04
-RUN apt-get update \
-  && DEBIAN_FRONTEND=noninteractive apt-get install -y curl gnupg apt-transport-https ca-certificates \
-  && curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg \
-  && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/ubuntu/22.04/prod jammy main" > /etc/apt/sources.list.d/mssql-release.list \
-  && apt-get update \
-  && ACCEPT_EULA=Y DEBIAN_FRONTEND=noninteractive apt-get install -y mssql-tools18 unixodbc \
-  && rm -rf /var/lib/apt/lists/*
+# sqlcmd client for MSSQL init / replication bootstrap (Compose + K8s Job).
+# Force amd64: matches mcr.microsoft.com/mssql/server (linux/amd64) and avoids apt exit 100 when
+# the build runs on ARM (OrbStack/Docker Desktop) but the repo line was pinned to [arch=amd64]
+# while dpkg reports arm64 — or when msodbcsql18 is required alongside mssql-tools18.
+FROM --platform=linux/amd64 ubuntu:22.04
+
+RUN set -eux; \
+  apt-get update; \
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    curl ca-certificates gnupg; \
+  curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
+    | gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg; \
+  echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/ubuntu/22.04/prod jammy main" \
+    > /etc/apt/sources.list.d/mssql-release.list; \
+  apt-get update; \
+  ACCEPT_EULA=Y DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    msodbcsql18 mssql-tools18 unixodbc; \
+  rm -rf /var/lib/apt/lists/*
+
 ENV PATH="/opt/mssql-tools18/bin:${PATH}"
