@@ -159,6 +159,7 @@ def consume_poll(
     max_messages: int,
     timeout_ms: int,
     auto_offset_reset: Literal["earliest", "latest"],
+    enable_auto_commit: bool,
 ) -> dict[str, Any]:
     try:
         from kafka import KafkaConsumer  # type: ignore
@@ -168,10 +169,10 @@ def consume_poll(
     topic = validate_topic(topic)
     gid = (group_id or "").strip() or f"demo-hub-kafka-lab-{uuid.uuid4().hex[:14]}"
 
-    consumer = KafkaConsumer(
+    c_kwargs: dict[str, Any] = dict(
         bootstrap_servers=bootstrap_list(),
         group_id=gid,
-        enable_auto_commit=False,
+        enable_auto_commit=enable_auto_commit,
         auto_offset_reset=auto_offset_reset,
         consumer_timeout_ms=max(timeout_ms, 3000),
         max_poll_records=min(max(1, max_messages), 500),
@@ -179,6 +180,9 @@ def consume_poll(
         value_deserializer=lambda b: json.loads(b.decode("utf-8")) if b else None,
         key_deserializer=lambda b: b.decode("utf-8") if b else None,
     )
+    if enable_auto_commit:
+        c_kwargs["auto_commit_interval_ms"] = 5000
+    consumer = KafkaConsumer(**c_kwargs)
     out: list[dict[str, Any]] = []
     t0 = time.perf_counter()
     deadline = t0 + timeout_ms / 1000.0
@@ -194,6 +198,7 @@ def consume_poll(
                 "error": "no partition assignment (topic missing or timeout)",
                 "topic": topic,
                 "group_id": gid,
+                "enable_auto_commit": enable_auto_commit,
             }
 
         while len(out) < max_messages and time.perf_counter() < deadline:
@@ -217,8 +222,19 @@ def consume_poll(
                 if len(out) >= max_messages:
                     break
     except Exception as e:
-        return {"ok": False, "error": str(e), "topic": topic, "group_id": gid}
+        return {
+            "ok": False,
+            "error": str(e),
+            "topic": topic,
+            "group_id": gid,
+            "enable_auto_commit": enable_auto_commit,
+        }
     finally:
+        if enable_auto_commit:
+            try:
+                consumer.commit()
+            except Exception:
+                pass
         consumer.close()
 
     elapsed = time.perf_counter() - t0
@@ -230,6 +246,7 @@ def consume_poll(
         "count": len(out),
         "elapsed_sec": round(elapsed, 4),
         "auto_offset_reset": auto_offset_reset,
+        "enable_auto_commit": enable_auto_commit,
     }
 
 
@@ -246,6 +263,7 @@ def describe_snippet() -> dict[str, Any]:
         "consumer_notes": {
             "group_id": "empty → random ephemeral group each request",
             "auto_offset_reset": "earliest reads from beginning for new group",
+            "enable_auto_commit": "on + fixed group_id commits offsets after poll — next run resumes after last commit",
             "max_messages": "poll loop stops early when enough records collected",
         },
         "next_steps": [

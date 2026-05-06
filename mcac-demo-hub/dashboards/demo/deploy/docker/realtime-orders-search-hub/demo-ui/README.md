@@ -58,15 +58,20 @@ Response includes **`elapsed_sec`**, **`approx_throughput_rps`**, **`effective_a
 | **`topic`** | Topic to subscribe to. |
 | **`group_id`** | Empty → random ephemeral group each request (**`demo-hub-kafka-lab-<suffix>`**). |
 | **`max_messages`** | Stop after this many records (1–500). |
-| **`timeout_ms`** | Wall-clock budget for assignment + polling (500–120_000). |
-| **`auto_offset_reset`** | **`earliest`** or **`latest`** for **new** consumer groups. |
+| **`timeout_ms`** | Wall-clock budget for assignment + polling (**500–600_000** ms). |
+| **`auto_offset_reset`** | **`earliest`** or **`latest`** when no committed offset exists for the group. |
+| **`enable_auto_commit`** | **`false`** (default): no offset commit. **`true`**: enables broker auto-commit and a synchronous **`commit()`** before **`close()`**; reuse the same **`group_id`** so the next poll resumes after committed offsets (**`auto_offset_reset`** applies only when there is no committed position). |
 
 Implementation notes:
 
-- **`enable_auto_commit=False`** — the lab does **not** exercise offset commit strategies (no sync/async commit APIs in this page).
+- With **`enable_auto_commit`** off and random **`group_id`**, offsets are **not** stored for the next HTTP poll — compare with **on** + stable **`group_id`** to study resume semantics.
 - Values are deserialized as **JSON**; producing from this lab yields JSON-compatible bodies. Binary or non-JSON topics may error on consume.
 
 Use returned **`partition`** / **`offset`** / **`key`** with **`key_mode`** experiments (e.g. fixed key → records stick to one partition → strict ordering per key).
+
+### Continuous until Stop (UI only)
+
+On **`/kafka`**, **Continuous until Stop** runs repeated **`POST /api/kafka/lab/consume`** calls in the browser until **Stop streaming**. Use **`enable_auto_commit`** and a stable **`group_id`** (or an auto-filled **`demo-hub-stream-…`** when the field is empty) so each round can advance offsets. Stop applies after the in-flight request completes.
 
 ### Rebuild / deploy
 
@@ -96,14 +101,14 @@ Use the **Kafka lab** for quick knobs and observability in the browser; use **CL
 | Broker disk full / replica lagging | ISR shrink; under-replicated partitions |
 | Compaction topic | Tombstones; retention of latest key; consumer semantics |
 
-**Map to this repo:** the lab helps with **keys**, **batching**, **compression**, **acks**, **idempotence**, and **multi-group** mental models (different **`group_id`** in separate browser sessions). It does **not** configure **`max.poll.interval.ms`**, transactions, or broker topic modes; add **`kafka-configs`**, Strimzi **`KafkaTopic`**, or shell scripts for those.
+**Map to this repo:** the lab helps with **keys**, **batching**, **compression**, **acks**, **idempotence**, optional **committed offsets** (**`enable_auto_commit`** + fixed **`group_id`**), and **multi-group** mental models. It does **not** configure **`max.poll.interval.ms`**, transactions, or broker topic modes; add **`kafka-configs`**, Strimzi **`KafkaTopic`**, or shell scripts for those.
 
 ### Consumer angles to exercise
 
 | Topic | How to practice |
 |-------|-----------------|
-| At-least-once: commit **after** processing | Duplicates on retry — use app-side counters; lab polls without committing offsets. |
-| Commit strategies | Auto vs manual sync/async; per-partition vs batch — requires custom consumer code or **`kafka-console-consumer`** flags, not the lab UI. |
+| At-least-once: commit **after** processing | Duplicates on retry — use app-side counters; turn **`enable_auto_commit`** off to replay without advancing commits. |
+| Commit strategies | With **`enable_auto_commit`** on and a fixed **`group_id`**, the lab commits once per poll before **`close()`**; tune **`auto_commit_interval_ms`** (fixed 5000 ms in code) vs manual commit in real apps. |
 | Rebalancing | Static vs dynamic membership; scale consumers up/down and watch broker/coordinator logs. |
 | Lag | **`kafka-consumer-groups.sh --describe`** under load; relate spikes to **`fetch.max.wait.ms`**, processing time, GC. |
 | Isolation | **`read_committed`** vs **`read_uncommitted`** when using transactions — not exposed in lab. |
