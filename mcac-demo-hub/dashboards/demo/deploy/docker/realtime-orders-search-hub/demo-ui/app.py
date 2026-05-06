@@ -13,7 +13,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
 import httpx
 import psycopg
@@ -32,6 +32,7 @@ from trino.exceptions import TrinoConnectionError, TrinoUserError
 import postgres_logical_demo as pg_logical
 import postgres_faker_schema as pg_faker_schema
 import postgres_schema_clone as pg_schema_clone
+import kafka_lab
 import scenario
 from hub_config import (
     SK_CASSANDRA_HOSTS,
@@ -498,6 +499,7 @@ NAV = """
   <nav style="margin-bottom:1rem;font-size:0.95rem;">
     <a href="/">Single order</a> · <a href="/workload">Workload</a> ·
     <a href="/reads">Read-back</a> · <a href="/scenario">Scenario</a> ·
+    <a href="/kafka">Kafka lab</a> ·
     <a href="/postgres">Postgres</a> · <a href="/trino">Trino</a> ·
     <a href="/connections">External DBs</a>
   </nav>
@@ -1424,6 +1426,214 @@ CONNECTIONS_PAGE = f"""<!DOCTYPE html>
       }}
     }});
     refresh();
+  </script>
+</body>
+</html>
+"""
+
+
+KAFKA_PAGE = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Kafka lab — hub demo</title>
+  <style>
+    :root {{ font-family: ui-sans-serif, system-ui, sans-serif; background: #0f1419; color: #e7e9ea; }}
+    body {{ max-width: 46rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }}
+    a {{ color: #6cb5f4; }}
+    h1 {{ font-size: 1.35rem; font-weight: 600; }}
+    h2 {{ font-size: 1.05rem; margin-top: 1.75rem; color: #c8d0d8; }}
+    p.note {{ color: #8899a6; font-size: 0.88rem; }}
+    label {{ display: block; margin: 0.55rem 0 0.2rem; font-size: 0.82rem; color: #c8d0d8; }}
+    input[type="text"], input[type="number"], select {{
+      width: 100%; max-width: 28rem; box-sizing: border-box; padding: 0.4rem 0.55rem;
+      border-radius: 6px; border: 1px solid #38444d; background: #16181c; color: #e7e9ea;
+      font-family: ui-monospace, monospace; font-size: 0.82rem;
+    }}
+    fieldset {{ border: 1px solid #38444d; border-radius: 8px; margin: 1rem 0; padding: 0.75rem 1rem; }}
+    button {{
+      background: #1d9bf0; color: #fff; border: 0; border-radius: 9999px;
+      padding: 0.55rem 1.15rem; font-size: 0.92rem; font-weight: 600; cursor: pointer;
+      margin: 0.5rem 0.65rem 0 0;
+    }}
+    button.secondary {{ background: #38444d; }}
+    button:disabled {{ opacity: 0.5; cursor: not-allowed; }}
+    #status {{ margin-top: 0.85rem; font-size: 0.88rem; }}
+    #status.ok {{ color: #7af87a; }} #status.err {{ color: #f66; }}
+    pre {{ background: #16181c; border: 1px solid #2f3336; border-radius: 8px;
+           padding: 1rem; overflow: auto; font-size: 0.74rem; max-height: 28rem; }}
+    pre.kafka-pre {{ margin-top: 0.35rem; }}
+    h3.kafka-out-h {{ font-size: 0.98rem; font-weight: 600; margin: 1.25rem 0 0.35rem; color: #c8d0d8; }}
+    p.kafka-status {{ margin: 0.25rem 0 0; font-size: 0.88rem; min-height: 1.2em; }}
+    p.kafka-status.ok {{ color: #7af87a; }}
+    p.kafka-status.err {{ color: #f66; }}
+    p.kafka-out-note {{ margin: 0.4rem 0 0.75rem; }}
+    code {{ font-size: 0.82rem; }}
+  </style>
+</head>
+<body>
+  {NAV}
+  <h1>Kafka lab</h1>
+  <p class="note">Uses <code>KAFKA_BOOTSTRAP</code> from the hub container (<strong>{kafka_lab.KAFKA_BOOTSTRAP}</strong>).
+    Produce bursts with tunable <strong>acks</strong>, <strong>linger</strong>, <strong>batch_size</strong>, <strong>compression</strong>, and key strategy (ordering demos).
+    Short-lived consumers use ephemeral <strong>group_id</strong> by default so each poll can read from <strong>earliest</strong> without resetting offsets manually.
+    <strong>latest</strong> only sees records appended <em>after</em> that consumer joins — produce first and use <strong>earliest</strong> to read an existing backlog.</p>
+
+  <h2>Producer load</h2>
+  <fieldset>
+    <form id="prod">
+      <label>Topic</label>
+      <input type="text" name="topic" value="{kafka_lab.DEFAULT_LAB_TOPIC}" autocomplete="off"/>
+      <label>Messages (1–20000)</label>
+      <input type="number" name="count" value="200" min="1" max="20000"/>
+      <label>Key mode</label>
+      <select name="key_mode">
+        <option value="per_message">per_message (spread partitions)</option>
+        <option value="fixed">fixed key (single partition)</option>
+        <option value="random">random key</option>
+        <option value="none">none</option>
+      </select>
+      <label>Fixed key (when mode=fixed)</label>
+      <input type="text" name="fixed_key" value="lab-key"/>
+      <label>acks</label>
+      <select name="acks">
+        <option value="0">0</option>
+        <option value="1" selected>1</option>
+        <option value="all">all</option>
+      </select>
+      <label>linger_ms</label>
+      <input type="number" name="linger_ms" value="5" min="0" max="30000"/>
+      <label>batch_size (bytes)</label>
+      <input type="number" name="batch_size" value="16384" min="1024" max="5000000"/>
+      <label>compression</label>
+      <select name="compression">
+        <option value="none">none</option>
+        <option value="gzip">gzip</option>
+        <option value="snappy">snappy</option>
+        <option value="lz4">lz4</option>
+        <option value="zstd">zstd</option>
+      </select>
+      <label>Value pad (KiB per message — increases payload)</label>
+      <input type="number" name="value_pad_kb" value="0" min="0" max="512"/>
+      <label style="display:flex;align-items:center;gap:0.5rem;max-width:28rem;">
+        <input type="checkbox" name="enable_idempotence" style="width:auto"/> enable_idempotence (forces acks=all)
+      </label>
+      <button type="submit">Produce</button>
+    </form>
+  </fieldset>
+
+  <h3 class="kafka-out-h">Producer response (JSON)</h3>
+  <p id="statusProduce" class="kafka-status"></p>
+  <pre id="outProduce" class="kafka-pre">Submit <strong>Produce</strong> — expect <code>ok</code>, <code>elapsed_sec</code>, <code>approx_throughput_rps</code>, <code>effective_acks</code>, …</pre>
+
+  <h2>Consumer poll</h2>
+  <p class="note kafka-out-note"><strong>Broker topics</strong> and <strong>Hints</strong> write JSON to the <strong>Consumer / broker</strong> panel under the form.</p>
+  <button type="button" id="btnMeta">Broker topics (metadata)</button>
+  <button type="button" class="secondary" id="btnHints">Hints cheat-sheet</button>
+
+  <fieldset>
+    <form id="cons">
+      <label>Topic</label>
+      <input type="text" name="topic" value="{kafka_lab.DEFAULT_LAB_TOPIC}" autocomplete="off"/>
+      <label>group_id (optional — empty = random ephemeral group)</label>
+      <input type="text" name="group_id" value="" placeholder="demo-hub-my-group" autocomplete="off"/>
+      <label>max_messages</label>
+      <input type="number" name="max_messages" value="30" min="1" max="500"/>
+      <label>timeout_ms</label>
+      <input type="number" name="timeout_ms" value="15000" min="500" max="120000"/>
+      <label>auto_offset_reset</label>
+      <select name="auto_offset_reset">
+        <option value="earliest">earliest</option>
+        <option value="latest">latest</option>
+      </select>
+      <button type="submit">Consume poll</button>
+    </form>
+  </fieldset>
+
+  <h3 class="kafka-out-h">Consumer / broker JSON</h3>
+  <p id="statusConsume" class="kafka-status"></p>
+  <pre id="outConsume" class="kafka-pre"><strong>Consume poll</strong> → <code>messages</code>, <code>count</code>, <code>auto_offset_reset</code>, <code>group_id</code>. <strong>latest</strong> + backlog already produced → often <code>count: 0</code>; use <strong>earliest</strong> to read older data.</pre>
+
+  <script>
+    const statusProduce = document.getElementById("statusProduce");
+    const outProduce = document.getElementById("outProduce");
+    const statusConsume = document.getElementById("statusConsume");
+    const outConsume = document.getElementById("outConsume");
+
+    async function readJSON(url, opts) {{
+      const r = await fetch(url, opts);
+      const text = await r.text();
+      if (!r.ok) {{
+        throw new Error(`HTTP ${{r.status}} ${{r.statusText || ""}}: ${{text.slice(0, 1200)}}`);
+      }}
+      try {{
+        return JSON.parse(text);
+      }} catch (parseErr) {{
+        throw new Error(`Expected JSON from ${{url}}; body starts with: ${{text.slice(0, 400)}}`);
+      }}
+    }}
+
+    async function showPanel(statusEl, outEl, fetchFn) {{
+      statusEl.textContent = "Working…";
+      statusEl.className = "kafka-status";
+      outEl.textContent = "";
+      try {{
+        const d = await fetchFn();
+        outEl.textContent = JSON.stringify(d, null, 2);
+        const errMsg = d && typeof d === "object" && d.ok === false ? (d.error || "failed") : null;
+        statusEl.textContent = errMsg || "OK";
+        statusEl.className = errMsg ? "kafka-status err" : "kafka-status ok";
+      }} catch (e) {{
+        const msg = String(e);
+        statusEl.textContent = msg;
+        statusEl.className = "kafka-status err";
+        outEl.textContent = msg;
+      }}
+    }}
+
+    document.getElementById("btnMeta").onclick = () =>
+      showPanel(statusConsume, outConsume, async () => readJSON("/api/kafka/lab/metadata"));
+
+    document.getElementById("btnHints").onclick = () =>
+      showPanel(statusConsume, outConsume, async () => readJSON("/api/kafka/lab/hints"));
+
+    function fdJSON(fd, producerForm) {{
+      const o = {{}};
+      for (const [k, v] of fd.entries()) {{
+        if (k === "enable_idempotence") continue;
+        if (v === "") continue;
+        const numKeys = new Set(["count", "linger_ms", "batch_size", "value_pad_kb", "max_messages", "timeout_ms"]);
+        o[k] = numKeys.has(k) ? Number(v) : String(v);
+      }}
+      if (producerForm) {{
+        const cb = document.querySelector("#prod input[name=enable_idempotence]");
+        o.enable_idempotence = !!(cb && cb.checked);
+      }}
+      return o;
+    }}
+
+    document.getElementById("prod").onsubmit = async (ev) => {{
+      ev.preventDefault();
+      const body = fdJSON(new FormData(ev.target), true);
+      await showPanel(statusProduce, outProduce, async () =>
+        readJSON("/api/kafka/lab/produce", {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify(body),
+        }}));
+    }};
+
+    document.getElementById("cons").onsubmit = async (ev) => {{
+      ev.preventDefault();
+      const body = fdJSON(new FormData(ev.target), false);
+      await showPanel(statusConsume, outConsume, async () =>
+        readJSON("/api/kafka/lab/consume", {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify(body),
+        }}));
+    }};
   </script>
 </body>
 </html>
@@ -2406,6 +2616,39 @@ class TrinoQueryBody(BaseModel):
     schema: str | None = Field(None, max_length=128)
 
 
+class KafkaLabProduceBody(BaseModel):
+    topic: str = Field(default="", max_length=249)
+    count: int = Field(default=100, ge=1, le=20_000)
+    key_mode: Literal["none", "fixed", "random", "per_message"] = "per_message"
+    fixed_key: str = Field(default="lab", max_length=200)
+    acks: Literal["0", "1", "all"] = "1"
+    linger_ms: int = Field(default=5, ge=0, le=30_000)
+    batch_size: int = Field(default=16384, ge=1024, le=5_000_000)
+    compression: Literal["none", "gzip", "snappy", "lz4", "zstd"] = "none"
+    value_pad_kb: int = Field(default=0, ge=0, le=512)
+    enable_idempotence: bool = False
+
+    @model_validator(mode="after")
+    def _normalize_topic(self) -> Self:
+        t = self.topic.strip() or kafka_lab.DEFAULT_LAB_TOPIC
+        object.__setattr__(self, "topic", kafka_lab.validate_topic(t))
+        return self
+
+
+class KafkaLabConsumeBody(BaseModel):
+    topic: str = Field(default="", max_length=249)
+    group_id: str = Field(default="", max_length=240)
+    max_messages: int = Field(default=20, ge=1, le=500)
+    timeout_ms: int = Field(default=15_000, ge=500, le=120_000)
+    auto_offset_reset: Literal["earliest", "latest"] = "earliest"
+
+    @model_validator(mode="after")
+    def _normalize_topic_consume(self) -> Self:
+        t = self.topic.strip() or kafka_lab.DEFAULT_LAB_TOPIC
+        object.__setattr__(self, "topic", kafka_lab.validate_topic(t))
+        return self
+
+
 class PostgresLogicalInsertBody(BaseModel):
     note: str = ""
 
@@ -3155,9 +3398,40 @@ async def scenario_page():
     return HTMLResponse(SCENARIO_PAGE)
 
 
+@app.get("/kafka", response_class=HTMLResponse)
+async def kafka_lab_page():
+    return HTMLResponse(KAFKA_PAGE)
+
+
 @app.get("/connections", response_class=HTMLResponse)
 async def connections_page():
     return HTMLResponse(CONNECTIONS_PAGE)
+
+
+@app.get("/api/kafka/lab/metadata")
+async def api_kafka_lab_metadata():
+    return await asyncio.to_thread(kafka_lab.metadata)
+
+
+@app.get("/api/kafka/lab/hints")
+async def api_kafka_lab_hints():
+    return kafka_lab.describe_snippet()
+
+
+@app.post("/api/kafka/lab/produce")
+async def api_kafka_lab_produce(body: KafkaLabProduceBody):
+    def _run() -> dict[str, Any]:
+        return kafka_lab.produce_burst(**body.model_dump())
+
+    return await asyncio.to_thread(_run)
+
+
+@app.post("/api/kafka/lab/consume")
+async def api_kafka_lab_consume(body: KafkaLabConsumeBody):
+    def _run() -> dict[str, Any]:
+        return kafka_lab.consume_poll(**body.model_dump())
+
+    return await asyncio.to_thread(_run)
 
 
 @app.get("/trino", response_class=HTMLResponse)

@@ -316,7 +316,7 @@ def _hub_wait_upstream() -> str:
                   exit 0
                 fi
                 if [ $((i % 15)) -eq 0 ]; then
-                  echo "wait-hub-deps: attempt $i/200 — kafka:9092=$(p {kh} 9092) opensearch:9200=$(p {oh} 9200) postgres:5432=$(p {pg} 5432) postgres-sub:5432=$(p {pgsub} 5432) cassandra-0:9042=$(p {cs0} 9042) redis:6379=$(p {rd} 6379) mssql-publisher:1433=$(p {ms} 1433) trino:8080=$(p {tn} 8080) (mongos not gated)" >&2
+                  echo "wait-hub-deps: attempt $i/200 — kafka:9092=$(p {kh} 9092) opensearch:9200=$(p {oh} 9200) postgres:5432=$(p {pg} 5432) postgres-sub:5432=$(p {pgsub} 5432) cassandra-0:9042=$(p {cs0} 9042) redis:6379=$(p {rd} 6379) mssql-publisher:1433=$(p {ms} 1433) trino:8080=$(p {tn} 8080) (hub skips mongos; Trino init waits mongos -> :8080)" >&2
                 fi
                 sleep 2
               done
@@ -340,6 +340,7 @@ def _trino_wait_deps() -> str:
             - -c
             - |
               apk add --no-cache netcat-openbsd >/dev/null
+              p() {{ nc -z -w 3 "$1" "$2" 2>/dev/null && echo OK || echo FAIL; }}
               for i in $(seq 1 180); do
                 if nc -z -w 3 {pg} 5432 2>/dev/null \\
                   && nc -z -w 3 {oh} 9200 2>/dev/null \\
@@ -347,6 +348,9 @@ def _trino_wait_deps() -> str:
                   && nc -z -w 3 {ms} 1433 2>/dev/null; then
                   echo "wait-trino-deps: OK (attempt $i)" >&2
                   exit 0
+                fi
+                if [ $((i % 15)) -eq 0 ]; then
+                  echo "wait-trino-deps: attempt $i/180 — postgres:5432=$(p {pg} 5432) opensearch:9200=$(p {oh} 9200) mongo-mongos1:27017=$(p {mg} 27017) mssql-publisher:1433=$(p {ms} 1433)" >&2
                 fi
                 sleep 2
               done
@@ -556,6 +560,7 @@ def deployment(
     strategy_recreate: bool = False,
     readiness_probe: str | None = None,
     env_secret_refs: list[tuple[str, str, str]] | None = None,
+    image_pull_policy: str = "IfNotPresent",
 ) -> str:
     ml, pl = lbl(group, name, extra_labels)
     port_block = "\n".join(
@@ -618,7 +623,7 @@ spec:
 {sec}{init}      containers:
         - name: {cname}
           image: {image}
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: {image_pull_policy}
 {cmd}{arg}{ev}{res}{vol_mount}          ports:
 {port_block}
 {rprobe}{vol}"""
@@ -2162,9 +2167,8 @@ exec bash /scripts/register-mssql-connectors.sh "http://kafka-connect:8083"
         "mssql-kafka-scripts",
         active_deadline_seconds=3600,
         env_secret_refs=[("MSSQL_SA_PASSWORD", SECRET_NAME, SK_MSSQL_SA_PASSWORD)],
-        # Local-only image (build-mssql-tools-image.sh). IfNotPresent matches other demo images:
-        # use node-local image when present (OrbStack/Docker Desktop shared store); otherwise pull is attempted and fails until built.
-        image_pull_policy="IfNotPresent",
+        # Local-only image (build-mssql-tools-image.sh). Never matches hub-demo-ui: never pull mcac-demo/* from a registry.
+        image_pull_policy="Never",
     )
     return join_docs(cm, job)
 
@@ -2287,6 +2291,7 @@ def hub_demo_ui() -> str:
             ("OPENSEARCH_URL", "http://opensearch:9200"),
             ("OPENSEARCH_INDEX", "hub-orders"),
             ("KAFKA_BOOTSTRAP", "kafka:9092"),
+            ("KAFKA_LAB_TOPIC", "demo-hub.kafka.lab"),
             ("CASSANDRA_WORKLOAD_REQUEST_TIMEOUT_SECONDS", "300"),
             ("CASSANDRA_WORKLOAD_INTER_BATCH_SLEEP_MS", "25"),
             ("CASSANDRA_WORKLOAD_WRITE_RETRIES", "3"),
@@ -2307,6 +2312,7 @@ def hub_demo_ui() -> str:
             ("REDIS_URL", SECRET_NAME, SK_HUB_REDIS_URL),
             ("MSSQL_SA_PASSWORD", SECRET_NAME, SK_MSSQL_SA_PASSWORD),
         ],
+        image_pull_policy="Never",
     )
 
 
