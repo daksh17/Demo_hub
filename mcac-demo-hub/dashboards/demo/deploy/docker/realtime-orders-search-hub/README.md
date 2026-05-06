@@ -29,6 +29,8 @@ A customer places an order: the **API** persists the order in **Postgres** and u
 
 Service **`hub-demo-ui`** in **`../../../docker-compose.yml`** serves a small page on **http://localhost:8888**.
 
+**Kafka lab** (**`/kafka`** — producer knobs, short consumer polls, deep-knowledge notes): [`demo-ui/README.md`](demo-ui/README.md).
+
 1. Start the full demo stack (includes **`mongo-kafka-prepare`** so Mongo collections exist): use **`../start-full-stack.sh`** or `docker compose build hub-demo-ui && docker compose up -d`.
 2. Open **http://localhost:8888** and click **Create demo order**.
 3. The response JSON shows per-store success and the shared **`order_id`**. The page also links to Grafana, Prometheus, OpenSearch Dashboards, and Kafka Connect.
@@ -60,7 +62,7 @@ Source: **[`demo-ui/`](demo-ui/)** (FastAPI + Dockerfile).
 
 **If you only see raw `flowchart` / `sequenceDiagram` text:** your preview does not render Mermaid. That is normal in **Cursor / VS Code** unless you add a Mermaid-capable Markdown preview (e.g. extension “Markdown Preview Mermaid Support”). **GitHub** renders Mermaid in `README.md` on the repo website.
 
-**Sections 1, 2, and 6** show the **Mermaid diagram first** (always up to date in git), then an **SVG** snapshot. Older sections (3–5) still lead with SVG + collapsible Mermaid. Regenerate SVGs from [`.mmd` files in `diagrams/`](diagrams/) with [`diagrams/render-all.sh`](diagrams/render-all.sh) so PNG/PDF-style viewers match.
+**Sections 1, 2, 6, and 7** show the **Mermaid diagram first** (always up to date in git), then an **SVG** snapshot. Older sections (3–5) still lead with SVG + collapsible Mermaid. Regenerate SVGs from [`.mmd` files in `diagrams/`](diagrams/) with [`diagrams/render-all.sh`](diagrams/render-all.sh) so PNG/PDF-style viewers match.
 
 ### 1. Component context (stack + data paths)
 
@@ -321,6 +323,100 @@ flowchart TD
 
 </details>
 
+### 7. Multi-DB Faker + Scenario vs Kafka Connect (all demo topics & connectors)
+
+One overview: **`hub-demo-ui`** produces **`scenario.*`** topics directly (not Connect). The six registration scripts add **Debezium sources + sinks** on **`demo_items`** / **`scenario_catalog_mirror_mssql`** paths plus Connect’s **`pgdemo_connect_*`** meta topics. Layout is **striped A→D** for printing (read top to bottom; each CDC row is left‑to‑right).
+
+**Printing:** Open [`diagrams/06-flowchart-multi-db-faker-connect-overview.svg`](diagrams/06-flowchart-multi-db-faker-connect-overview.svg) in Preview or a browser → Print → **Landscape**, **fit to page** (SVG export uses a wide canvas). Regenerate after edits: [`diagrams/render-all.sh`](diagrams/render-all.sh).
+
+**Source:** [`diagrams/06-flowchart-multi-db-faker-connect-overview.mmd`](diagrams/06-flowchart-multi-db-faker-connect-overview.mmd).
+
+```mermaid
+%% Multi-DB demo — print-friendly layout (landscape or fit-to-page PDF).
+%% Topics/connectors: register-connectors.sh, register-mongo-connectors.sh, register-mssql-connectors.sh.
+%%{init: {'theme': 'neutral', 'flowchart': {'nodeSpacing': 36, 'rankSpacing': 52, 'padding': 22, 'curve': 'basis'}, 'themeVariables': {'fontSize': '13px', 'fontFamily': 'ui-sans-serif, system-ui, sans-serif'}}}%%
+flowchart TB
+  subgraph SEC_A["A — Application (hub-demo-ui)"]
+    direction LR
+    UI["/scenario steps 1–4<br/>Faker · pipelines · workload"]
+    OD["Create demo order<br/>→ demo_items"]
+  end
+
+  subgraph SEC_B["B — Kafka topics from hub only (not Connect)"]
+    direction LR
+    T1[scenario.catalog.changes]
+    T2[scenario.orders.events]
+    T3[scenario.pipeline.sync]
+  end
+
+  UI --> T1
+  UI --> T2
+  UI --> T3
+
+  WSTORES["/scenario multi-store writes:<br/>Postgres scenario_* · Mongo · MSSQL catalog mirror<br/>OpenSearch · Redis · Cassandra"]
+  UI --> WSTORES
+
+  PGdem[(Postgres<br/>public.demo_items)]
+  MGdem[(Mongo<br/>demo.demo_items)]
+
+  OD --> PGdem
+  OD --> MGdem
+
+  subgraph SEC_PG["C1 — Postgres CDC (Kafka Connect :8083)"]
+    direction LR
+    PGdem --> SRCpg[pg-source-demo]
+    SRCpg --> TOPpg[demopg.public.demo_items]
+    TOPpg --> SNKpg[jdbc-sink-demo]
+    SNKpg --> PGsink[(Postgres<br/>demo_items_from_kafka)]
+    SRCpg -.-> SCHpg[demopg.schema-changes.internal]
+  end
+
+  subgraph SEC_MG["C2 — Mongo CDC (Kafka Connect :8083)"]
+    direction LR
+    MGdem --> SRCmg[mongo-source-demo]
+    SRCmg --> TOPmg[demomongo.demo.demo_items]
+    TOPmg --> SNKmg[mongo-sink-demo]
+    SNKmg --> MGsink[(Mongo<br/>demo_items_from_kafka)]
+  end
+
+  MSpub[(MSSQL publisher<br/>dbo.scenario_catalog_mirror_mssql)]
+  UI -.->|"step 2 MERGE"| MSpub
+
+  subgraph SEC_MS["C3 — SQL Server CDC (Kafka Connect :8083)"]
+    direction LR
+    MSpub --> SRCms[mssql-source-demo]
+    SRCms --> TOPms[demomssql.dbo.scenario_catalog_mirror_mssql]
+    TOPms --> SNKms[mssql-jdbc-sink-demo]
+    SNKms --> MSsub[(MSSQL subscriber<br/>dbo.demo_items_from_kafka_mssql)]
+    SRCms -.-> SCHms[demomssql.schema-changes.internal]
+  end
+
+  subgraph SEC_META["D — Connect worker internal topics"]
+    direction LR
+    Cf[pgdemo_connect_configs]
+    Of[pgdemo_connect_offsets]
+    Sf[pgdemo_connect_statuses]
+  end
+
+  KREST[Kafka Connect worker] -.-> Cf
+  KREST -.-> Of
+  KREST -.-> Sf
+```
+
+![Multi-DB Faker + Connect overview (SVG)](./diagrams/06-flowchart-multi-db-faker-connect-overview.svg)
+
+<details>
+<summary>Registration scripts</summary>
+
+| Path | Connectors |
+|------|------------|
+| [`../postgres-kafka/register-connectors.sh`](../postgres-kafka/register-connectors.sh) | `pg-source-demo`, `jdbc-sink-demo` |
+| [`../mongo-kafka/register-mongo-connectors.sh`](../mongo-kafka/register-mongo-connectors.sh) | `mongo-source-demo`, `mongo-sink-demo` |
+| [`../mssql-kafka/register-mssql-connectors.sh`](../mssql-kafka/register-mssql-connectors.sh) | `mssql-source-demo`, `mssql-jdbc-sink-demo` |
+| [`../kafka-connect-register/register-all-connectors.sh`](../kafka-connect-register/register-all-connectors.sh) | All six (use **`DEMO_HUB_K8S=1`** for cluster bootstrap + MSSQL schema) |
+
+</details>
+
 ---
 
 ## Phase map (what to build vs what exists)
@@ -435,6 +531,7 @@ The same diagrams are **embedded above** under **Entire workflow (diagrams)**. E
 | [`diagrams/03-flowchart-mongo-path.mmd`](diagrams/03-flowchart-mongo-path.mmd) | [`diagrams/03-flowchart-mongo-path.svg`](diagrams/03-flowchart-mongo-path.svg) | **Stepped** Mongo CDC path |
 | [`diagrams/04-flowchart-cassandra-redis-os.mmd`](diagrams/04-flowchart-cassandra-redis-os.mmd) | [`diagrams/04-flowchart-cassandra-redis-os.svg`](diagrams/04-flowchart-cassandra-redis-os.svg) | Cassandra, Redis, OpenSearch fan-out |
 | [`diagrams/05-flowchart-mssql-path.mmd`](diagrams/05-flowchart-mssql-path.mmd) | [`diagrams/05-flowchart-mssql-path.svg`](diagrams/05-flowchart-mssql-path.svg) | **SQL Server** stepped CDC + JDBC sink |
+| [`diagrams/06-flowchart-multi-db-faker-connect-overview.mmd`](diagrams/06-flowchart-multi-db-faker-connect-overview.mmd) | [`diagrams/06-flowchart-multi-db-faker-connect-overview.svg`](diagrams/06-flowchart-multi-db-faker-connect-overview.svg) | **Single overview** (striped **A–D**, wide SVG for print): Faker /scenario + **`scenario.*`** vs six connectors |
 
 ---
 
@@ -452,6 +549,7 @@ npx --yes @mermaid-js/mermaid-cli@11.4.0 -i diagrams/02-flowchart-postgres-path.
 npx --yes @mermaid-js/mermaid-cli@11.4.0 -i diagrams/03-flowchart-mongo-path.mmd -o diagrams/03-flowchart-mongo-path.svg -b transparent
 npx --yes @mermaid-js/mermaid-cli@11.4.0 -i diagrams/04-flowchart-cassandra-redis-os.mmd -o diagrams/04-flowchart-cassandra-redis-os.svg -b transparent
 npx --yes @mermaid-js/mermaid-cli@11.4.0 -i diagrams/05-flowchart-mssql-path.mmd -o diagrams/05-flowchart-mssql-path.svg -b transparent
+npx --yes @mermaid-js/mermaid-cli@11.4.0 -i diagrams/06-flowchart-multi-db-faker-connect-overview.mmd -o diagrams/06-flowchart-multi-db-faker-connect-overview.svg -b transparent -w 2400
 ```
 
 ---

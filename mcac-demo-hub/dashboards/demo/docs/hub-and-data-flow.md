@@ -9,8 +9,9 @@ This page describes **application behavior** that is the same in Docker Compose 
 | **http://localhost:8888** | Home: single-order demo, links to stores |
 | **http://localhost:8888/workload** | Tunable batch load across Postgres, Mongo, Redis, Cassandra, OpenSearch, and optionally **SQL Server** (`demo.dbo.hub_workload_mssql` on the publisher) |
 | **http://localhost:8888/scenario** | Multi-DB scenario (Faker, pipelines, Kafka topics from Python — independent of Kafka Connect unless you also register connectors) |
+| **http://localhost:8888/kafka** | **Kafka lab:** broker metadata, produce bursts (acks / linger / batch / compression / keys), short consumer polls (explore ordering, groups, offsets) against **`KAFKA_BOOTSTRAP`** |
 
-**Implementation:** [`deploy/docker/realtime-orders-search-hub/demo-ui/`](../deploy/docker/realtime-orders-search-hub/demo-ui/) (FastAPI). **Narrative + diagrams:** [`deploy/docker/realtime-orders-search-hub/README.md`](../deploy/docker/realtime-orders-search-hub/README.md), [`scenario-flow/README.md`](../deploy/docker/realtime-orders-search-hub/scenario-flow/README.md).
+**Implementation:** [`deploy/docker/realtime-orders-search-hub/demo-ui/`](../deploy/docker/realtime-orders-search-hub/demo-ui/) (FastAPI). **Kafka lab (API, env, curriculum):** [`deploy/docker/realtime-orders-search-hub/demo-ui/README.md`](../deploy/docker/realtime-orders-search-hub/demo-ui/README.md). **Narrative + diagrams:** [`deploy/docker/realtime-orders-search-hub/README.md`](../deploy/docker/realtime-orders-search-hub/README.md), [`scenario-flow/README.md`](../deploy/docker/realtime-orders-search-hub/scenario-flow/README.md).
 
 ## Kafka Connect & CDC (Postgres + Mongo + optional SQL Server)
 

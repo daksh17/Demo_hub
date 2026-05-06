@@ -43,7 +43,7 @@ spec:
                   exit 0
                 fi
                 if [ $((i % 15)) -eq 0 ]; then
-                  echo "wait-hub-deps: attempt $i/200 — kafka:9092=$(p kafka.demo-hub.svc.cluster.local 9092) opensearch:9200=$(p opensearch.demo-hub.svc.cluster.local 9200) postgres:5432=$(p postgresql-primary.demo-hub.svc.cluster.local 5432) postgres-sub:5432=$(p postgres-sub.demo-hub.svc.cluster.local 5432) cassandra-0:9042=$(p cassandra-0.cassandra-headless.demo-hub.svc.cluster.local 9042) redis:6379=$(p redis.demo-hub.svc.cluster.local 6379) mssql-publisher:1433=$(p mssql-publisher.demo-hub.svc.cluster.local 1433) trino:8080=$(p trino.demo-hub.svc.cluster.local 8080) (mongos not gated)" >&2
+                  echo "wait-hub-deps: attempt $i/200 — kafka:9092=$(p kafka.demo-hub.svc.cluster.local 9092) opensearch:9200=$(p opensearch.demo-hub.svc.cluster.local 9200) postgres:5432=$(p postgresql-primary.demo-hub.svc.cluster.local 5432) postgres-sub:5432=$(p postgres-sub.demo-hub.svc.cluster.local 5432) cassandra-0:9042=$(p cassandra-0.cassandra-headless.demo-hub.svc.cluster.local 9042) redis:6379=$(p redis.demo-hub.svc.cluster.local 6379) mssql-publisher:1433=$(p mssql-publisher.demo-hub.svc.cluster.local 1433) trino:8080=$(p trino.demo-hub.svc.cluster.local 8080) (hub skips mongos; Trino init waits mongos -> :8080)" >&2
                 fi
                 sleep 2
               done
@@ -53,7 +53,7 @@ spec:
       containers:
         - name: hub-demo-ui
           image: mcac-demo/hub-demo-ui:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Never
           env:
             - name: MONGO_URI
               value: "mongodb://mongo-mongos1:27017"
@@ -67,6 +67,8 @@ spec:
               value: "hub-orders"
             - name: KAFKA_BOOTSTRAP
               value: "kafka:9092"
+            - name: KAFKA_LAB_TOPIC
+              value: "demo-hub.kafka.lab"
             - name: CASSANDRA_WORKLOAD_REQUEST_TIMEOUT_SECONDS
               value: "300"
             - name: CASSANDRA_WORKLOAD_INTER_BATCH_SLEEP_MS
