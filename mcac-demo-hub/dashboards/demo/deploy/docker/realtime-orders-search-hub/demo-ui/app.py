@@ -1458,6 +1458,7 @@ KAFKA_PAGE = f"""<!DOCTYPE html>
       margin: 0.5rem 0.65rem 0 0;
     }}
     button.secondary {{ background: #38444d; }}
+    button.danger {{ background: #8b2f2f; }}
     button:disabled {{ opacity: 0.5; cursor: not-allowed; }}
     #status {{ margin-top: 0.85rem; font-size: 0.88rem; }}
     #status.ok {{ color: #7af87a; }} #status.err {{ color: #f66; }}
@@ -1478,7 +1479,8 @@ KAFKA_PAGE = f"""<!DOCTYPE html>
   <p class="note">Uses <code>KAFKA_BOOTSTRAP</code> from the hub container (<strong>{kafka_lab.KAFKA_BOOTSTRAP}</strong>).
     Produce bursts with tunable <strong>acks</strong>, <strong>linger</strong>, <strong>batch_size</strong>, <strong>compression</strong>, and key strategy (ordering demos).
     Short-lived consumers use ephemeral <strong>group_id</strong> by default so each poll can read from <strong>earliest</strong> without resetting offsets manually.
-    <strong>latest</strong> only sees records appended <em>after</em> that consumer joins — produce first and use <strong>earliest</strong> to read an existing backlog.</p>
+    <strong>latest</strong> only sees records appended <em>after</em> that consumer joins — produce first and use <strong>earliest</strong> to read an existing backlog.
+    Turn on <strong>enable_auto_commit</strong> and reuse the same <strong>group_id</strong> to persist offsets between polls (next run continues after the last committed position).</p>
 
   <h2>Producer load</h2>
   <fieldset>
@@ -1541,19 +1543,26 @@ KAFKA_PAGE = f"""<!DOCTYPE html>
       <label>max_messages</label>
       <input type="number" name="max_messages" value="30" min="1" max="500"/>
       <label>timeout_ms</label>
-      <input type="number" name="timeout_ms" value="15000" min="500" max="120000"/>
+      <input type="number" name="timeout_ms" value="15000" min="500" max="600000"/>
       <label>auto_offset_reset</label>
       <select name="auto_offset_reset">
         <option value="earliest">earliest</option>
         <option value="latest">latest</option>
       </select>
-      <button type="submit">Consume poll</button>
+      <label style="display:flex;align-items:center;gap:0.5rem;max-width:28rem;">
+        <input type="checkbox" name="enable_auto_commit" style="width:auto"/> enable_auto_commit (sync commit before close; reuse same group_id to resume)
+      </label>
+      <label style="display:flex;align-items:center;gap:0.5rem;max-width:28rem;">
+        <input type="checkbox" name="continuous_consume" style="width:auto"/> Continuous until Stop — repeats consume in the browser (same group_id; auto-filled if empty). Turn on <strong>enable_auto_commit</strong> to advance offsets between rounds.
+      </label>
+      <button type="submit" id="btnConsumeSubmit">Consume poll</button>
+      <button type="button" class="danger" id="btnStopStream" disabled>Stop streaming</button>
     </form>
   </fieldset>
 
   <h3 class="kafka-out-h">Consumer / broker JSON</h3>
   <p id="statusConsume" class="kafka-status"></p>
-  <pre id="outConsume" class="kafka-pre"><strong>Consume poll</strong> → <code>messages</code>, <code>count</code>, <code>auto_offset_reset</code>, <code>group_id</code>. <strong>latest</strong> + backlog already produced → often <code>count: 0</code>; use <strong>earliest</strong> to read older data.</pre>
+  <pre id="outConsume" class="kafka-pre"><strong>Consume poll</strong> → <code>messages</code>, <code>count</code>, <code>auto_offset_reset</code>, <code>group_id</code>, <code>enable_auto_commit</code>. <strong>latest</strong> + backlog already produced → often <code>count: 0</code>; use <strong>earliest</strong> for a new group. With <strong>enable_auto_commit</strong> + fixed <code>group_id</code>, the next poll continues after committed offsets.</pre>
 
   <script>
     const statusProduce = document.getElementById("statusProduce");
@@ -1598,10 +1607,12 @@ KAFKA_PAGE = f"""<!DOCTYPE html>
     document.getElementById("btnHints").onclick = () =>
       showPanel(statusConsume, outConsume, async () => readJSON("/api/kafka/lab/hints"));
 
-    function fdJSON(fd, producerForm) {{
+    function fdJSON(fd, producerForm = false, consumerForm = false) {{
       const o = {{}};
       for (const [k, v] of fd.entries()) {{
         if (k === "enable_idempotence") continue;
+        if (k === "enable_auto_commit") continue;
+        if (k === "continuous_consume") continue;
         if (v === "") continue;
         const numKeys = new Set(["count", "linger_ms", "batch_size", "value_pad_kb", "max_messages", "timeout_ms"]);
         o[k] = numKeys.has(k) ? Number(v) : String(v);
@@ -1610,12 +1621,16 @@ KAFKA_PAGE = f"""<!DOCTYPE html>
         const cb = document.querySelector("#prod input[name=enable_idempotence]");
         o.enable_idempotence = !!(cb && cb.checked);
       }}
+      if (consumerForm) {{
+        const cbac = document.querySelector("#cons input[name=enable_auto_commit]");
+        o.enable_auto_commit = !!(cbac && cbac.checked);
+      }}
       return o;
     }}
 
     document.getElementById("prod").onsubmit = async (ev) => {{
       ev.preventDefault();
-      const body = fdJSON(new FormData(ev.target), true);
+      const body = fdJSON(new FormData(ev.target), true, false);
       await showPanel(statusProduce, outProduce, async () =>
         readJSON("/api/kafka/lab/produce", {{
           method: "POST",
@@ -1624,15 +1639,86 @@ KAFKA_PAGE = f"""<!DOCTYPE html>
         }}));
     }};
 
+    let kafkaLabStreamStop = false;
+
+    async function runContinuousConsume(body) {{
+      kafkaLabStreamStop = false;
+      const btnStop = document.getElementById("btnStopStream");
+      const btnGo = document.getElementById("btnConsumeSubmit");
+      btnStop.disabled = false;
+      btnGo.disabled = true;
+      statusConsume.textContent = "Streaming… click Stop when done";
+      statusConsume.className = "kafka-status ok";
+      outConsume.textContent = "";
+
+      if (!body.group_id || String(body.group_id).trim() === "") {{
+        body.group_id = "demo-hub-stream-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
+      }}
+
+      const batches = [];
+      let totalMsgs = 0;
+      let iter = 0;
+      try {{
+        while (!kafkaLabStreamStop) {{
+          iter += 1;
+          const d = await readJSON("/api/kafka/lab/consume", {{
+            method: "POST",
+            headers: {{ "Content-Type": "application/json" }},
+            body: JSON.stringify(body),
+          }});
+          totalMsgs += typeof d.count === "number" ? d.count : 0;
+          batches.push({{ iteration: iter, count: d.count, elapsed_sec: d.elapsed_sec, ok: d.ok }});
+          const preview = {{
+            streaming: true,
+            hint: "Stop halts after the current HTTP round finishes.",
+            iterations: iter,
+            total_messages_so_far: totalMsgs,
+            effective_group_id: body.group_id,
+            enable_auto_commit: body.enable_auto_commit,
+            last_batch: d,
+            batch_history: batches.slice(-12),
+          }};
+          outConsume.textContent = JSON.stringify(preview, null, 2);
+          if (!d.ok) {{
+            statusConsume.textContent = d.error || "batch failed";
+            statusConsume.className = "kafka-status err";
+            break;
+          }}
+          await new Promise((r) => setTimeout(r, 150));
+        }}
+        if (kafkaLabStreamStop) {{
+          statusConsume.textContent = "Stopped by user";
+          statusConsume.className = "kafka-status ok";
+        }}
+      }} catch (e) {{
+        statusConsume.textContent = String(e);
+        statusConsume.className = "kafka-status err";
+        outConsume.textContent = String(e);
+      }} finally {{
+        btnStop.disabled = true;
+        btnGo.disabled = false;
+      }}
+    }}
+
+    document.getElementById("btnStopStream").onclick = () => {{
+      kafkaLabStreamStop = true;
+    }};
+
     document.getElementById("cons").onsubmit = async (ev) => {{
       ev.preventDefault();
-      const body = fdJSON(new FormData(ev.target), false);
-      await showPanel(statusConsume, outConsume, async () =>
-        readJSON("/api/kafka/lab/consume", {{
-          method: "POST",
-          headers: {{ "Content-Type": "application/json" }},
-          body: JSON.stringify(body),
-        }}));
+      const cbStream = document.querySelector("#cons input[name=continuous_consume]");
+      const continuous = !!(cbStream && cbStream.checked);
+      const body = fdJSON(new FormData(ev.target), false, true);
+      if (continuous) {{
+        await runContinuousConsume(body);
+      }} else {{
+        await showPanel(statusConsume, outConsume, async () =>
+          readJSON("/api/kafka/lab/consume", {{
+            method: "POST",
+            headers: {{ "Content-Type": "application/json" }},
+            body: JSON.stringify(body),
+          }}));
+      }}
     }};
   </script>
 </body>
@@ -2639,8 +2725,9 @@ class KafkaLabConsumeBody(BaseModel):
     topic: str = Field(default="", max_length=249)
     group_id: str = Field(default="", max_length=240)
     max_messages: int = Field(default=20, ge=1, le=500)
-    timeout_ms: int = Field(default=15_000, ge=500, le=120_000)
+    timeout_ms: int = Field(default=15_000, ge=500, le=600_000)
     auto_offset_reset: Literal["earliest", "latest"] = "earliest"
+    enable_auto_commit: bool = False
 
     @model_validator(mode="after")
     def _normalize_topic_consume(self) -> Self:
