@@ -61,17 +61,24 @@ Response includes **`elapsed_sec`**, **`approx_throughput_rps`**, **`effective_a
 | **`timeout_ms`** | Wall-clock budget for assignment + polling (**500–600_000** ms). |
 | **`auto_offset_reset`** | **`earliest`** or **`latest`** when no committed offset exists for the group. |
 | **`enable_auto_commit`** | **`false`** (default): no offset commit. **`true`**: enables broker auto-commit and a synchronous **`commit()`** before **`close()`**; reuse the same **`group_id`** so the next poll resumes after committed offsets (**`auto_offset_reset`** applies only when there is no committed position). |
+| **`parallel_consumers`** | **`1`**–**`3`**. Runs one **`consume_poll`** per thread inside **hub-demo-ui**. **`1`** returns the original flat JSON; **`2`** or **`3`** returns **`consumers`**, **`group_ids_used`**, **`topics_per_consumer`**, **`total_messages_across_consumers`**, etc. |
+| **`topic_consumer_2`** | Optional (parallel ≥ **2**). Topic for parallel instance **1** (0-based: instance **0** uses **`topic`**). Blank → same as **`topic`**. |
+| **`topic_consumer_3`** | Optional (parallel ≥ **3**). Topic for parallel instance **2**. Blank → same as **`topic`**. |
+| **`share_consumer_group`** | **`true`**: all parallel consumers share **one** **`group.id`** (your **`group_id`** or one shared random id) → partitions split across members when the topic has enough partitions. **`false`**: separate **`group.id`** values (**`<your>-inst0`**, **`inst1`**, … when **`group_id`** set; otherwise unrelated random groups — independent reads). |
 
 Implementation notes:
 
 - With **`enable_auto_commit`** off and random **`group_id`**, offsets are **not** stored for the next HTTP poll — compare with **on** + stable **`group_id`** to study resume semantics.
+- **`max_messages`** is enforced **per** parallel consumer (possible total up to **`parallel × max_messages`**).
+- Partition splitting only matters when the topic has **multiple partitions**; a single-partition topic + shared group leaves extra idle-looking instances until producers spread keys.
+- Successful **`consume_poll`** responses include **`assigned_partitions`** (partition IDs assigned after subscribe, before polling) and **`partitions_seen_in_messages`** (unique partitions present in the returned **`messages`** list). Use **`assigned_partitions`** in the UI to see which member owns which partitions when **`share_consumer_group`** is on.
 - Values are deserialized as **JSON**; producing from this lab yields JSON-compatible bodies. Binary or non-JSON topics may error on consume.
 
 Use returned **`partition`** / **`offset`** / **`key`** with **`key_mode`** experiments (e.g. fixed key → records stick to one partition → strict ordering per key).
 
 ### Continuous until Stop (UI only)
 
-On **`/kafka`**, **Continuous until Stop** runs repeated **`POST /api/kafka/lab/consume`** calls in the browser until **Stop streaming**. Use **`enable_auto_commit`** and a stable **`group_id`** (or an auto-filled **`demo-hub-stream-…`** when the field is empty) so each round can advance offsets. Stop applies after the in-flight request completes.
+On **`/kafka`**, **Continuous until Stop** runs repeated **`POST /api/kafka/lab/consume`** calls in the browser until **Stop streaming**. Use **`enable_auto_commit`** and a stable **`group_id`** (or an auto-filled **`demo-hub-stream-…`** when the field is empty) so each round can advance offsets. Stop applies after the in-flight request completes. With **parallel consumers**, the page keeps a streaming summary in the top JSON panel and refreshes **one JSON panel per instance** below (each shows **`assigned_partitions`** when the poll succeeds).
 
 ### Rebuild / deploy
 

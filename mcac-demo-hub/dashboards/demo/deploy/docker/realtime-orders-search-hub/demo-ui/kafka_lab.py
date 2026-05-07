@@ -6,6 +6,7 @@ import os
 import re
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Literal
 
 KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP", "kafka:29092")
@@ -160,6 +161,7 @@ def consume_poll(
     timeout_ms: int,
     auto_offset_reset: Literal["earliest", "latest"],
     enable_auto_commit: bool,
+    consumer_instance_tag: str = "",
 ) -> dict[str, Any]:
     try:
         from kafka import KafkaConsumer  # type: ignore
@@ -176,12 +178,16 @@ def consume_poll(
         auto_offset_reset=auto_offset_reset,
         consumer_timeout_ms=max(timeout_ms, 3000),
         max_poll_records=min(max(1, max_messages), 500),
-        client_id="demo-hub-kafka-lab-consumer",
         value_deserializer=lambda b: json.loads(b.decode("utf-8")) if b else None,
         key_deserializer=lambda b: b.decode("utf-8") if b else None,
     )
     if enable_auto_commit:
         c_kwargs["auto_commit_interval_ms"] = 5000
+    client_id = "demo-hub-kafka-lab-consumer"
+    if (consumer_instance_tag or "").strip():
+        suf = re.sub(r"[^a-zA-Z0-9._-]", "", consumer_instance_tag.strip())[:80]
+        client_id = f"{client_id}-{suf}"[:240]
+    c_kwargs["client_id"] = client_id
     consumer = KafkaConsumer(**c_kwargs)
     out: list[dict[str, Any]] = []
     t0 = time.perf_counter()
@@ -200,6 +206,8 @@ def consume_poll(
                 "group_id": gid,
                 "enable_auto_commit": enable_auto_commit,
             }
+
+        assigned_partitions_sorted = sorted(tp.partition for tp in assigned)
 
         while len(out) < max_messages and time.perf_counter() < deadline:
             remaining_ms = max(100, int((deadline - time.perf_counter()) * 1000))
@@ -247,6 +255,102 @@ def consume_poll(
         "elapsed_sec": round(elapsed, 4),
         "auto_offset_reset": auto_offset_reset,
         "enable_auto_commit": enable_auto_commit,
+        "assigned_partitions": assigned_partitions_sorted,
+        "partitions_seen_in_messages": sorted({m["partition"] for m in out}),
+    }
+
+
+def _topics_for_parallel_workers(
+    primary: str, topic_consumer_2: str, topic_consumer_3: str, n: int
+) -> list[str]:
+    t0 = validate_topic(primary.strip() or DEFAULT_LAB_TOPIC)
+    out: list[str] = [t0]
+    if n >= 2:
+        s2 = (topic_consumer_2 or "").strip()
+        out.append(validate_topic(s2) if s2 else t0)
+    if n >= 3:
+        s3 = (topic_consumer_3 or "").strip()
+        out.append(validate_topic(s3) if s3 else t0)
+    return out
+
+
+def consume_poll_parallel(
+    *,
+    topic: str,
+    topic_consumer_2: str = "",
+    topic_consumer_3: str = "",
+    group_id: str,
+    parallel_consumers: int,
+    share_consumer_group: bool,
+    max_messages: int,
+    timeout_ms: int,
+    auto_offset_reset: Literal["earliest", "latest"],
+    enable_auto_commit: bool,
+) -> dict[str, Any]:
+    """Run multiple kafka-python consumers concurrently (same process).
+
+    ``share_consumer_group=True``: identical ``group.id`` → cooperative assignment splits partitions.
+    ``share_consumer_group=False``: distinct groups ``{base}-inst{i}`` (or independent random ids if base empty).
+    Optional ``topic_consumer_2`` / ``topic_consumer_3`` select different topics for parallel instances (blank repeats ``topic``).
+    Each consumer may fetch up to ``max_messages`` records (cap applies **per instance**).
+    """
+    if parallel_consumers <= 1:
+        return consume_poll(
+            topic=topic,
+            group_id=group_id,
+            max_messages=max_messages,
+            timeout_ms=timeout_ms,
+            auto_offset_reset=auto_offset_reset,
+            enable_auto_commit=enable_auto_commit,
+        )
+
+    topics_used = _topics_for_parallel_workers(
+        topic, topic_consumer_2, topic_consumer_3, parallel_consumers
+    )
+    base = (group_id or "").strip()
+    if share_consumer_group:
+        gids = [base or f"demo-hub-kafka-lab-{uuid.uuid4().hex[:14]}"] * parallel_consumers
+    else:
+        if base:
+            gids = [f"{base}-inst{i}" for i in range(parallel_consumers)]
+        else:
+            gids = [f"demo-hub-kafka-lab-{uuid.uuid4().hex[:14]}" for _ in range(parallel_consumers)]
+
+    def _worker(idx: int) -> dict[str, Any]:
+        tag = f"p{idx}-{uuid.uuid4().hex[:8]}"
+        r = consume_poll(
+            topic=topics_used[idx],
+            group_id=gids[idx],
+            max_messages=max_messages,
+            timeout_ms=timeout_ms,
+            auto_offset_reset=auto_offset_reset,
+            enable_auto_commit=enable_auto_commit,
+            consumer_instance_tag=tag,
+        )
+        merged = dict(r)
+        merged["parallel_index"] = idx
+        return merged
+
+    results: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=parallel_consumers) as pool:
+        futures = [pool.submit(_worker, i) for i in range(parallel_consumers)]
+        for fu in as_completed(futures):
+            results.append(fu.result())
+
+    results.sort(key=lambda x: int(x.get("parallel_index", 0)))
+    ok_all = all(bool(r.get("ok")) for r in results)
+    total = sum(int(r.get("count") or 0) for r in results if r.get("ok"))
+
+    return {
+        "ok": ok_all,
+        "topic": topics_used[0],
+        "topics_per_consumer": topics_used,
+        "parallel_consumers": parallel_consumers,
+        "share_consumer_group": share_consumer_group,
+        "group_ids_used": list(gids),
+        "total_messages_across_consumers": total,
+        "max_messages_per_consumer": max_messages,
+        "consumers": results,
     }
 
 
@@ -264,7 +368,10 @@ def describe_snippet() -> dict[str, Any]:
             "group_id": "empty → random ephemeral group each request",
             "auto_offset_reset": "earliest reads from beginning for new group",
             "enable_auto_commit": "on + fixed group_id commits offsets after poll — next run resumes after last commit",
+            "parallel_consumers": "2–3: shared group.id splits partitions across hub threads; unchecked → separate groups `{base}-inst0`, `-inst1`, …",
+            "topics_per_consumer": "optional topic_consumer_2 / topic_consumer_3 fields assign different topics to parallel instances (blank repeats main topic)",
             "max_messages": "poll loop stops early when enough records collected",
+            "assigned_partitions": "after subscribe, lists partition IDs owned by that consumer member (same group → disjoint assignment when topic has enough partitions)",
         },
         "next_steps": [
             "Compare throughput with linger_ms=0 vs 20 and acks=1 vs all.",
