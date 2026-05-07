@@ -1480,7 +1480,8 @@ KAFKA_PAGE = f"""<!DOCTYPE html>
     Produce bursts with tunable <strong>acks</strong>, <strong>linger</strong>, <strong>batch_size</strong>, <strong>compression</strong>, and key strategy (ordering demos).
     Short-lived consumers use ephemeral <strong>group_id</strong> by default so each poll can read from <strong>earliest</strong> without resetting offsets manually.
     <strong>latest</strong> only sees records appended <em>after</em> that consumer joins — produce first and use <strong>earliest</strong> to read an existing backlog.
-    Turn on <strong>enable_auto_commit</strong> and reuse the same <strong>group_id</strong> to persist offsets between polls (next run continues after the last committed position).</p>
+    Turn on <strong>enable_auto_commit</strong> and reuse the same <strong>group_id</strong> to persist offsets between polls (next run continues after the last committed position).
+    Use <strong>Parallel consumers</strong> (2–3) with <strong>Same consumer group</strong> to mimic multiple members splitting partitions; turn it off for independent groups (<code>-inst0</code>, <code>-inst1</code>, …). Optional <strong>Topic — parallel instance</strong> fields let each thread subscribe to a different topic (blank repeats the main Topic).</p>
 
   <h2>Producer load</h2>
   <fieldset>
@@ -1540,6 +1541,23 @@ KAFKA_PAGE = f"""<!DOCTYPE html>
       <input type="text" name="topic" value="{kafka_lab.DEFAULT_LAB_TOPIC}" autocomplete="off"/>
       <label>group_id (optional — empty = random ephemeral group)</label>
       <input type="text" name="group_id" value="" placeholder="demo-hub-my-group" autocomplete="off"/>
+      <label>Parallel consumers (threads inside hub)</label>
+      <select name="parallel_consumers">
+        <option value="1" selected>1</option>
+        <option value="2">2</option>
+        <option value="3">3</option>
+      </select>
+      <label style="display:flex;align-items:center;gap:0.5rem;max-width:36rem;">
+        <input type="checkbox" name="share_consumer_group" checked style="width:auto"/> <strong>Same consumer group</strong> — identical <code>group.id</code> so Kafka assigns partitions across the parallel instances (off → distinct ids: your <code>group_id</code> plus suffix <code>-inst0</code>, <code>-inst1</code>, … or independent random groups if group_id is empty).
+      </label>
+      <div id="kafkaTopicExtra2" style="display:none;">
+        <label>Topic — parallel instance 1 (optional; blank = main Topic above)</label>
+        <input type="text" name="topic_consumer_2" value="" placeholder="same as main Topic if empty" autocomplete="off"/>
+      </div>
+      <div id="kafkaTopicExtra3" style="display:none;">
+        <label>Topic — parallel instance 2 (optional; blank = main Topic above)</label>
+        <input type="text" name="topic_consumer_3" value="" placeholder="same as main Topic if empty" autocomplete="off"/>
+      </div>
       <label>max_messages</label>
       <input type="number" name="max_messages" value="30" min="1" max="500"/>
       <label>timeout_ms</label>
@@ -1562,13 +1580,101 @@ KAFKA_PAGE = f"""<!DOCTYPE html>
 
   <h3 class="kafka-out-h">Consumer / broker JSON</h3>
   <p id="statusConsume" class="kafka-status"></p>
-  <pre id="outConsume" class="kafka-pre"><strong>Consume poll</strong> → <code>messages</code>, <code>count</code>, <code>auto_offset_reset</code>, <code>group_id</code>, <code>enable_auto_commit</code>. <strong>latest</strong> + backlog already produced → often <code>count: 0</code>; use <strong>earliest</strong> for a new group. With <strong>enable_auto_commit</strong> + fixed <code>group_id</code>, the next poll continues after committed offsets.</pre>
+  <pre id="outConsume" class="kafka-pre"><strong>Consume poll</strong>: one JSON panel for a single consumer or for broker metadata/hints. With parallel &gt;1, the hub shows a <strong>summary</strong> plus one panel per instance (<code>assigned_partitions</code> after subscribe shows what each member owns when using the same <code>group.id</code>). <strong>max_messages</strong> applies <strong>per</strong> instance.</pre>
+  <div id="kafkaParallelWrap" style="display:none;margin-top:0.75rem;">
+    <h3 class="kafka-out-h">Parallel run — summary</h3>
+    <pre id="outConsumeParallelSummary" class="kafka-pre"></pre>
+    <div id="kafkaParallelSec0" class="kafka-par-inst" style="display:none;">
+      <h4 class="kafka-out-h" id="kafkaParallelTitle0"></h4>
+      <pre id="outConsumeInst0" class="kafka-pre"></pre>
+    </div>
+    <div id="kafkaParallelSec1" class="kafka-par-inst" style="display:none;">
+      <h4 class="kafka-out-h" id="kafkaParallelTitle1"></h4>
+      <pre id="outConsumeInst1" class="kafka-pre"></pre>
+    </div>
+    <div id="kafkaParallelSec2" class="kafka-par-inst" style="display:none;">
+      <h4 class="kafka-out-h" id="kafkaParallelTitle2"></h4>
+      <pre id="outConsumeInst2" class="kafka-pre"></pre>
+    </div>
+  </div>
 
   <script>
     const statusProduce = document.getElementById("statusProduce");
     const outProduce = document.getElementById("outProduce");
     const statusConsume = document.getElementById("statusConsume");
     const outConsume = document.getElementById("outConsume");
+    const kafkaParallelWrap = document.getElementById("kafkaParallelWrap");
+
+    function hideKafkaParallelLayout() {{
+      if (!kafkaParallelWrap) return;
+      kafkaParallelWrap.style.display = "none";
+      const sum = document.getElementById("outConsumeParallelSummary");
+      if (sum) sum.textContent = "";
+      for (let i = 0; i < 3; i++) {{
+        const sec = document.getElementById("kafkaParallelSec" + i);
+        const pre = document.getElementById("outConsumeInst" + i);
+        const h = document.getElementById("kafkaParallelTitle" + i);
+        if (sec) sec.style.display = "none";
+        if (pre) pre.textContent = "";
+        if (h) h.textContent = "";
+      }}
+    }}
+
+    function showKafkaParallelLayout(summaryObj, consumers) {{
+      if (!kafkaParallelWrap) return;
+      kafkaParallelWrap.style.display = "block";
+      const sum = document.getElementById("outConsumeParallelSummary");
+      if (sum) sum.textContent = JSON.stringify(summaryObj, null, 2);
+      const arr = Array.isArray(consumers) ? consumers : [];
+      for (let i = 0; i < 3; i++) {{
+        const sec = document.getElementById("kafkaParallelSec" + i);
+        const pre = document.getElementById("outConsumeInst" + i);
+        const h = document.getElementById("kafkaParallelTitle" + i);
+        if (!sec || !pre || !h) continue;
+        if (i < arr.length) {{
+          sec.style.display = "block";
+          const c = arr[i];
+          const topic = c && c.topic !== undefined ? String(c.topic) : "";
+          const gid = c && c.group_id !== undefined ? String(c.group_id) : "";
+          const ap = c && Array.isArray(c.assigned_partitions) ? c.assigned_partitions.join(", ") : "";
+          const shareHint =
+            ap !== ""
+              ? `assigned partitions [${{ap}}]`
+              : "(assignment or partitions may still be pending — check JSON)";
+          h.textContent = `Instance ${{i}} — ${{topic}} — group_id ${{gid}} — ${{shareHint}}`;
+          pre.textContent = JSON.stringify(c, null, 2);
+        }} else {{
+          sec.style.display = "none";
+          pre.textContent = "";
+          h.textContent = "";
+        }}
+      }}
+    }}
+
+    function kafkaConsumeUsesParallelLayout(d) {{
+      return !!(d && typeof d === "object" && Array.isArray(d.consumers) && d.consumers.length > 1);
+    }}
+
+    function displayConsumePayload(d) {{
+      if (kafkaConsumeUsesParallelLayout(d)) {{
+        const agg = {{ ...d }};
+        delete agg.consumers;
+        outConsume.textContent = "";
+        showKafkaParallelLayout(agg, d.consumers);
+      }} else {{
+        hideKafkaParallelLayout();
+        outConsume.textContent = JSON.stringify(d, null, 2);
+      }}
+    }}
+
+    function syncKafkaParallelTopicRows() {{
+      const sel = document.querySelector("#cons select[name=parallel_consumers]");
+      const n = sel ? Number(sel.value) : 1;
+      const e2 = document.getElementById("kafkaTopicExtra2");
+      const e3 = document.getElementById("kafkaTopicExtra3");
+      if (e2) e2.style.display = n >= 2 ? "block" : "none";
+      if (e3) e3.style.display = n >= 3 ? "block" : "none";
+    }}
 
     async function readJSON(url, opts) {{
       const r = await fetch(url, opts);
@@ -1584,6 +1690,7 @@ KAFKA_PAGE = f"""<!DOCTYPE html>
     }}
 
     async function showPanel(statusEl, outEl, fetchFn) {{
+      hideKafkaParallelLayout();
       statusEl.textContent = "Working…";
       statusEl.className = "kafka-status";
       outEl.textContent = "";
@@ -1613,8 +1720,9 @@ KAFKA_PAGE = f"""<!DOCTYPE html>
         if (k === "enable_idempotence") continue;
         if (k === "enable_auto_commit") continue;
         if (k === "continuous_consume") continue;
+        if (k === "share_consumer_group") continue;
         if (v === "") continue;
-        const numKeys = new Set(["count", "linger_ms", "batch_size", "value_pad_kb", "max_messages", "timeout_ms"]);
+        const numKeys = new Set(["count", "linger_ms", "batch_size", "value_pad_kb", "max_messages", "timeout_ms", "parallel_consumers"]);
         o[k] = numKeys.has(k) ? Number(v) : String(v);
       }}
       if (producerForm) {{
@@ -1624,6 +1732,8 @@ KAFKA_PAGE = f"""<!DOCTYPE html>
       if (consumerForm) {{
         const cbac = document.querySelector("#cons input[name=enable_auto_commit]");
         o.enable_auto_commit = !!(cbac && cbac.checked);
+        const sh = document.querySelector("#cons input[name=share_consumer_group]");
+        o.share_consumer_group = !!(sh && sh.checked);
       }}
       return o;
     }}
@@ -1650,6 +1760,7 @@ KAFKA_PAGE = f"""<!DOCTYPE html>
       statusConsume.textContent = "Streaming… click Stop when done";
       statusConsume.className = "kafka-status ok";
       outConsume.textContent = "";
+      hideKafkaParallelLayout();
 
       if (!body.group_id || String(body.group_id).trim() === "") {{
         body.group_id = "demo-hub-stream-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
@@ -1666,19 +1777,42 @@ KAFKA_PAGE = f"""<!DOCTYPE html>
             headers: {{ "Content-Type": "application/json" }},
             body: JSON.stringify(body),
           }});
-          totalMsgs += typeof d.count === "number" ? d.count : 0;
-          batches.push({{ iteration: iter, count: d.count, elapsed_sec: d.elapsed_sec, ok: d.ok }});
+          const batchMsgs =
+            typeof d.total_messages_across_consumers === "number"
+              ? d.total_messages_across_consumers
+              : typeof d.count === "number"
+                ? d.count
+                : 0;
+          totalMsgs += batchMsgs;
+          batches.push({{
+            iteration: iter,
+            messages_this_round: batchMsgs,
+            elapsed_sec: d.elapsed_sec,
+            ok: d.ok,
+            parallel_consumers: d.parallel_consumers,
+          }});
           const preview = {{
             streaming: true,
             hint: "Stop halts after the current HTTP round finishes.",
             iterations: iter,
             total_messages_so_far: totalMsgs,
             effective_group_id: body.group_id,
+            group_ids_used: d.group_ids_used,
+            topics_per_consumer: d.topics_per_consumer,
+            share_consumer_group: d.share_consumer_group,
             enable_auto_commit: body.enable_auto_commit,
-            last_batch: d,
             batch_history: batches.slice(-12),
           }};
-          outConsume.textContent = JSON.stringify(preview, null, 2);
+          if (kafkaConsumeUsesParallelLayout(d)) {{
+            outConsume.textContent = JSON.stringify(preview, null, 2);
+            const agg = {{ ...d }};
+            delete agg.consumers;
+            showKafkaParallelLayout(agg, d.consumers);
+          }} else {{
+            hideKafkaParallelLayout();
+            preview.last_batch = d;
+            outConsume.textContent = JSON.stringify(preview, null, 2);
+          }}
           if (!d.ok) {{
             statusConsume.textContent = d.error || "batch failed";
             statusConsume.className = "kafka-status err";
@@ -1693,6 +1827,7 @@ KAFKA_PAGE = f"""<!DOCTYPE html>
       }} catch (e) {{
         statusConsume.textContent = String(e);
         statusConsume.className = "kafka-status err";
+        hideKafkaParallelLayout();
         outConsume.textContent = String(e);
       }} finally {{
         btnStop.disabled = true;
@@ -1712,14 +1847,33 @@ KAFKA_PAGE = f"""<!DOCTYPE html>
       if (continuous) {{
         await runContinuousConsume(body);
       }} else {{
-        await showPanel(statusConsume, outConsume, async () =>
-          readJSON("/api/kafka/lab/consume", {{
+        statusConsume.textContent = "Working…";
+        statusConsume.className = "kafka-status";
+        hideKafkaParallelLayout();
+        try {{
+          const d = await readJSON("/api/kafka/lab/consume", {{
             method: "POST",
             headers: {{ "Content-Type": "application/json" }},
             body: JSON.stringify(body),
-          }}));
+          }});
+          displayConsumePayload(d);
+          const errMsg =
+            d && typeof d === "object" && d.ok === false ? (d.error || "failed") : null;
+          statusConsume.textContent = errMsg || "OK";
+          statusConsume.className = errMsg ? "kafka-status err" : "kafka-status ok";
+        }} catch (e) {{
+          const msg = String(e);
+          statusConsume.textContent = msg;
+          statusConsume.className = "kafka-status err";
+          hideKafkaParallelLayout();
+          outConsume.textContent = msg;
+        }}
       }}
     }};
+
+    syncKafkaParallelTopicRows();
+    const pcSel = document.querySelector("#cons select[name=parallel_consumers]");
+    if (pcSel) pcSel.addEventListener("change", syncKafkaParallelTopicRows);
   </script>
 </body>
 </html>
@@ -2723,16 +2877,32 @@ class KafkaLabProduceBody(BaseModel):
 
 class KafkaLabConsumeBody(BaseModel):
     topic: str = Field(default="", max_length=249)
+    topic_consumer_2: str = Field(default="", max_length=249)
+    topic_consumer_3: str = Field(default="", max_length=249)
     group_id: str = Field(default="", max_length=240)
     max_messages: int = Field(default=20, ge=1, le=500)
     timeout_ms: int = Field(default=15_000, ge=500, le=600_000)
     auto_offset_reset: Literal["earliest", "latest"] = "earliest"
     enable_auto_commit: bool = False
+    parallel_consumers: int = Field(default=1, ge=1, le=3)
+    share_consumer_group: bool = True
 
     @model_validator(mode="after")
     def _normalize_topic_consume(self) -> Self:
         t = self.topic.strip() or kafka_lab.DEFAULT_LAB_TOPIC
         object.__setattr__(self, "topic", kafka_lab.validate_topic(t))
+        s2 = self.topic_consumer_2.strip()
+        object.__setattr__(
+            self,
+            "topic_consumer_2",
+            kafka_lab.validate_topic(s2) if s2 else "",
+        )
+        s3 = self.topic_consumer_3.strip()
+        object.__setattr__(
+            self,
+            "topic_consumer_3",
+            kafka_lab.validate_topic(s3) if s3 else "",
+        )
         return self
 
 
@@ -3516,7 +3686,27 @@ async def api_kafka_lab_produce(body: KafkaLabProduceBody):
 @app.post("/api/kafka/lab/consume")
 async def api_kafka_lab_consume(body: KafkaLabConsumeBody):
     def _run() -> dict[str, Any]:
-        return kafka_lab.consume_poll(**body.model_dump())
+        if body.parallel_consumers <= 1:
+            return kafka_lab.consume_poll(
+                topic=body.topic,
+                group_id=body.group_id,
+                max_messages=body.max_messages,
+                timeout_ms=body.timeout_ms,
+                auto_offset_reset=body.auto_offset_reset,
+                enable_auto_commit=body.enable_auto_commit,
+            )
+        return kafka_lab.consume_poll_parallel(
+            topic=body.topic,
+            topic_consumer_2=body.topic_consumer_2,
+            topic_consumer_3=body.topic_consumer_3,
+            group_id=body.group_id,
+            parallel_consumers=body.parallel_consumers,
+            share_consumer_group=body.share_consumer_group,
+            max_messages=body.max_messages,
+            timeout_ms=body.timeout_ms,
+            auto_offset_reset=body.auto_offset_reset,
+            enable_auto_commit=body.enable_auto_commit,
+        )
 
     return await asyncio.to_thread(_run)
 
