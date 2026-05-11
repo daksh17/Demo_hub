@@ -1,0 +1,71 @@
+%% Multi-DB demo — print-friendly layout (landscape or fit-to-page PDF).
+%% Topics/connectors: register-connectors.sh, register-mongo-connectors.sh, register-mssql-connectors.sh.
+%%{init: {'theme': 'neutral', 'flowchart': {'nodeSpacing': 36, 'rankSpacing': 52, 'padding': 22, 'curve': 'basis'}, 'themeVariables': {'fontSize': '13px', 'fontFamily': 'ui-sans-serif, system-ui, sans-serif'}}}%%
+flowchart TB
+  subgraph SEC_A["A — Application (hub-demo-ui)"]
+    direction LR
+    UI["/scenario steps 1–5<br/>Faker · pipelines · ship labels · workload"]
+    OD["Create demo order<br/>→ demo_items"]
+  end
+
+  subgraph SEC_B["B — Kafka topics from hub only (not Connect)"]
+    direction LR
+    T1[scenario.catalog.changes]
+    T2[scenario.orders.events]
+    T3[scenario.pipeline.sync]
+    T4[scenario.shipments.events]
+  end
+
+  UI --> T1
+  UI --> T2
+  UI --> T3
+  UI --> T4
+
+  WSTORES["/scenario multi-store writes:<br/>Postgres scenario_* incl. customers · payments · shipments<br/>Mongo catalog + scenario_suppliers · MSSQL catalog mirror<br/>OpenSearch · Redis · Cassandra timeline + carrier_shipments"]
+  UI --> WSTORES
+
+  PGdem[(Postgres<br/>public.demo_items)]
+  MGdem[(Mongo<br/>demo.demo_items)]
+
+  OD --> PGdem
+  OD --> MGdem
+
+  subgraph SEC_PG["C1 — Postgres CDC (Kafka Connect :8083)"]
+    direction LR
+    PGdem --> SRCpg[pg-source-demo]
+    SRCpg --> TOPpg[demopg.public.demo_items]
+    TOPpg --> SNKpg[jdbc-sink-demo]
+    SNKpg --> PGsink[(Postgres<br/>demo_items_from_kafka)]
+    SRCpg -.-> SCHpg[demopg.schema-changes.internal]
+  end
+
+  subgraph SEC_MG["C2 — Mongo CDC (Kafka Connect :8083)"]
+    direction LR
+    MGdem --> SRCmg[mongo-source-demo]
+    SRCmg --> TOPmg[demomongo.demo.demo_items]
+    TOPmg --> SNKmg[mongo-sink-demo]
+    SNKmg --> MGsink[(Mongo<br/>demo_items_from_kafka)]
+  end
+
+  MSpub[(MSSQL publisher<br/>dbo.scenario_catalog_mirror_mssql)]
+  UI -.->|"step 2 MERGE"| MSpub
+
+  subgraph SEC_MS["C3 — SQL Server CDC (Kafka Connect :8083)"]
+    direction LR
+    MSpub --> SRCms[mssql-source-demo]
+    SRCms --> TOPms[demomssql.dbo.scenario_catalog_mirror_mssql]
+    TOPms --> SNKms[mssql-jdbc-sink-demo]
+    SNKms --> MSsub[(MSSQL subscriber<br/>dbo.demo_items_from_kafka_mssql)]
+    SRCms -.-> SCHms[demomssql.schema-changes.internal]
+  end
+
+  subgraph SEC_META["D — Connect worker internal topics"]
+    direction LR
+    Cf[pgdemo_connect_configs]
+    Of[pgdemo_connect_offsets]
+    Sf[pgdemo_connect_statuses]
+  end
+
+  KREST[Kafka Connect worker] -.-> Cf
+  KREST -.-> Of
+  KREST -.-> Sf

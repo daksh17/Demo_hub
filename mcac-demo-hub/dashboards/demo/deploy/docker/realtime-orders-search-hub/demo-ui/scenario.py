@@ -37,11 +37,14 @@ MSSQL_DATABASE = os.environ.get("MSSQL_DATABASE", "demo")
 _MSSQL_ENCRYPT = os.environ.get("MSSQL_ENCRYPT", "off").strip().lower()
 
 MONGO_COLL = "scenario_products"
+MONGO_COLL_SUPPLIERS = "scenario_suppliers"
 REDIS_DASH_KEY = "scenario:dashboard:summary"
 REDIS_KAFKA_RECENT = "scenario:kafka:recent"
+REDIS_SHIPMENTS_RECENT = "scenario:shipments:recent"
 TOPIC_CATALOG = "scenario.catalog.changes"
 TOPIC_ORDERS = "scenario.orders.events"
 TOPIC_PIPELINE = "scenario.pipeline.sync"
+TOPIC_SHIPMENTS = "scenario.shipments.events"
 
 
 def _kafka_producer():
@@ -129,6 +132,44 @@ def ensure_postgres_scenario_schema(conn: psycopg.Connection) -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS scenario_customers (
+          customer_email TEXT PRIMARY KEY,
+          customer_name TEXT,
+          loyalty_tier TEXT NOT NULL DEFAULT 'standard',
+          orders_placed INT NOT NULL DEFAULT 0,
+          lifetime_cents BIGINT NOT NULL DEFAULT 0,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS scenario_payments (
+          id SERIAL PRIMARY KEY,
+          order_ref TEXT NOT NULL REFERENCES scenario_orders(order_ref) ON DELETE CASCADE,
+          payment_method TEXT NOT NULL,
+          amount_cents INT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'captured',
+          processor_ref TEXT,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS scenario_shipments (
+          id SERIAL PRIMARY KEY,
+          order_ref TEXT NOT NULL REFERENCES scenario_orders(order_ref) ON DELETE CASCADE,
+          carrier TEXT NOT NULL,
+          tracking_id TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'label_created',
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          UNIQUE(order_ref)
+        )
+        """
+    )
     _ensure_postgres_scenario_indexes(conn)
 
 
@@ -156,6 +197,17 @@ def _ensure_postgres_scenario_indexes(conn: psycopg.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_scenario_fulfill_sku ON scenario_fulfillment_lines (sku)",
         "CREATE INDEX IF NOT EXISTS idx_scenario_fulfill_order_sku ON scenario_fulfillment_lines (order_ref, sku)",
         "CREATE INDEX IF NOT EXISTS idx_scenario_fulfill_brin_created ON scenario_fulfillment_lines USING BRIN (created_at)",
+        # --- scenario_customers ---
+        "CREATE INDEX IF NOT EXISTS idx_scenario_customers_tier ON scenario_customers (loyalty_tier)",
+        "CREATE INDEX IF NOT EXISTS idx_scenario_customers_updated ON scenario_customers (updated_at DESC)",
+        # --- scenario_payments ---
+        "CREATE INDEX IF NOT EXISTS idx_scenario_payments_order ON scenario_payments (order_ref)",
+        "CREATE INDEX IF NOT EXISTS idx_scenario_payments_method ON scenario_payments (payment_method, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_scenario_payments_brin_created ON scenario_payments USING BRIN (created_at)",
+        # --- scenario_shipments ---
+        "CREATE INDEX IF NOT EXISTS idx_scenario_shipments_carrier ON scenario_shipments (carrier)",
+        "CREATE INDEX IF NOT EXISTS idx_scenario_shipments_tracking ON scenario_shipments (tracking_id)",
+        "CREATE INDEX IF NOT EXISTS idx_scenario_shipments_brin_created ON scenario_shipments USING BRIN (created_at)",
     ]
     for sql in stmts:
         conn.execute(sql)
@@ -180,6 +232,17 @@ def ensure_cassandra_scenario_schema(
     # High-cardinality or large partitions: prefer model + query by partition key or a dedicated table.
     session.execute(
         f"CREATE INDEX IF NOT EXISTS scenario_timeline_event_type ON {ks}.scenario_timeline (event_type)"
+    )
+    session.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {ks}.scenario_carrier_shipments (
+          carrier text,
+          tracking_id text,
+          order_ref text,
+          created_ts timestamp,
+          PRIMARY KEY ((carrier), tracking_id)
+        )
+        """
     )
 
 
@@ -237,6 +300,7 @@ def _redis_push_recent(r: redis.Redis, rec: dict) -> None:
 def _redis_refresh_summary(r: redis.Redis) -> None:
     cfg = get_runtime_config()
     with psycopg.connect(cfg.postgres_dsn) as conn:
+        ensure_postgres_scenario_schema(conn)
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM scenario_catalog_mirror")
             n_mir = cur.fetchone()[0]
@@ -244,14 +308,25 @@ def _redis_refresh_summary(r: redis.Redis) -> None:
             n_ord = cur.fetchone()[0]
             cur.execute("SELECT COUNT(*) FROM scenario_fulfillment_lines")
             n_ful = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM scenario_customers")
+            n_cust = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM scenario_payments")
+            n_pay = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM scenario_shipments")
+            n_ship = cur.fetchone()[0]
     mc = MongoClient(cfg.mongo_uri, serverSelectionTimeoutMS=10_000)
     n_mongo = mc["demo"][MONGO_COLL].count_documents({})
+    n_sup = mc["demo"][MONGO_COLL_SUPPLIERS].count_documents({})
     mc.close()
     summary = {
         "postgres_catalog_mirror_rows": n_mir,
         "postgres_orders": n_ord,
         "postgres_fulfillment_lines": n_ful,
+        "postgres_customers": n_cust,
+        "postgres_payments": n_pay,
+        "postgres_shipments": n_ship,
         "mongo_catalog_docs": n_mongo,
+        "mongo_supplier_docs": n_sup,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     r.set(REDIS_DASH_KEY, json.dumps(summary))
@@ -260,8 +335,8 @@ def _redis_refresh_summary(r: redis.Redis) -> None:
 # --- API-facing operations ---
 
 
-def op_seed_catalog(count: int = 10) -> dict[str, Any]:
-    """Service A: product catalog documents in Mongo (rich semi-realistic attributes)."""
+def op_seed_catalog(count: int = 10, supplier_count: int = 0) -> dict[str, Any]:
+    """Service A: product catalog + optional supplier roster in Mongo."""
     cfg = get_runtime_config()
     mc: MongoClient | None = None
     try:
@@ -279,12 +354,50 @@ def op_seed_catalog(count: int = 10) -> dict[str, Any]:
                 "stock_units": fake.random_int(0, 500),
                 "warehouse": fake.random_element(["east-1", "west-2", "eu-1"]),
                 "description": fake.text(max_nb_chars=200),
+                "weight_grams": fake.random_int(50, 15000),
+                "return_window_days": fake.random_element([14, 30, 60]),
+                "vendor_region": fake.random_element(["NA", "EU", "APAC", "LATAM"]),
                 "source": "scenario-seed",
                 "updated_at": datetime.now(timezone.utc),
             }
             coll.insert_one(doc)
             inserted.append({"sku": sku, "title": doc["title"][:60]})
-        return {"ok": True, "mongo_inserted": len(inserted), "samples": inserted[:5]}
+
+        sup_coll = mc["demo"][MONGO_COLL_SUPPLIERS]
+        suppliers_ins = []
+        if supplier_count > 0:
+            regions = ["NA", "EU", "APAC", "LATAM"]
+            for _ in range(supplier_count):
+                code = f"VND-{uuid.uuid4().hex[:6].upper()}"
+                sdoc = {
+                    "supplier_code": code,
+                    "company": fake.company(),
+                    "region": fake.random_element(regions),
+                    "rating": round(random.uniform(3.4, 5.0), 2),
+                    "lead_time_days": fake.random_int(1, 21),
+                    "contact_email": fake.company_email(),
+                    "categories_served": fake.random_elements(
+                        elements=cats,
+                        length=fake.random_int(1, min(3, len(cats))),
+                        unique=True,
+                    ),
+                    "updated_at": datetime.now(timezone.utc),
+                }
+                sup_coll.insert_one(sdoc)
+                suppliers_ins.append({"supplier_code": code, "company": sdoc["company"][:50]})
+
+        r = redis.from_url(cfg.redis_url, decode_responses=True)
+        _redis_refresh_summary(r)
+
+        return {
+            "ok": True,
+            "mongo_inserted": len(inserted),
+            "mongo_products_inserted": len(inserted),
+            "mongo_suppliers_inserted": len(suppliers_ins),
+            "samples": inserted[:5],
+            "product_samples": inserted[:5],
+            "supplier_samples": suppliers_ins[:5],
+        }
     except Exception as e:
         return {
             "ok": False,
@@ -650,6 +763,10 @@ def op_place_order(
     slon = ship_lon
     slab = (ship_label or "").strip()[:500] or None
 
+    tier = random.choices(["standard", "plus", "vip"], weights=[72, 22, 6], k=1)[0]
+    pm = fake.random_element(["card_visa", "card_mc", "wallet", "bnpl"])
+    processor_ref = f"PAY-{uuid.uuid4().hex[:12].upper()}"
+
     with psycopg.connect(cfg.postgres_dsn) as conn:
         ensure_postgres_scenario_schema(conn)
         conn.execute(
@@ -671,6 +788,27 @@ def op_place_order(
                 slab,
             ),
         )
+        conn.execute(
+            """
+            INSERT INTO scenario_customers AS sc
+              (customer_email, customer_name, loyalty_tier, orders_placed, lifetime_cents, updated_at)
+            VALUES (%s, %s, %s, 1, %s, NOW())
+            ON CONFLICT (customer_email) DO UPDATE SET
+              customer_name = EXCLUDED.customer_name,
+              orders_placed = sc.orders_placed + 1,
+              lifetime_cents = sc.lifetime_cents + EXCLUDED.lifetime_cents,
+              updated_at = NOW()
+            """,
+            (ce, cn, tier, total),
+        )
+        conn.execute(
+            """
+            INSERT INTO scenario_payments
+              (order_ref, payment_method, amount_cents, status, processor_ref)
+            VALUES (%s, %s, %s, 'captured', %s)
+            """,
+            (order_ref, pm, total, processor_ref),
+        )
         conn.commit()
 
     detail = json.dumps(
@@ -680,6 +818,9 @@ def op_place_order(
             "ship_lat": slat,
             "ship_lon": slon,
             "ship_label": slab,
+            "payment_method": pm,
+            "processor_ref": processor_ref,
+            "loyalty_tier": tier,
         }
     )
     # Cassandra timeline (requires session from caller — use cluster in app)
@@ -693,6 +834,9 @@ def op_place_order(
         "ship_lat": slat,
         "ship_lon": slon,
         "ship_label": slab,
+        "payment_method": pm,
+        "processor_ref": processor_ref,
+        "loyalty_tier": tier,
     }
     sent = _producer_send(TOPIC_ORDERS, order_ref, payload)
     with httpx.Client(timeout=30.0) as hc:
@@ -723,9 +867,22 @@ def op_place_order(
                 "ship_lat": slat,
                 "ship_lon": slon,
                 "ship_label": slab,
+                "payment_method": pm,
+                "processor_ref": processor_ref,
+                "loyalty_tier": tier,
             }
         ),
     )
+    r.hset(
+        f"scenario:customer:{ce}",
+        mapping={
+            "name": cn,
+            "loyalty_tier": tier,
+            "last_order_ref": order_ref,
+            "last_processor_ref": processor_ref,
+        },
+    )
+    r.expire(f"scenario:customer:{ce}", 86400)
     _redis_push_recent(
         r,
         {"topic": TOPIC_ORDERS, "order_ref": order_ref, "total_cents": total},
@@ -742,6 +899,9 @@ def op_place_order(
         "ship_label": slab,
         "total_cents": total,
         "lines": lines,
+        "payment_method": pm,
+        "processor_ref": processor_ref,
+        "loyalty_tier": tier,
         "kafka_sent": sent,
     }
 
@@ -833,15 +993,118 @@ def op_pipeline_postgres_to_fulfillment_and_kafka(
     }
 
 
+def op_pipeline_fulfilled_to_shipments(
+    cassandra_session: CassandraSession | None,
+    *,
+    batch_limit: int = 15,
+) -> dict[str, Any]:
+    """
+    Orders that already have fulfillment lines but no shipment row get a label + carrier +
+    tracking id; events go to Kafka, OpenSearch, Cassandra timeline + carrier table, Redis list.
+    """
+    kafka_ok = 0
+    ks = get_runtime_config().cassandra_keyspace
+    carriers = ["UPS", "FedEx", "DHL", "USPS"]
+    shipped: list[dict[str, Any]] = []
+    cfg = get_runtime_config()
+
+    with psycopg.connect(cfg.postgres_dsn) as conn:
+        ensure_postgres_scenario_schema(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT o.order_ref FROM scenario_orders o
+                WHERE EXISTS (
+                  SELECT 1 FROM scenario_fulfillment_lines f WHERE f.order_ref = o.order_ref
+                )
+                AND NOT EXISTS (
+                  SELECT 1 FROM scenario_shipments s WHERE s.order_ref = o.order_ref
+                )
+                ORDER BY o.id DESC
+                LIMIT %s
+                """,
+                (batch_limit,),
+            )
+            refs = [row[0] for row in cur.fetchall()]
+
+        with httpx.Client(timeout=30.0) as hc:
+            ensure_scenario_os_index(hc)
+            for order_ref in refs:
+                carrier = random.choice(carriers)
+                tracking_id = f"TRK-{uuid.uuid4().hex[:14].upper()}"
+                conn.execute(
+                    """
+                    INSERT INTO scenario_shipments (order_ref, carrier, tracking_id, status)
+                    VALUES (%s, %s, %s, 'label_created')
+                    """,
+                    (order_ref, carrier, tracking_id),
+                )
+                payload = {
+                    "action": "shipment.label_created",
+                    "order_ref": order_ref,
+                    "carrier": carrier,
+                    "tracking_id": tracking_id,
+                }
+                if _producer_send(TOPIC_SHIPMENTS, tracking_id, payload):
+                    kafka_ok += 1
+                _mirror_to_opensearch(
+                    hc,
+                    topic=TOPIC_SHIPMENTS,
+                    key=tracking_id,
+                    direction="postgres→kafka+os",
+                    payload=payload,
+                )
+                if cassandra_session:
+                    op_write_cassandra_timeline(
+                        cassandra_session,
+                        order_ref,
+                        "SHIPMENT_LABELED",
+                        json.dumps(payload)[:4000],
+                    )
+                    cassandra_session.execute(
+                        f"""
+                        INSERT INTO {ks}.scenario_carrier_shipments
+                          (carrier, tracking_id, order_ref, created_ts)
+                        VALUES (%s, %s, %s, %s)
+                        """,
+                        (
+                            carrier,
+                            tracking_id,
+                            order_ref,
+                            datetime.now(timezone.utc),
+                        ),
+                    )
+                shipped.append(payload)
+        conn.commit()
+
+    r = redis.from_url(cfg.redis_url, decode_responses=True)
+    for p in shipped:
+        r.lpush(REDIS_SHIPMENTS_RECENT, json.dumps(p, default=str))
+    r.ltrim(REDIS_SHIPMENTS_RECENT, 0, 99)
+    _redis_refresh_summary(r)
+
+    return {
+        "ok": True,
+        "shipments_created": len(shipped),
+        "kafka_events_sent": kafka_ok,
+        "samples": shipped[:5],
+        "topic": TOPIC_SHIPMENTS,
+    }
+
+
 def fetch_view_postgres() -> dict[str, Any]:
     out: dict[str, Any] = {"tables": {}}
     cfg = get_runtime_config()
     with psycopg.connect(cfg.postgres_dsn) as conn:
+        ensure_postgres_scenario_schema(conn)
         with conn.cursor() as cur:
             for name, sql in [
                 ("scenario_catalog_mirror", "SELECT * FROM scenario_catalog_mirror ORDER BY id DESC LIMIT 25"),
                 ("scenario_orders", "SELECT * FROM scenario_orders ORDER BY id DESC LIMIT 25"),
                 ("scenario_fulfillment_lines", "SELECT * FROM scenario_fulfillment_lines ORDER BY id DESC LIMIT 25"),
+                ("scenario_customers", "SELECT * FROM scenario_customers ORDER BY updated_at DESC LIMIT 25"),
+                ("scenario_payments", "SELECT * FROM scenario_payments ORDER BY id DESC LIMIT 25"),
+                ("scenario_shipments", "SELECT * FROM scenario_shipments ORDER BY id DESC LIMIT 25"),
             ]:
                 cur.execute(sql)
                 cols = [d[0] for d in cur.description]
@@ -867,8 +1130,23 @@ def fetch_view_mongo() -> dict[str, Any]:
     for d in cur:
         d["_id"] = str(d["_id"])
         docs.append(d)
+    sup_cur = (
+        mc["demo"][MONGO_COLL_SUPPLIERS]
+        .find({}, {"_id": 1, "supplier_code": 1, "company": 1, "region": 1, "rating": 1, "lead_time_days": 1})
+        .sort("_id", -1)
+        .limit(25)
+    )
+    suppliers = []
+    for d in sup_cur:
+        d["_id"] = str(d["_id"])
+        suppliers.append(d)
     mc.close()
-    return {"collection": f"demo.{MONGO_COLL}", "documents": docs}
+    return {
+        "collection": f"demo.{MONGO_COLL}",
+        "documents": docs,
+        "collection_suppliers": f"demo.{MONGO_COLL_SUPPLIERS}",
+        "supplier_documents": suppliers,
+    }
 
 
 def fetch_view_redis() -> dict[str, Any]:
@@ -876,19 +1154,26 @@ def fetch_view_redis() -> dict[str, Any]:
     r = redis.from_url(cfg.redis_url, decode_responses=True)
     dash = r.get(REDIS_DASH_KEY)
     recent = r.lrange(REDIS_KAFKA_RECENT, 0, 19)
+    ship_recent = r.lrange(REDIS_SHIPMENTS_RECENT, 0, 14)
     keys = r.keys("scenario:order:latest:*")[:15]
-    orders = []
-    for k in keys:
-        v = r.get(k)
-        if v:
-            try:
-                orders.append(json.loads(v))
-            except json.JSONDecodeError:
-                orders.append({"key": k, "raw": v[:200]})
+    cust_keys = r.keys("scenario:customer:*")[:12]
+    customers = []
+    for ck in cust_keys:
+        h = r.hgetall(ck)
+        if h:
+            customers.append({"key": ck, "profile": h})
+    shipments_recent_parsed = []
+    for x in ship_recent or []:
+        try:
+            shipments_recent_parsed.append(json.loads(x))
+        except json.JSONDecodeError:
+            shipments_recent_parsed.append({"raw": x[:200]})
     return {
         "dashboard_summary": json.loads(dash) if dash else None,
         "recent_pipeline_events": [json.loads(x) for x in recent] if recent else [],
+        "recent_shipment_events": shipments_recent_parsed,
         "cached_latest_orders_sample": orders,
+        "customer_profile_hashes_sample": customers,
     }
 
 
@@ -908,7 +1193,29 @@ def fetch_view_cassandra(session: CassandraSession) -> dict[str, Any]:
                 "detail": (row.detail or "")[:300],
             }
         )
-    return {"table": f"{ks}.scenario_timeline", "rows": out}
+    csr = session.execute(
+        f"SELECT carrier, tracking_id, order_ref, created_ts FROM {ks}.scenario_carrier_shipments "
+        "LIMIT 40 ALLOW FILTERING"
+    )
+    carriers_out = []
+    for row in csr:
+        carriers_out.append(
+            {
+                "carrier": row.carrier,
+                "tracking_id": row.tracking_id,
+                "order_ref": row.order_ref,
+                "created_ts": row.created_ts.isoformat() if row.created_ts else None,
+            }
+        )
+    return {
+        "table": f"{ks}.scenario_timeline",
+        "rows": out,
+        "timeline": {"table": f"{ks}.scenario_timeline", "rows": out},
+        "carrier_shipments": {
+            "table": f"{ks}.scenario_carrier_shipments",
+            "rows": carriers_out,
+        },
+    }
 
 
 def fetch_view_opensearch() -> dict[str, Any]:
@@ -949,7 +1256,7 @@ def fetch_view_kafka_meta() -> dict[str, Any]:
     p = _kafka_producer()
     return {
         "bootstrap": KAFKA_BOOTSTRAP,
-        "topics_emitted": [TOPIC_CATALOG, TOPIC_ORDERS, TOPIC_PIPELINE],
+        "topics_emitted": [TOPIC_CATALOG, TOPIC_ORDERS, TOPIC_PIPELINE, TOPIC_SHIPMENTS],
         "producer_ready": p is not None,
         "hint": "This UI produces to Kafka and mirrors the same events into OpenSearch. "
         "Use kafka-console-consumer or Grafana Kafka dashboard to verify broker traffic.",

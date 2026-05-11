@@ -974,7 +974,7 @@ _SCENARIO_PAGE_TEMPLATE = """<!DOCTYPE html>
       overflow-x: auto;
     }
     .line-flow-wrap h2 { margin: 0 0 0.5rem; font-size: 1rem; color: #8899a6; }
-    .line-flow { width: 100%; min-width: 560px; height: auto; display: block; }
+    .line-flow { width: 100%; min-width: 680px; height: auto; display: block; }
     .line-flow .spine { stroke: #6cb5f4; stroke-width: 2.5; fill: none; }
     .line-flow .node { fill: #1d9bf0; stroke: #e7e9ea; stroke-width: 1.5; }
     .line-flow .lbl { font-size: 11px; fill: #e7e9ea; font-weight: 600; }
@@ -1009,7 +1009,7 @@ _SCENARIO_PAGE_TEMPLATE = """<!DOCTYPE html>
       <h1>Multi-DB scenario (Faker + pipelines)</h1>
       <div class="line-flow-wrap">
         <h2>Pipeline line diagram</h2>
-        <svg class="line-flow" viewBox="0 0 620 125" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Horizontal pipeline: four connected steps">
+        <svg class="line-flow" viewBox="0 0 740 125" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Horizontal pipeline: five scenario steps plus end marker">
           <defs>
             <marker id="line-arr" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
               <path d="M0,0 L6,3 L0,6 Z" fill="#6cb5f4"/>
@@ -1019,35 +1019,39 @@ _SCENARIO_PAGE_TEMPLATE = """<!DOCTYPE html>
           <line class="spine" x1="202" y1="52" x2="292" y2="52" marker-end="url(#line-arr)"/>
           <line class="spine" x1="322" y1="52" x2="412" y2="52" marker-end="url(#line-arr)"/>
           <line class="spine" x1="442" y1="52" x2="532" y2="52" marker-end="url(#line-arr)"/>
+          <line class="spine" x1="562" y1="52" x2="652" y2="52" marker-end="url(#line-arr)"/>
           <circle class="node" cx="70" cy="52" r="10"/>
           <circle class="node" cx="190" cy="52" r="10"/>
           <circle class="node" cx="310" cy="52" r="10"/>
           <circle class="node" cx="430" cy="52" r="10"/>
           <circle class="node" cx="550" cy="52" r="10"/>
+          <circle class="node" cx="670" cy="52" r="10"/>
           <text x="70" y="28" text-anchor="middle" class="lbl">1 · Seed</text>
           <text x="190" y="28" text-anchor="middle" class="lbl">2 · Sync</text>
           <text x="310" y="28" text-anchor="middle" class="lbl">3 · Order</text>
           <text x="430" y="28" text-anchor="middle" class="lbl">4 · Fulfill</text>
-          <text x="550" y="28" text-anchor="middle" class="lbl">◆</text>
+          <text x="550" y="28" text-anchor="middle" class="lbl">5 · Ship</text>
+          <text x="670" y="28" text-anchor="middle" class="lbl">◆</text>
           <text x="70" y="78" text-anchor="middle" class="sub">Faker→Mongo</text>
           <text x="190" y="78" text-anchor="middle" class="sub">PG+MS+K+OS+R</text>
-          <text x="310" y="78" text-anchor="middle" class="sub">PG+K+OS+R+C*</text>
+          <text x="310" y="78" text-anchor="middle" class="sub">cust+pay+K+OS+R+C*</text>
           <text x="430" y="78" text-anchor="middle" class="sub">PG+K+OS+C*</text>
-          <text x="550" y="78" text-anchor="middle" class="sub">end</text>
-          <text x="300" y="108" text-anchor="middle" class="sub">C* = Cassandra · K = Kafka · MS = SQL Server (publisher) · OS = hub-scenario-pipeline · R = Redis · PG = Postgres</text>
+          <text x="550" y="78" text-anchor="middle" class="sub">PG+K+OS+C*</text>
+          <text x="670" y="78" text-anchor="middle" class="sub">end</text>
+          <text x="370" y="108" text-anchor="middle" class="sub">C* = Cassandra · K = Kafka incl. scenario.shipments.events · MS = SQL Server · OS = hub-scenario-pipeline · R = Redis · PG = Postgres</text>
         </svg>
       </div>
-      <p class="hint"><strong>Mongo</strong> is the <em>catalog service</em>: rich product docs in <code>demo.scenario_products</code>.
-        <strong>Postgres</strong> holds a <em>relational mirror</em> (<code>scenario_catalog_mirror</code>), <em>orders</em> (<code>scenario_orders</code>), and <em>fulfillment lines</em> (<code>scenario_fulfillment_lines</code>).
+        <p class="hint"><strong>Mongo</strong> is the <em>catalog service</em>: rich product docs in <code>demo.scenario_products</code> plus optional vendor roster <code>demo.scenario_suppliers</code>.
+        <strong>Postgres</strong> holds a <em>relational mirror</em> (<code>scenario_catalog_mirror</code>), <em>orders</em> (<code>scenario_orders</code>), <em>fulfillment lines</em> (<code>scenario_fulfillment_lines</code>), <em>customers</em> (<code>scenario_customers</code>), <em>payments</em> (<code>scenario_payments</code>), and <em>shipments</em> (<code>scenario_shipments</code>).
         <strong>SQL Server</strong> (when <code>MSSQL_HOST</code> + <code>MSSQL_SA_PASSWORD</code> are set — Compose/K8s: <code>mssql-publisher</code>) gets a second mirror <code>dbo.scenario_catalog_mirror_mssql</code> on step 2 for <em>Debezium CDC</em> → Kafka → JDBC sink to the subscriber; workload generator can also write <code>dbo.hub_workload_mssql</code>.
         <strong>Kafka</strong> gets event payloads for integration testing; the same JSON is written to <strong>OpenSearch</strong> index <code>hub-scenario-pipeline</code> (simulating what a Kafka→OpenSearch sink would index).
         <strong>Redis</strong> stores a small dashboard summary + a rolling list of recent pipeline events + per-order cache keys.
-        <strong>Cassandra</strong> appends an <em>order timeline</em> (<code>demo_hub.scenario_timeline</code>) for steps 3–4.</p>
+        <strong>Cassandra</strong> appends an <em>order timeline</em> (<code>demo_hub.scenario_timeline</code>) for steps 3–5 and a carrier-partitioned shipment lookup (<code>scenario_carrier_shipments</code>) when labels are created.</p>
 
       <h2>Behind the scenes (each button)</h2>
       <details class="behind" open>
         <summary>1 · Seed Mongo catalog (Faker)</summary>
-        <p class="hint">Runs <code>scenario.op_seed_catalog</code>: <strong>Faker</strong> generates titles, categories, prices, stock, warehouse, description. Inserts <strong>one document per product</strong> into MongoDB <code>demo.scenario_products</code> (unique <code>sku</code>). No other database is touched yet.</p>
+        <p class="hint">Runs <code>scenario.op_seed_catalog</code>: <strong>Faker</strong> generates titles, categories, prices, stock, warehouse, weight/returns/vendor_region, description. Inserts into MongoDB <code>demo.scenario_products</code> (unique <code>sku</code>). Optional query param <code>suppliers</code> seeds <code>demo.scenario_suppliers</code>. Refreshes Redis <code>scenario:dashboard:summary</code> counts.</p>
       </details>
       <details class="behind">
         <summary>2 · Sync catalog → Postgres + Kafka + OpenSearch</summary>
@@ -1055,15 +1059,19 @@ _SCENARIO_PAGE_TEMPLATE = """<!DOCTYPE html>
       </details>
       <details class="behind">
         <summary>3 · Place order (Faker + map)</summary>
-        <p class="hint"><strong>Form</strong> → <code>POST /api/scenario/order/custom</code>: same as <code>op_place_order</code> but with your <strong>customer name, email</strong>, and <strong>ship_lat / ship_lon / ship_label</strong> (preset city, map click, or Faker). <strong>Quick random</strong> → <code>POST /api/scenario/order</code> (fully server-side Faker for customer + lines). Both paths insert <code>scenario_orders</code>, emit Kafka, OpenSearch, Redis, Cassandra timeline.</p>
+        <p class="hint"><strong>Form</strong> → <code>POST /api/scenario/order/custom</code>: same as <code>op_place_order</code> but with your <strong>customer name, email</strong>, and <strong>ship_lat / ship_lon / ship_label</strong> (preset city, map click, or Faker). <strong>Quick random</strong> → <code>POST /api/scenario/order</code> (fully server-side Faker for customer + lines). Both paths insert <code>scenario_orders</code>, upsert <code>scenario_customers</code>, insert <code>scenario_payments</code>, emit Kafka, OpenSearch, Redis (order blob + customer hash), Cassandra timeline.</p>
       </details>
       <details class="behind">
         <summary>4 · Fulfillment rows + Kafka + OS + Cassandra</summary>
         <p class="hint">Runs <code>op_pipeline_postgres_to_fulfillment_and_kafka</code>: finds Postgres orders that have <strong>no</strong> rows in <code>scenario_fulfillment_lines</code> yet, expands each order’s <code>lines</code> JSON into fulfillment rows, produces <code>scenario.pipeline.sync</code> on Kafka, indexes OpenSearch with <code>postgres→kafka+os</code>, appends <code>FULFILLMENT_READY</code> on Cassandra timeline, commits Postgres.</p>
       </details>
+      <details class="behind">
+        <summary>5 · Shipping labels (fulfilled orders)</summary>
+        <p class="hint">Runs <code>op_pipeline_fulfilled_to_shipments</code>: Postgres orders that have fulfillment rows but <strong>no</strong> <code>scenario_shipments</code> row get carrier + tracking id; produces Kafka topic <code>scenario.shipments.events</code>, mirrors OpenSearch, Cassandra <code>SHIPMENT_LABELED</code> + <code>scenario_carrier_shipments</code>, Redis list <code>scenario:shipments:recent</code>.</p>
+      </details>
 
       <h2>Run pipelines (order matters the first time)</h2>
-      <p class="hint">You need <strong>catalog in Mongo</strong> before sync; <strong>mirror in Postgres</strong> helps pricing on step 3; step 4 needs <strong>orders</strong> in Postgres that are not yet fulfilled.</p>
+      <p class="hint">You need <strong>catalog in Mongo</strong> before sync; <strong>mirror in Postgres</strong> helps pricing on step 3; step 4 needs <strong>orders</strong> in Postgres that are not yet fulfilled; step 5 needs fulfilled orders without a shipment row.</p>
       <div>
         <button type="button" id="b_seed">1 · Seed Mongo catalog (Faker)</button>
         <button type="button" id="b_sync">2 · Sync catalog → Postgres + Kafka + OpenSearch</button>
@@ -1111,6 +1119,7 @@ _SCENARIO_PAGE_TEMPLATE = """<!DOCTYPE html>
 
       <div>
         <button type="button" id="b_fulfill">4 · Fulfillment rows + Kafka + OS + Cassandra</button>
+        <button type="button" id="b_ship">5 · Shipping labels + Kafka + OS + Cassandra</button>
       </div>
       <p id="st"></p>
       <pre id="out">Click a step or submit the order form to see JSON.</pre>
@@ -1127,21 +1136,22 @@ _SCENARIO_PAGE_TEMPLATE = """<!DOCTYPE html>
     </div>
     <aside class="diagram-aside">
       <h2>Vertical line (detail)</h2>
-      <p class="hint" style="margin-top:0">Spine + branches. Same steps as the horizontal line above.</p>
-      <svg class="flow-svg" viewBox="0 0 340 560" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Vertical scenario timeline">
+      <p class="hint" style="margin-top:0">Spine + branches. Same five steps as the horizontal line above.</p>
+      <svg class="flow-svg" viewBox="0 0 340 628" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Vertical scenario timeline: five steps">
         <defs>
           <marker id="ah" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto">
             <path d="M0,0 L8,4 L0,8 Z" fill="#8899a6"/>
           </marker>
         </defs>
-        <line x1="40" y1="28" x2="40" y2="428" stroke="#6cb5f4" stroke-width="3" stroke-linecap="round"/>
+        <line x1="40" y1="28" x2="40" y2="508" stroke="#6cb5f4" stroke-width="3" stroke-linecap="round"/>
         <circle class="node" cx="40" cy="40" r="9" fill="#1d9bf0" stroke="#e7e9ea" stroke-width="1.5"/>
         <circle class="node" cx="40" cy="148" r="9" fill="#1d9bf0" stroke="#e7e9ea" stroke-width="1.5"/>
         <circle class="node" cx="40" cy="296" r="9" fill="#1d9bf0" stroke="#e7e9ea" stroke-width="1.5"/>
         <circle class="node" cx="40" cy="416" r="9" fill="#1d9bf0" stroke="#e7e9ea" stroke-width="1.5"/>
+        <circle class="node" cx="40" cy="508" r="9" fill="#1d9bf0" stroke="#e7e9ea" stroke-width="1.5"/>
         <path class="arrow" d="M55 40 L115 40"/>
         <text x="120" y="44" font-size="11px" fill="#e7e9ea" font-weight="700">① Faker → Mongo</text>
-        <text x="120" y="58" class="muted">demo.scenario_products</text>
+        <text x="120" y="58" class="muted">scenario_products · optional scenario_suppliers</text>
         <path class="arrow" d="M55 148 L115 148"/>
         <text x="120" y="136" font-size="11px" fill="#e7e9ea" font-weight="700">② Sync catalog</text>
         <text x="120" y="150" class="muted">PG+MS+K+OS+R · mirrors → bus</text>
@@ -1149,18 +1159,19 @@ _SCENARIO_PAGE_TEMPLATE = """<!DOCTYPE html>
         <text x="118" y="178" class="muted" font-size="10px">K · scenario.catalog.changes</text>
         <text x="118" y="192" class="muted" font-size="10px">OS · index hub-scenario-pipeline</text>
         <path class="arrow" d="M55 296 L115 296"/>
-        <text x="120" y="288" font-size="11px" fill="#e7e9ea" font-weight="700">③ New order</text>
-        <text x="120" y="302" class="muted">PG+K+OS+R+C* · scenario_orders</text>
+        <text x="120" y="284" font-size="11px" fill="#e7e9ea" font-weight="700">③ New order</text>
+        <text x="120" y="298" class="muted">orders + customers + payments · K+OS+R+C*</text>
         <path class="arrow" d="M55 416 L115 416"/>
         <text x="120" y="408" font-size="11px" fill="#e7e9ea" font-weight="700">④ Fulfillment</text>
         <text x="120" y="422" class="muted">PG+K+OS+C* · scenario_fulfillment_lines</text>
-        <text x="16" y="452" font-size="10px" fill="#8899a6">Key · C* Cassandra · K Kafka · MS SQL Server · OS OpenSearch · R Redis · PG Postgres</text>
-        <text x="16" y="468" class="muted" font-size="10px">MS hub_workload on publisher (workload page) · pymssql + FreeTDS in hub image</text>
-        <text x="16" y="484" class="muted" font-size="10px">PG workload SQL · pg_stat_statements on DB postgres</text>
-        <text x="16" y="500" class="muted" font-size="10px">ORDER_PLACED (step ③) · FULFILLMENT_READY (step ④)</text>
-        <text x="16" y="518" font-size="10px" fill="#8899a6">Kafka topics</text>
-        <text x="16" y="532" class="muted" font-size="10px">scenario.catalog.changes · scenario.orders.events</text>
-        <text x="16" y="546" class="muted" font-size="10px">scenario.pipeline.sync</text>
+        <path class="arrow" d="M55 508 L115 508"/>
+        <text x="120" y="500" font-size="11px" fill="#e7e9ea" font-weight="700">⑤ Shipping labels</text>
+        <text x="120" y="514" class="muted">scenario_shipments · K scenario.shipments.events · carrier_shipments</text>
+        <text x="16" y="538" font-size="10px" fill="#8899a6">Key · C* Cassandra · K Kafka · MS SQL Server · OS OpenSearch · R Redis · PG Postgres</text>
+        <text x="16" y="554" class="muted" font-size="10px">Timeline · ORDER_PLACED · FULFILLMENT_READY · SHIPMENT_LABELED</text>
+        <text x="16" y="570" font-size="10px" fill="#8899a6">Kafka scenario.* topics</text>
+        <text x="16" y="584" class="muted" font-size="10px">catalog · orders · pipeline.sync · shipments.events</text>
+        <text x="16" y="598" class="muted" font-size="10px">Redis · scenario:shipments:recent · scenario:customer:*</text>
       </svg>
     </aside>
   </div>
@@ -1183,10 +1194,11 @@ _SCENARIO_PAGE_TEMPLATE = """<!DOCTYPE html>
     }
     const st = document.getElementById("st");
     const out = document.getElementById("out");
-    document.getElementById("b_seed").onclick = () => call("/api/scenario/seed?count=12", st, out);
+    document.getElementById("b_seed").onclick = () => call("/api/scenario/seed?count=24&suppliers=10", st, out);
     document.getElementById("b_sync").onclick = () => call("/api/scenario/pipeline/mongo-sync", st, out);
     document.getElementById("b_order_quick").onclick = () => call("/api/scenario/order", st, out);
     document.getElementById("b_fulfill").onclick = () => call("/api/scenario/pipeline/fulfill", st, out);
+    document.getElementById("b_ship").onclick = () => call("/api/scenario/pipeline/ship", st, out);
 
     const latEl = document.getElementById("ship_lat");
     const lonEl = document.getElementById("ship_lon");
@@ -1480,7 +1492,8 @@ KAFKA_PAGE = f"""<!DOCTYPE html>
     Produce bursts with tunable <strong>acks</strong>, <strong>linger</strong>, <strong>batch_size</strong>, <strong>compression</strong>, and key strategy (ordering demos).
     Short-lived consumers use ephemeral <strong>group_id</strong> by default so each poll can read from <strong>earliest</strong> without resetting offsets manually.
     <strong>latest</strong> only sees records appended <em>after</em> that consumer joins — produce first and use <strong>earliest</strong> to read an existing backlog.
-    Turn on <strong>enable_auto_commit</strong> and reuse the same <strong>group_id</strong> to persist offsets between polls (next run continues after the last committed position).</p>
+    Turn on <strong>enable_auto_commit</strong> and reuse the same <strong>group_id</strong> to persist offsets between polls (next run continues after the last committed position).
+    Use <strong>Parallel consumers</strong> (2–3) with <strong>Same consumer group</strong> to mimic multiple members splitting partitions; turn it off for independent groups (<code>-inst0</code>, <code>-inst1</code>, …). Optional <strong>Topic — parallel instance</strong> fields let each thread subscribe to a different topic (blank repeats the main Topic).</p>
 
   <h2>Producer load</h2>
   <fieldset>
@@ -1540,6 +1553,23 @@ KAFKA_PAGE = f"""<!DOCTYPE html>
       <input type="text" name="topic" value="{kafka_lab.DEFAULT_LAB_TOPIC}" autocomplete="off"/>
       <label>group_id (optional — empty = random ephemeral group)</label>
       <input type="text" name="group_id" value="" placeholder="demo-hub-my-group" autocomplete="off"/>
+      <label>Parallel consumers (threads inside hub)</label>
+      <select name="parallel_consumers">
+        <option value="1" selected>1</option>
+        <option value="2">2</option>
+        <option value="3">3</option>
+      </select>
+      <label style="display:flex;align-items:center;gap:0.5rem;max-width:36rem;">
+        <input type="checkbox" name="share_consumer_group" checked style="width:auto"/> <strong>Same consumer group</strong> — identical <code>group.id</code> so Kafka assigns partitions across the parallel instances (off → distinct ids: your <code>group_id</code> plus suffix <code>-inst0</code>, <code>-inst1</code>, … or independent random groups if group_id is empty).
+      </label>
+      <div id="kafkaTopicExtra2" style="display:none;">
+        <label>Topic — parallel instance 1 (optional; blank = main Topic above)</label>
+        <input type="text" name="topic_consumer_2" value="" placeholder="same as main Topic if empty" autocomplete="off"/>
+      </div>
+      <div id="kafkaTopicExtra3" style="display:none;">
+        <label>Topic — parallel instance 2 (optional; blank = main Topic above)</label>
+        <input type="text" name="topic_consumer_3" value="" placeholder="same as main Topic if empty" autocomplete="off"/>
+      </div>
       <label>max_messages</label>
       <input type="number" name="max_messages" value="30" min="1" max="500"/>
       <label>timeout_ms</label>
@@ -1562,13 +1592,101 @@ KAFKA_PAGE = f"""<!DOCTYPE html>
 
   <h3 class="kafka-out-h">Consumer / broker JSON</h3>
   <p id="statusConsume" class="kafka-status"></p>
-  <pre id="outConsume" class="kafka-pre"><strong>Consume poll</strong> → <code>messages</code>, <code>count</code>, <code>auto_offset_reset</code>, <code>group_id</code>, <code>enable_auto_commit</code>. <strong>latest</strong> + backlog already produced → often <code>count: 0</code>; use <strong>earliest</strong> for a new group. With <strong>enable_auto_commit</strong> + fixed <code>group_id</code>, the next poll continues after committed offsets.</pre>
+  <pre id="outConsume" class="kafka-pre"><strong>Consume poll</strong>: one JSON panel for a single consumer or for broker metadata/hints. With parallel &gt;1, the hub shows a <strong>summary</strong> plus one panel per instance (<code>assigned_partitions</code> after subscribe shows what each member owns when using the same <code>group.id</code>). <strong>max_messages</strong> applies <strong>per</strong> instance.</pre>
+  <div id="kafkaParallelWrap" style="display:none;margin-top:0.75rem;">
+    <h3 class="kafka-out-h">Parallel run — summary</h3>
+    <pre id="outConsumeParallelSummary" class="kafka-pre"></pre>
+    <div id="kafkaParallelSec0" class="kafka-par-inst" style="display:none;">
+      <h4 class="kafka-out-h" id="kafkaParallelTitle0"></h4>
+      <pre id="outConsumeInst0" class="kafka-pre"></pre>
+    </div>
+    <div id="kafkaParallelSec1" class="kafka-par-inst" style="display:none;">
+      <h4 class="kafka-out-h" id="kafkaParallelTitle1"></h4>
+      <pre id="outConsumeInst1" class="kafka-pre"></pre>
+    </div>
+    <div id="kafkaParallelSec2" class="kafka-par-inst" style="display:none;">
+      <h4 class="kafka-out-h" id="kafkaParallelTitle2"></h4>
+      <pre id="outConsumeInst2" class="kafka-pre"></pre>
+    </div>
+  </div>
 
   <script>
     const statusProduce = document.getElementById("statusProduce");
     const outProduce = document.getElementById("outProduce");
     const statusConsume = document.getElementById("statusConsume");
     const outConsume = document.getElementById("outConsume");
+    const kafkaParallelWrap = document.getElementById("kafkaParallelWrap");
+
+    function hideKafkaParallelLayout() {{
+      if (!kafkaParallelWrap) return;
+      kafkaParallelWrap.style.display = "none";
+      const sum = document.getElementById("outConsumeParallelSummary");
+      if (sum) sum.textContent = "";
+      for (let i = 0; i < 3; i++) {{
+        const sec = document.getElementById("kafkaParallelSec" + i);
+        const pre = document.getElementById("outConsumeInst" + i);
+        const h = document.getElementById("kafkaParallelTitle" + i);
+        if (sec) sec.style.display = "none";
+        if (pre) pre.textContent = "";
+        if (h) h.textContent = "";
+      }}
+    }}
+
+    function showKafkaParallelLayout(summaryObj, consumers) {{
+      if (!kafkaParallelWrap) return;
+      kafkaParallelWrap.style.display = "block";
+      const sum = document.getElementById("outConsumeParallelSummary");
+      if (sum) sum.textContent = JSON.stringify(summaryObj, null, 2);
+      const arr = Array.isArray(consumers) ? consumers : [];
+      for (let i = 0; i < 3; i++) {{
+        const sec = document.getElementById("kafkaParallelSec" + i);
+        const pre = document.getElementById("outConsumeInst" + i);
+        const h = document.getElementById("kafkaParallelTitle" + i);
+        if (!sec || !pre || !h) continue;
+        if (i < arr.length) {{
+          sec.style.display = "block";
+          const c = arr[i];
+          const topic = c && c.topic !== undefined ? String(c.topic) : "";
+          const gid = c && c.group_id !== undefined ? String(c.group_id) : "";
+          const ap = c && Array.isArray(c.assigned_partitions) ? c.assigned_partitions.join(", ") : "";
+          const shareHint =
+            ap !== ""
+              ? `assigned partitions [${{ap}}]`
+              : "(assignment or partitions may still be pending — check JSON)";
+          h.textContent = `Instance ${{i}} — ${{topic}} — group_id ${{gid}} — ${{shareHint}}`;
+          pre.textContent = JSON.stringify(c, null, 2);
+        }} else {{
+          sec.style.display = "none";
+          pre.textContent = "";
+          h.textContent = "";
+        }}
+      }}
+    }}
+
+    function kafkaConsumeUsesParallelLayout(d) {{
+      return !!(d && typeof d === "object" && Array.isArray(d.consumers) && d.consumers.length > 1);
+    }}
+
+    function displayConsumePayload(d) {{
+      if (kafkaConsumeUsesParallelLayout(d)) {{
+        const agg = {{ ...d }};
+        delete agg.consumers;
+        outConsume.textContent = "";
+        showKafkaParallelLayout(agg, d.consumers);
+      }} else {{
+        hideKafkaParallelLayout();
+        outConsume.textContent = JSON.stringify(d, null, 2);
+      }}
+    }}
+
+    function syncKafkaParallelTopicRows() {{
+      const sel = document.querySelector("#cons select[name=parallel_consumers]");
+      const n = sel ? Number(sel.value) : 1;
+      const e2 = document.getElementById("kafkaTopicExtra2");
+      const e3 = document.getElementById("kafkaTopicExtra3");
+      if (e2) e2.style.display = n >= 2 ? "block" : "none";
+      if (e3) e3.style.display = n >= 3 ? "block" : "none";
+    }}
 
     async function readJSON(url, opts) {{
       const r = await fetch(url, opts);
@@ -1584,6 +1702,7 @@ KAFKA_PAGE = f"""<!DOCTYPE html>
     }}
 
     async function showPanel(statusEl, outEl, fetchFn) {{
+      hideKafkaParallelLayout();
       statusEl.textContent = "Working…";
       statusEl.className = "kafka-status";
       outEl.textContent = "";
@@ -1613,8 +1732,9 @@ KAFKA_PAGE = f"""<!DOCTYPE html>
         if (k === "enable_idempotence") continue;
         if (k === "enable_auto_commit") continue;
         if (k === "continuous_consume") continue;
+        if (k === "share_consumer_group") continue;
         if (v === "") continue;
-        const numKeys = new Set(["count", "linger_ms", "batch_size", "value_pad_kb", "max_messages", "timeout_ms"]);
+        const numKeys = new Set(["count", "linger_ms", "batch_size", "value_pad_kb", "max_messages", "timeout_ms", "parallel_consumers"]);
         o[k] = numKeys.has(k) ? Number(v) : String(v);
       }}
       if (producerForm) {{
@@ -1624,6 +1744,8 @@ KAFKA_PAGE = f"""<!DOCTYPE html>
       if (consumerForm) {{
         const cbac = document.querySelector("#cons input[name=enable_auto_commit]");
         o.enable_auto_commit = !!(cbac && cbac.checked);
+        const sh = document.querySelector("#cons input[name=share_consumer_group]");
+        o.share_consumer_group = !!(sh && sh.checked);
       }}
       return o;
     }}
@@ -1650,6 +1772,7 @@ KAFKA_PAGE = f"""<!DOCTYPE html>
       statusConsume.textContent = "Streaming… click Stop when done";
       statusConsume.className = "kafka-status ok";
       outConsume.textContent = "";
+      hideKafkaParallelLayout();
 
       if (!body.group_id || String(body.group_id).trim() === "") {{
         body.group_id = "demo-hub-stream-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
@@ -1666,19 +1789,42 @@ KAFKA_PAGE = f"""<!DOCTYPE html>
             headers: {{ "Content-Type": "application/json" }},
             body: JSON.stringify(body),
           }});
-          totalMsgs += typeof d.count === "number" ? d.count : 0;
-          batches.push({{ iteration: iter, count: d.count, elapsed_sec: d.elapsed_sec, ok: d.ok }});
+          const batchMsgs =
+            typeof d.total_messages_across_consumers === "number"
+              ? d.total_messages_across_consumers
+              : typeof d.count === "number"
+                ? d.count
+                : 0;
+          totalMsgs += batchMsgs;
+          batches.push({{
+            iteration: iter,
+            messages_this_round: batchMsgs,
+            elapsed_sec: d.elapsed_sec,
+            ok: d.ok,
+            parallel_consumers: d.parallel_consumers,
+          }});
           const preview = {{
             streaming: true,
             hint: "Stop halts after the current HTTP round finishes.",
             iterations: iter,
             total_messages_so_far: totalMsgs,
             effective_group_id: body.group_id,
+            group_ids_used: d.group_ids_used,
+            topics_per_consumer: d.topics_per_consumer,
+            share_consumer_group: d.share_consumer_group,
             enable_auto_commit: body.enable_auto_commit,
-            last_batch: d,
             batch_history: batches.slice(-12),
           }};
-          outConsume.textContent = JSON.stringify(preview, null, 2);
+          if (kafkaConsumeUsesParallelLayout(d)) {{
+            outConsume.textContent = JSON.stringify(preview, null, 2);
+            const agg = {{ ...d }};
+            delete agg.consumers;
+            showKafkaParallelLayout(agg, d.consumers);
+          }} else {{
+            hideKafkaParallelLayout();
+            preview.last_batch = d;
+            outConsume.textContent = JSON.stringify(preview, null, 2);
+          }}
           if (!d.ok) {{
             statusConsume.textContent = d.error || "batch failed";
             statusConsume.className = "kafka-status err";
@@ -1693,6 +1839,7 @@ KAFKA_PAGE = f"""<!DOCTYPE html>
       }} catch (e) {{
         statusConsume.textContent = String(e);
         statusConsume.className = "kafka-status err";
+        hideKafkaParallelLayout();
         outConsume.textContent = String(e);
       }} finally {{
         btnStop.disabled = true;
@@ -1712,14 +1859,33 @@ KAFKA_PAGE = f"""<!DOCTYPE html>
       if (continuous) {{
         await runContinuousConsume(body);
       }} else {{
-        await showPanel(statusConsume, outConsume, async () =>
-          readJSON("/api/kafka/lab/consume", {{
+        statusConsume.textContent = "Working…";
+        statusConsume.className = "kafka-status";
+        hideKafkaParallelLayout();
+        try {{
+          const d = await readJSON("/api/kafka/lab/consume", {{
             method: "POST",
             headers: {{ "Content-Type": "application/json" }},
             body: JSON.stringify(body),
-          }}));
+          }});
+          displayConsumePayload(d);
+          const errMsg =
+            d && typeof d === "object" && d.ok === false ? (d.error || "failed") : null;
+          statusConsume.textContent = errMsg || "OK";
+          statusConsume.className = errMsg ? "kafka-status err" : "kafka-status ok";
+        }} catch (e) {{
+          const msg = String(e);
+          statusConsume.textContent = msg;
+          statusConsume.className = "kafka-status err";
+          hideKafkaParallelLayout();
+          outConsume.textContent = msg;
+        }}
       }}
     }};
+
+    syncKafkaParallelTopicRows();
+    const pcSel = document.querySelector("#cons select[name=parallel_consumers]");
+    if (pcSel) pcSel.addEventListener("change", syncKafkaParallelTopicRows);
   </script>
 </body>
 </html>
@@ -2723,16 +2889,32 @@ class KafkaLabProduceBody(BaseModel):
 
 class KafkaLabConsumeBody(BaseModel):
     topic: str = Field(default="", max_length=249)
+    topic_consumer_2: str = Field(default="", max_length=249)
+    topic_consumer_3: str = Field(default="", max_length=249)
     group_id: str = Field(default="", max_length=240)
     max_messages: int = Field(default=20, ge=1, le=500)
     timeout_ms: int = Field(default=15_000, ge=500, le=600_000)
     auto_offset_reset: Literal["earliest", "latest"] = "earliest"
     enable_auto_commit: bool = False
+    parallel_consumers: int = Field(default=1, ge=1, le=3)
+    share_consumer_group: bool = True
 
     @model_validator(mode="after")
     def _normalize_topic_consume(self) -> Self:
         t = self.topic.strip() or kafka_lab.DEFAULT_LAB_TOPIC
         object.__setattr__(self, "topic", kafka_lab.validate_topic(t))
+        s2 = self.topic_consumer_2.strip()
+        object.__setattr__(
+            self,
+            "topic_consumer_2",
+            kafka_lab.validate_topic(s2) if s2 else "",
+        )
+        s3 = self.topic_consumer_3.strip()
+        object.__setattr__(
+            self,
+            "topic_consumer_3",
+            kafka_lab.validate_topic(s3) if s3 else "",
+        )
         return self
 
 
@@ -3516,7 +3698,27 @@ async def api_kafka_lab_produce(body: KafkaLabProduceBody):
 @app.post("/api/kafka/lab/consume")
 async def api_kafka_lab_consume(body: KafkaLabConsumeBody):
     def _run() -> dict[str, Any]:
-        return kafka_lab.consume_poll(**body.model_dump())
+        if body.parallel_consumers <= 1:
+            return kafka_lab.consume_poll(
+                topic=body.topic,
+                group_id=body.group_id,
+                max_messages=body.max_messages,
+                timeout_ms=body.timeout_ms,
+                auto_offset_reset=body.auto_offset_reset,
+                enable_auto_commit=body.enable_auto_commit,
+            )
+        return kafka_lab.consume_poll_parallel(
+            topic=body.topic,
+            topic_consumer_2=body.topic_consumer_2,
+            topic_consumer_3=body.topic_consumer_3,
+            group_id=body.group_id,
+            parallel_consumers=body.parallel_consumers,
+            share_consumer_group=body.share_consumer_group,
+            max_messages=body.max_messages,
+            timeout_ms=body.timeout_ms,
+            auto_offset_reset=body.auto_offset_reset,
+            enable_auto_commit=body.enable_auto_commit,
+        )
 
     return await asyncio.to_thread(_run)
 
@@ -3924,8 +4126,11 @@ async def scenario_data_page(store: str):
 
 
 @app.post("/api/scenario/seed")
-async def api_scenario_seed(count: int = 12):
-    out = scenario.op_seed_catalog(min(max(count, 1), 50))
+async def api_scenario_seed(count: int = 24, suppliers: int = 10):
+    out = scenario.op_seed_catalog(
+        min(max(count, 1), 120),
+        supplier_count=min(max(suppliers, 0), 60),
+    )
     if not out.get("ok", True):
         raise HTTPException(503, detail=out)
     return out
@@ -3946,6 +4151,12 @@ async def api_scenario_order():
 async def api_scenario_fulfill():
     cass, _ = get_hub_cassandra_handles(get_runtime_config())
     return scenario.op_pipeline_postgres_to_fulfillment_and_kafka(cass)
+
+
+@app.post("/api/scenario/pipeline/ship")
+async def api_scenario_ship():
+    cass, _ = get_hub_cassandra_handles(get_runtime_config())
+    return scenario.op_pipeline_fulfilled_to_shipments(cass)
 
 
 @app.get("/api/scenario/view/{store}")

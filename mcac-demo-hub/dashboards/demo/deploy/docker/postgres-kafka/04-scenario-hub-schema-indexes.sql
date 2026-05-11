@@ -35,16 +35,58 @@ CREATE TABLE IF NOT EXISTS scenario_fulfillment_lines (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+ALTER TABLE scenario_orders ADD COLUMN IF NOT EXISTS ship_lat DOUBLE PRECISION;
+ALTER TABLE scenario_orders ADD COLUMN IF NOT EXISTS ship_lon DOUBLE PRECISION;
+ALTER TABLE scenario_orders ADD COLUMN IF NOT EXISTS ship_label TEXT;
+
+CREATE TABLE IF NOT EXISTS scenario_customers (
+  customer_email TEXT PRIMARY KEY,
+  customer_name TEXT,
+  loyalty_tier TEXT NOT NULL DEFAULT 'standard',
+  orders_placed INT NOT NULL DEFAULT 0,
+  lifetime_cents BIGINT NOT NULL DEFAULT 0,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS scenario_payments (
+  id SERIAL PRIMARY KEY,
+  order_ref TEXT NOT NULL REFERENCES scenario_orders(order_ref) ON DELETE CASCADE,
+  payment_method TEXT NOT NULL,
+  amount_cents INT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'captured',
+  processor_ref TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS scenario_shipments (
+  id SERIAL PRIMARY KEY,
+  order_ref TEXT NOT NULL REFERENCES scenario_orders(order_ref) ON DELETE CASCADE,
+  carrier TEXT NOT NULL,
+  tracking_id TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'label_created',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE(order_ref)
+);
+
 ALTER TABLE public.scenario_catalog_mirror OWNER TO demo;
 ALTER TABLE public.scenario_orders OWNER TO demo;
 ALTER TABLE public.scenario_fulfillment_lines OWNER TO demo;
+ALTER TABLE public.scenario_customers OWNER TO demo;
+ALTER TABLE public.scenario_payments OWNER TO demo;
+ALTER TABLE public.scenario_shipments OWNER TO demo;
 
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.scenario_catalog_mirror TO demo;
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.scenario_orders TO demo;
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.scenario_fulfillment_lines TO demo;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.scenario_customers TO demo;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.scenario_payments TO demo;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.scenario_shipments TO demo;
 GRANT SELECT ON TABLE public.scenario_catalog_mirror TO replicator;
 GRANT SELECT ON TABLE public.scenario_orders TO replicator;
 GRANT SELECT ON TABLE public.scenario_fulfillment_lines TO replicator;
+GRANT SELECT ON TABLE public.scenario_customers TO replicator;
+GRANT SELECT ON TABLE public.scenario_payments TO replicator;
+GRANT SELECT ON TABLE public.scenario_shipments TO replicator;
 
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
@@ -66,3 +108,12 @@ CREATE INDEX IF NOT EXISTS idx_scenario_fulfill_order_ref ON scenario_fulfillmen
 CREATE INDEX IF NOT EXISTS idx_scenario_fulfill_sku ON scenario_fulfillment_lines (sku);
 CREATE INDEX IF NOT EXISTS idx_scenario_fulfill_order_sku ON scenario_fulfillment_lines (order_ref, sku);
 CREATE INDEX IF NOT EXISTS idx_scenario_fulfill_brin_created ON scenario_fulfillment_lines USING BRIN (created_at);
+
+CREATE INDEX IF NOT EXISTS idx_scenario_customers_tier ON scenario_customers (loyalty_tier);
+CREATE INDEX IF NOT EXISTS idx_scenario_customers_updated ON scenario_customers (updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_scenario_payments_order ON scenario_payments (order_ref);
+CREATE INDEX IF NOT EXISTS idx_scenario_payments_method ON scenario_payments (payment_method, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_scenario_payments_brin_created ON scenario_payments USING BRIN (created_at);
+CREATE INDEX IF NOT EXISTS idx_scenario_shipments_carrier ON scenario_shipments (carrier);
+CREATE INDEX IF NOT EXISTS idx_scenario_shipments_tracking ON scenario_shipments (tracking_id);
+CREATE INDEX IF NOT EXISTS idx_scenario_shipments_brin_created ON scenario_shipments USING BRIN (created_at);

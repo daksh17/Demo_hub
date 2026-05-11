@@ -39,7 +39,7 @@ Service **`hub-demo-ui`** in **`../../../docker-compose.yml`** serves a small pa
 
 **Tunable load:** open **http://localhost:8888/workload** to drive batches with **total records**, **batch size**, **payload size (KB)**, and choose **Postgres / Mongo / Redis / Cassandra / OpenSearch / SQL Server** (optional checkbox). **SQL Server** targets **`demo.dbo.hub_workload_mssql`** on the **publisher** (same `wl-<run_id>-<seq>` pattern; table is **not** CDC-enabled so Debezium stays focused on the catalog mirror). OpenSearch writes go to index **`hub-workload`** (large payloads × many rows can stress disk; stay within the UI limits).
 
-**Multi-DB scenario (Faker, pipelines):** **http://localhost:8888/scenario** seeds a **MongoDB** product catalog (rich documents), syncs a mirror into **Postgres** and (when **`MSSQL_HOST`** is set) into **SQL Server** **`dbo.scenario_catalog_mirror_mssql`**, emits **Kafka** topics (`scenario.catalog.changes`, `scenario.orders.events`, `scenario.pipeline.sync`), indexes the same payloads in **OpenSearch** (`hub-scenario-pipeline`) as a stand-in for a Kafka→OpenSearch sink, refreshes **Redis** dashboard keys, and writes order timelines to **Cassandra**. Use the numbered buttons, then open each store’s **View data** page (including **SQL Server**). Requires **`docker compose build hub-demo-ui`** after pulling (adds Faker + kafka-python + pymssql). **SQL Server compose + connectors:** [`../mssql-kafka/README.md`](../mssql-kafka/README.md). **Full narrative with Mermaid diagrams, connector counts, source/sink tables, and Mongo sharding:** [`scenario-flow/README.md`](scenario-flow/README.md). **Compact version:** [`README-SCENARIO-FLOW.md`](README-SCENARIO-FLOW.md). **Indexes** (Postgres BRIN/GIN/GiST/HASH/partial/covering, Mongo ESR compounds + partial + text, Cassandra secondary index): [`../../README.md` → Hub scenario indexes](../../README.md#hub-scenario-indexes-multi-db-reference); implementation in **`demo-ui/scenario.py`** and **`../mongo-kafka/demo-indexes.js`**.
+**Multi-DB scenario (Faker, pipelines):** **http://localhost:8888/scenario** seeds a **MongoDB** product catalog (rich documents) and optional **`demo.scenario_suppliers`**, syncs a mirror into **Postgres** and (when **`MSSQL_HOST`** is set) into **SQL Server** **`dbo.scenario_catalog_mirror_mssql`**, emits **Kafka** topics (`scenario.catalog.changes`, `scenario.orders.events`, `scenario.pipeline.sync`, `scenario.shipments.events`), indexes the same payloads in **OpenSearch** (`hub-scenario-pipeline`) as a stand-in for a Kafka→OpenSearch sink, refreshes **Redis** dashboard keys (including **`scenario:shipments:recent`** and **`scenario:customer:*`** hashes), and writes order timelines plus **`scenario_carrier_shipments`** to **Cassandra**. Use the numbered buttons, then open each store’s **View data** page (including **SQL Server**). Requires **`docker compose build hub-demo-ui`** after pulling (adds Faker + kafka-python + pymssql). **SQL Server compose + connectors:** [`../mssql-kafka/README.md`](../mssql-kafka/README.md). **Full narrative with Mermaid diagrams, connector counts, source/sink tables, and Mongo sharding:** [`scenario-flow/README.md`](scenario-flow/README.md). **Compact version:** [`README-SCENARIO-FLOW.md`](README-SCENARIO-FLOW.md). **Indexes** (Postgres BRIN/GIN/GiST/HASH/partial/covering, Mongo ESR compounds + partial + text, Cassandra secondary index): [`../../README.md` → Hub scenario indexes](../../README.md#hub-scenario-indexes-multi-db-reference); implementation in **`demo-ui/scenario.py`** and **`../mongo-kafka/demo-indexes.js`**.
 
 | Store | What the UI writes | Quick verify |
 |--------|-------------------|--------------|
@@ -166,8 +166,8 @@ sequenceDiagram
   participant OS as OpenSearch Dashboards
 
   Note over App, O: Step A — persist order (OLTP)
-  App->>PG: INSERT order + line items
-  PG-->>App: OK (order_id)
+  App->>PG: INSERT order + lines (generic demo_items or scenario_orders + customers + payments)
+  PG-->>App: OK (order id / order_ref)
 
   Note over App, M: Step B — update catalog / stock (document)
   App->>M: update catalog collection (e.g. sku stockByWarehouse)
@@ -264,29 +264,32 @@ flowchart TD
 flowchart LR
   subgraph ingest [From Kafka or API]
     K[Kafka topics]
-    A[API direct]
+    A[API direct hub-demo-ui]
   end
 
   subgraph write_path [Write paths]
-    C1[Step 1: High volume timeline events to Cassandra]
-    R1[Step 2: Short TTL read models in Redis]
-    O1[Step 3: Denormalized docs bulk to OpenSearch]
+    C1[Cassandra: timelines ORDER_PLACED FULFILLMENT_READY SHIPMENT_LABELED]
+    C2[Cassandra: scenario_carrier_shipments by carrier + tracking]
+    R1[Redis: TTL order:latest · customer hash · kafka recent · shipments recent]
+    O1[OpenSearch: hub-scenario-pipeline mirrored JSON]
   end
 
   subgraph read_path [Read paths]
-    CQ[Analytics CQL time range by partition]
-    RQ[Cache aside GET order status]
-    OQ[Search browse fuzzy filters]
+    CQ[CQL by order_ref or carrier partition]
+    RQ[GET cached order profile dashboard summary]
+    OQ[Discover / search pipeline events]
   end
 
   K --> C1
   K --> R1
   K --> O1
   A --> C1
+  A --> C2
   A --> R1
   A --> O1
 
   C1 --> CQ
+  C2 --> CQ
   R1 --> RQ
   O1 --> OQ
 ```
@@ -338,7 +341,7 @@ One overview: **`hub-demo-ui`** produces **`scenario.*`** topics directly (not C
 flowchart TB
   subgraph SEC_A["A — Application (hub-demo-ui)"]
     direction LR
-    UI["/scenario steps 1–4<br/>Faker · pipelines · workload"]
+    UI["/scenario steps 1–5<br/>Faker · pipelines · ship labels · workload"]
     OD["Create demo order<br/>→ demo_items"]
   end
 
@@ -347,13 +350,15 @@ flowchart TB
     T1[scenario.catalog.changes]
     T2[scenario.orders.events]
     T3[scenario.pipeline.sync]
+    T4[scenario.shipments.events]
   end
 
   UI --> T1
   UI --> T2
   UI --> T3
+  UI --> T4
 
-  WSTORES["/scenario multi-store writes:<br/>Postgres scenario_* · Mongo · MSSQL catalog mirror<br/>OpenSearch · Redis · Cassandra"]
+  WSTORES["/scenario multi-store writes:<br/>Postgres scenario_* incl. customers · payments · shipments<br/>Mongo catalog + scenario_suppliers · MSSQL catalog mirror<br/>OpenSearch · Redis · Cassandra timeline + carrier_shipments"]
   UI --> WSTORES
 
   PGdem[(Postgres<br/>public.demo_items)]

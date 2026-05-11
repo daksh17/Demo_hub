@@ -10,8 +10,8 @@ Implementation: [`demo-ui/scenario.py`](demo-ui/scenario.py) (FastAPI handlers i
 
 | Where | What to look at |
 |--------|------------------|
-| **Live UI** | **Scenario** → **Pipeline line diagram** (horizontal spine, steps 1–4) and the **vertical “Flow diagram”** in the sidebar (same four stages top → bottom). These match the page you see when you click the numbered buttons. |
-| **This repo (static)** | **[`diagrams/01-sequence-order-flow.mmd`](diagrams/01-sequence-order-flow.mmd)** — end-to-end sequence closest to “order + search + side stores.” For **Mongo-heavy** paths see **`03-flowchart-mongo-path.mmd`**, for **Postgres / fulfillment** see **`02-flowchart-postgres-path.mmd`**, for **Cassandra + Redis + OpenSearch** see **`04-flowchart-cassandra-redis-os.mmd`**. Overview: **`00-component-context.mmd`**. Rendered **SVG** versions sit alongside each **`.mmd`** file. |
+| **Live UI** | **Scenario** → **Pipeline line diagram** (horizontal spine, steps **1–5**) and the **vertical “Flow diagram”** in the sidebar (same five stages top → bottom). |
+| **This repo (static)** | **[`diagrams/01-sequence-order-flow.mmd`](diagrams/01-sequence-order-flow.mmd)** — broader order + CDC story. For **Mongo-heavy** paths see **`03-flowchart-mongo-path.mmd`**, for **Postgres / fulfillment** see **`02-flowchart-postgres-path.mmd`**, for **Cassandra + Redis + OpenSearch** see **`04-flowchart-cassandra-redis-os.mmd`**. Overview including **`scenario.*`** vs Connect: **`06-flowchart-multi-db-faker-connect-overview.mmd`**. Rendered **SVG** versions sit alongside each **`.mmd`** file. |
 
 The hub’s main **[`README.md`](README.md)** also inlines those SVGs and collapsible Mermaid blocks for GitHub.
 
@@ -24,41 +24,43 @@ There are **two different meanings** of “connector”:
 ### A) Kafka Connect JVM connectors (Debezium, JDBC sink, …)
 
 - The **Multi-DB scenario does not require any Kafka Connect connector** to move data. The demo uses **in-process Python**: **`kafka-python`** producers, **PyMongo**, **psycopg**, **HTTP** to OpenSearch, **redis-py**, **Cassandra driver**.
-- The stack **can** run **Kafka Connect** for other demos (e.g. **`../mongo-kafka/`** with **`demo.demo_items`**). That is **separate** from the four **Scenario** buttons unless you explicitly register and run those connectors.
+- The stack **can** run **Kafka Connect** for other demos (e.g. **`../mongo-kafka/`** with **`demo.demo_items`**). That is **separate** from the **Scenario** buttons unless you explicitly register and run those connectors.
 
 ### B) Logical “pipelines” triggered from the UI (recommended wording)
 
-When you use **Scenario**, you are running **four explicit operations** (four buttons). Think of them as **four integration steps**, not four Kafka Connect tasks:
+When you use **Scenario**, you run **five explicit operations** (five numbered pipeline buttons plus order form / quick order). Think of them as **five integration steps**, not Kafka Connect tasks:
 
 | # | Python entry | Role |
 |---|----------------|------|
-| 1 | `op_seed_catalog` | Load generator → Mongo only |
-| 2 | `op_pipeline_mongo_to_postgres_and_kafka` | **Batch sync**: Mongo → Postgres + Kafka + OpenSearch + Redis |
-| 3 | `op_place_order` | **OLTP**: Mongo + Postgres read → Postgres + Kafka + OpenSearch + Cassandra + Redis |
-| 4 | `op_pipeline_postgres_to_fulfillment_and_kafka` | **Batch sync**: Postgres → Postgres fulfillment + Kafka + OpenSearch + Cassandra (+ Redis summary refresh) |
+| 1 | `op_seed_catalog` | Load generator → Mongo (`scenario_products`, optional `scenario_suppliers`) |
+| 2 | `op_pipeline_mongo_to_postgres_and_kafka` | **Batch sync**: Mongo → Postgres mirror + Kafka + OpenSearch + Redis (+ MSSQL MERGE when configured) |
+| 3 | `op_place_order` | **OLTP**: Postgres `scenario_orders` + `scenario_customers` + `scenario_payments` + Kafka + OpenSearch + Cassandra + Redis |
+| 4 | `op_pipeline_postgres_to_fulfillment_and_kafka` | **Batch sync**: Postgres fulfillment lines + Kafka + OpenSearch + Cassandra (+ Redis summary refresh) |
+| 5 | `op_pipeline_fulfilled_to_shipments` | **Shipping**: Postgres `scenario_shipments` + `scenario.shipments.events` + OpenSearch + Cassandra timeline + `scenario_carrier_shipments` + Redis `scenario:shipments:recent` |
 
-So: **four** user-driven steps; **two** of them are **multi-store pipeline/sync** functions (steps **2** and **4**). **None** of these are “Kafka Connect connectors” unless you replace them with Connect in production.
+**None** of these are “Kafka Connect connectors” unless you replace them with Connect in production.
 
 ---
 
 ## 3. Source vs sink (per step)
 
-Full **Kafka** topic names are prefixed with **`scenario.`** in code:
+Full **Kafka** topic names ( **`scenario.`** prefix ):
 
 - `scenario.catalog.changes`
 - `scenario.orders.events`
 - `scenario.pipeline.sync`
+- `scenario.shipments.events`
 
-**OpenSearch** index for mirrored events: **`hub-scenario-pipeline`** (see `SCENARIO_PIPELINE_OS_INDEX` in `scenario.py`).
+**OpenSearch** index for mirrored events: **`hub-scenario-pipeline`**.
 
 ### Step 1 — Seed Mongo catalog
 
 | Role | System | Detail |
 |------|--------|--------|
-| **Source** | **Faker** (in memory) | Synthetic product fields |
-| **Sink** | **MongoDB** | `demo.scenario_products` (via **mongos**) |
+| **Source** | **Faker** (in memory) | Synthetic product + supplier fields |
+| **Sink** | **MongoDB** | `demo.scenario_products`; optional `demo.scenario_suppliers` |
 
-No other store is written.
+Redis dashboard summary refreshed after seed.
 
 ### Step 2 — Sync catalog → Postgres + Kafka + OpenSearch + Redis
 
@@ -67,20 +69,20 @@ No other store is written.
 | **Source** | **MongoDB** | Reads up to **80** docs from `demo.scenario_products` |
 | **Sink** | **PostgreSQL** | UPSERT `scenario_catalog_mirror` |
 | **Sink** | **Kafka** | Produce `scenario.catalog.changes` |
-| **Sink** | **OpenSearch** | Index same logical payload (direction `mongo→kafka+os`) |
+| **Sink** | **OpenSearch** | Index same logical payload (`mongo→kafka+os`) |
 | **Sink** | **Redis** | `LPUSH` recent list `scenario:kafka:recent`, refresh `scenario:dashboard:summary` |
 
-### Step 3 — Place random order
+### Step 3 — Place order
 
 | Role | System | Detail |
 |------|--------|--------|
 | **Source** | **MongoDB** | SKUs (up to 50 read) |
 | **Source** | **PostgreSQL** | Prices from `scenario_catalog_mirror` when available |
-| **Sink** | **PostgreSQL** | Insert `scenario_orders` |
+| **Sink** | **PostgreSQL** | Insert `scenario_orders`; UPSERT `scenario_customers`; INSERT `scenario_payments` |
 | **Sink** | **Kafka** | `scenario.orders.events` |
-| **Sink** | **OpenSearch** | Mirror payload (direction `api→kafka+os`) |
-| **Sink** | **Cassandra** | `demo_hub.scenario_timeline` event `ORDER_PLACED` |
-| **Sink** | **Redis** | `scenario:order:latest:<order_ref>` (1h TTL), recent list + dashboard summary |
+| **Sink** | **OpenSearch** | Mirror (`api→kafka+os`) |
+| **Sink** | **Cassandra** | `scenario_timeline` — `ORDER_PLACED` |
+| **Sink** | **Redis** | `scenario:order:latest:<order_ref>`, `scenario:customer:<email>`, recent list + dashboard summary |
 
 ### Step 4 — Fulfillment rows + Kafka + OpenSearch + Cassandra
 
@@ -89,9 +91,20 @@ No other store is written.
 | **Source** | **PostgreSQL** | Orders **without** rows in `scenario_fulfillment_lines` yet (up to 20) |
 | **Sink** | **PostgreSQL** | Insert `scenario_fulfillment_lines` |
 | **Sink** | **Kafka** | `scenario.pipeline.sync` |
-| **Sink** | **OpenSearch** | Mirror payload (direction `postgres→kafka+os`) |
+| **Sink** | **OpenSearch** | Mirror (`postgres→kafka+os`) |
 | **Sink** | **Cassandra** | `FULFILLMENT_READY` on `scenario_timeline` |
-| **Sink** | **Redis** | Dashboard summary refresh only (**no** new recent-list push in this function) |
+| **Sink** | **Redis** | Dashboard summary refresh only |
+
+### Step 5 — Shipping labels
+
+| Role | System | Detail |
+|------|--------|--------|
+| **Source** | **PostgreSQL** | Fulfilled orders with **no** `scenario_shipments` row yet |
+| **Sink** | **PostgreSQL** | Insert `scenario_shipments` |
+| **Sink** | **Kafka** | `scenario.shipments.events` |
+| **Sink** | **OpenSearch** | Mirror (`postgres→kafka+os`) |
+| **Sink** | **Cassandra** | `SHIPMENT_LABELED` + insert `scenario_carrier_shipments` |
+| **Sink** | **Redis** | `scenario:shipments:recent` list + dashboard summary |
 
 ---
 
@@ -109,41 +122,49 @@ No other store is written.
 
 ---
 
-## 5. Diagram: four-step pipeline (Mermaid)
-
-Renders on **GitHub** and in Mermaid-capable viewers.
+## 5. Diagram: five-step pipeline (Mermaid)
 
 ```mermaid
 flowchart LR
   subgraph s1 [1 · Seed]
-    F[ Faker ] --> M[( Mongo demo.scenario_products )]
+    F[Faker] --> M[(scenario_products)]
+    F -. optional .-> SUP[(scenario_suppliers)]
   end
 
   subgraph s2 [2 · Sync]
-    M2[( Mongo catalog )] --> PG1[( Postgres mirror )]
-    M2 --> K1[ Kafka scenario.catalog.changes ]
-    M2 --> OS1[ OpenSearch hub-scenario-pipeline ]
-    M2 --> R1[ Redis summary + recent ]
+    M2[(Mongo catalog)] --> PG1[(Postgres mirror)]
+    M2 --> K1[Kafka scenario.catalog.changes]
+    M2 --> OS1[OpenSearch hub-scenario-pipeline]
+    M2 --> R1[Redis summary + recent]
   end
 
   subgraph s3 [3 · Order]
-    M3[( Mongo SKUs )] --> PGO[ Postgres scenario_orders ]
-    PGm[( Postgres mirror prices )] --> PGO
-    PGO --> K2[ Kafka scenario.orders.events ]
-    PGO --> OS2[ OpenSearch ]
-    PGO --> CA1[( Cassandra ORDER_PLACED )]
-    PGO --> R2[ Redis order cache + summary ]
+    M3[(Mongo SKUs)] --> PGO[(Postgres orders + customers + payments)]
+    PGm[(Postgres mirror prices)] --> PGO
+    PGO --> K2[Kafka scenario.orders.events]
+    PGO --> OS2[OpenSearch]
+    PGO --> CA1[(Cassandra ORDER_PLACED)]
+    PGO --> R2[Redis order + customer hash]
   end
 
   subgraph s4 [4 · Fulfill]
-    PGF[( Postgres orders )] --> PGL[( Postgres fulfillment_lines )]
-    PGF --> K3[ Kafka scenario.pipeline.sync ]
-    PGF --> OS3[ OpenSearch ]
-    PGF --> CA2[( Cassandra FULFILLMENT_READY )]
-    PGF --> R3[ Redis summary refresh ]
+    PGF[(Postgres orders)] --> PGL[(Postgres fulfillment_lines)]
+    PGF --> K3[Kafka scenario.pipeline.sync]
+    PGF --> OS3[OpenSearch]
+    PGF --> CA2[(Cassandra FULFILLMENT_READY)]
+    PGF --> R3[Redis summary refresh]
   end
 
-  M -.->|same cluster| M2
+  subgraph s5 [5 · Ship]
+    PGL --> SH[(Postgres scenario_shipments)]
+    PGL --> K4[Kafka scenario.shipments.events]
+    PGL --> OS4[OpenSearch]
+    PGL --> CA3[(Cassandra SHIPMENT_LABELED)]
+    PGL --> CS[(carrier_shipments)]
+    PGL --> R4[Redis shipments recent]
+  end
+
+  M -.->|mongos| M2
   M2 --> M3
   PG1 --> PGm
   PGO --> PGF
@@ -155,11 +176,12 @@ flowchart LR
 
 ```mermaid
 flowchart TB
-  A[Seed: Faker → Mongo demo.scenario_products]
-  B[Sync: Postgres mirror + Kafka + OpenSearch + Redis\nscenario.catalog.changes → hub-scenario-pipeline]
-  C[Order: Postgres orders + Kafka + OS + Redis + Cassandra ORDER_PLACED]
-  D[Fulfill: Postgres lines + Kafka + OS + Cassandra FULFILLMENT_READY]
-  A --> B --> C --> D
+  A[Seed: Faker → Mongo scenario_products + optional scenario_suppliers]
+  B[Sync: Postgres mirror + Kafka + OpenSearch + Redis\nscenario.catalog.changes]
+  C[Order: scenario_orders + customers + payments + Kafka + OS + Redis + Cassandra]
+  D[Fulfill: fulfillment_lines + Kafka + OS + Cassandra FULFILLMENT_READY]
+  E[Ship: scenario_shipments + scenario.shipments.events + carrier_shipments + Redis]
+  A --> B --> C --> D --> E
 ```
 
 ---
@@ -169,9 +191,9 @@ flowchart TB
 | Artifact | Value |
 |----------|--------|
 | UI | `http://localhost:8888/scenario` |
-| Catalog collection | `demo.scenario_products` |
-| Postgres tables | `scenario_catalog_mirror`, `scenario_orders`, `scenario_fulfillment_lines` |
-| Cassandra table | `demo_hub.scenario_timeline` |
-| Redis keys | `scenario:dashboard:summary`, `scenario:kafka:recent`, `scenario:order:latest:*` |
+| Catalog collections | `demo.scenario_products`, `demo.scenario_suppliers` |
+| Postgres tables | `scenario_catalog_mirror`, `scenario_orders`, `scenario_fulfillment_lines`, `scenario_customers`, `scenario_payments`, `scenario_shipments` |
+| Cassandra | `demo_hub.scenario_timeline`, `demo_hub.scenario_carrier_shipments` |
+| Redis keys | `scenario:dashboard:summary`, `scenario:kafka:recent`, `scenario:order:latest:*`, `scenario:customer:*`, `scenario:shipments:recent` |
 
 For ports, stack startup, and OpenSearch **Discover**, see **[`README.md`](README.md)** and **[`../../../docker-compose.yml`](../../../docker-compose.yml)**.

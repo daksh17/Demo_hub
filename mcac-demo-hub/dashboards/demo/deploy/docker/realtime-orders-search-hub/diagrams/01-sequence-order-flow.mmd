@@ -13,8 +13,8 @@ sequenceDiagram
   participant OS as OpenSearch Dashboards
 
   Note over App, O: Step A — persist order (OLTP)
-  App->>PG: INSERT order + line items
-  PG-->>App: OK (order_id)
+  App->>PG: INSERT order + lines (generic demo_items or scenario_orders + customers + payments)
+  PG-->>App: OK (order id / order_ref)
 
   Note over App, M: Step B — update catalog / stock (document)
   App->>M: update catalog collection (e.g. sku stockByWarehouse)

@@ -1,29 +1,32 @@
-%% Cassandra + Redis + OpenSearch — how they complement Kafka CDC
+%% Cassandra + Redis + OpenSearch — Kafka CDC and /scenario hub paths
 flowchart LR
   subgraph ingest [From Kafka or API]
     K[Kafka topics]
-    A[API direct]
+    A[API direct hub-demo-ui]
   end
 
   subgraph write_path [Write paths]
-    C1[Step 1: High volume timeline events to Cassandra]
-    R1[Step 2: Short TTL read models in Redis]
-    O1[Step 3: Denormalized docs bulk to OpenSearch]
+    C1[Cassandra: timelines ORDER_PLACED FULFILLMENT_READY SHIPMENT_LABELED]
+    C2[Cassandra: scenario_carrier_shipments by carrier + tracking]
+    R1[Redis: TTL order:latest · customer hash · kafka recent · shipments recent]
+    O1[OpenSearch: hub-scenario-pipeline mirrored JSON]
   end
 
   subgraph read_path [Read paths]
-    CQ[Analytics CQL time range by partition]
-    RQ[Cache aside GET order status]
-    OQ[Search browse fuzzy filters]
+    CQ[CQL by order_ref or carrier partition]
+    RQ[GET cached order profile dashboard summary]
+    OQ[Discover / search pipeline events]
   end
 
   K --> C1
   K --> R1
   K --> O1
   A --> C1
+  A --> C2
   A --> R1
   A --> O1
 
   C1 --> CQ
+  C2 --> CQ
   R1 --> RQ
   O1 --> OQ

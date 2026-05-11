@@ -2,7 +2,7 @@
 
 **Common to Compose + Kubernetes:** [`../../../../docs/hub-and-data-flow.md`](../../../../docs/hub-and-data-flow.md) · [`../../../../docs/compose-vs-kubernetes.md`](../../../../docs/compose-vs-kubernetes.md) · [`../../../../docs/README.md`](../../../../docs/README.md)
 
-This page matches what you see on **http://localhost:8888/scenario** (“Multi-DB scenario (Faker + pipelines)”): the **Pipeline line diagram** (horizontal), the sidebar **Flow diagram** (vertical), and the four **Behind the scenes** steps.
+This page matches what you see on **http://localhost:8888/scenario** (“Multi-DB scenario (Faker + pipelines)”): the **Pipeline line diagram** (horizontal), the sidebar **Flow diagram** (vertical), and the **Behind the scenes** steps (**1–5**).
 
 Implementation: [`../demo-ui/scenario.py`](../demo-ui/scenario.py) and handlers in [`../demo-ui/app.py`](../demo-ui/app.py).
 
@@ -14,16 +14,17 @@ A shorter companion with the same tables: [`../README-SCENARIO-FLOW.md`](../READ
 
 | What you are looking at | Where it lives | What it shows |
 |---------------------------|----------------|---------------|
-| **Pipeline line diagram** | Scenario page, main column | Steps **1 → 2 → 3 → 4** on one horizontal spine (Seed, Sync, Order, Fulfill). |
-| **Vertical flow diagram** | Scenario page, right column | The **same four stages** top to bottom (matches your screenshot). |
-| **Four-step Mermaid (horizontal)** | [Section 5](#5-mermaid-four-step-pipeline-matches-ui-logic) below | Same logic as the UI; good for GitHub / docs. |
-| **End-to-end reference architecture** | [`../diagrams/00-component-context.mmd`](../diagrams/00-component-context.mmd) (+ `.svg`) | All hub systems at once; not limited to the four Scenario buttons. |
+| **Pipeline line diagram** | Scenario page, main column | Steps **1 → 5** on one horizontal spine (Seed, Sync, Order, Fulfill, Ship) plus end marker. |
+| **Vertical flow diagram** | Scenario page, right column | The **same five stages** top to bottom. |
+| **Five-step Mermaid (horizontal)** | [Section 5](#5-mermaid-five-step-pipeline-matches-ui-logic) below | Same logic as the UI; good for GitHub / docs. |
+| **End-to-end reference architecture** | [`../diagrams/00-component-context.mmd`](../diagrams/00-component-context.mmd) (+ `.svg`) | All hub systems at once; not limited to the Scenario buttons. |
 | **Order / search sequence** | [`../diagrams/01-sequence-order-flow.mmd`](../diagrams/01-sequence-order-flow.mmd) | Broader “order + search + side stores” story. |
+| **Scenario vs Connect overview** | [`../diagrams/06-flowchart-multi-db-faker-connect-overview.mmd`](../diagrams/06-flowchart-multi-db-faker-connect-overview.mmd) | **`scenario.*`** topics + multi-store writes vs **`demo_items`** CDC connectors. |
 | **Postgres fulfillment path** | [`../diagrams/02-flowchart-postgres-path.mmd`](../diagrams/02-flowchart-postgres-path.mmd) | Detailed Postgres-shaped flows. |
 | **Mongo CDC-style path** | [`../diagrams/03-flowchart-mongo-path.mmd`](../diagrams/03-flowchart-mongo-path.mmd) | **Debezium + `demo.demo_items`** (mongo-kafka demo), not `scenario_products`. |
-| **Cassandra / Redis / OpenSearch** | [`../diagrams/04-flowchart-cassandra-redis-os.mmd`](../diagrams/04-flowchart-cassandra-redis-os.mmd) | Side stores in the wider hub story. |
+| **Cassandra / Redis / OpenSearch** | [`../diagrams/04-flowchart-cassandra-redis-os.mmd`](../diagrams/04-flowchart-cassandra-redis-os.mmd) | Side stores including **`/scenario`** timeline + carrier shipments + Redis key patterns. |
 
-**Takeaway:** For the **exact** four-button Scenario flow, trust the **UI diagrams** or the **Mermaid in sections 5–6** below. The numbered `.mmd` files under [`../diagrams/`](../diagrams/) describe the **whole** reference hub; some nodes reference **other** demos (e.g. Postgres/Mongo CDC on `demo_items`), not necessarily `scenario_*` tables.
+**Takeaway:** For the **exact** Scenario buttons, trust the **UI diagrams** or the **Mermaid in sections 5–6** below. The numbered `.mmd` files under [`../diagrams/`](../diagrams/) describe the **whole** reference hub; some nodes reference **other** demos (e.g. Postgres/Mongo CDC on `demo_items`), not necessarily `scenario_*` tables.
 
 ---
 
@@ -33,9 +34,9 @@ The word **connector** means two different things here.
 
 ### A) Kafka Connect connectors (JVM, Debezium / JDBC / Mongo sink)
 
-The **Scenario page does not use Kafka Connect.** Data movement for the four buttons is **Python in `hub-demo-ui`**: PyMongo, psycopg, kafka-python, HTTP to OpenSearch, redis-py, Cassandra driver.
+The **Scenario page does not use Kafka Connect.** Data movement for the pipeline buttons is **Python in `hub-demo-ui`**: PyMongo, psycopg, kafka-python, HTTP to OpenSearch, redis-py, Cassandra driver.
 
-If you **separately** start the stack’s **Kafka Connect** service and run the registration scripts from the other demos, you can have **up to four** connectors defined in this repo (they mirror **`demo_items`**-style paths, **not** `scenario_*`):
+If you **separately** start the stack’s **Kafka Connect** service and run the registration scripts from the other demos, you can have **up to six** connectors defined in this repo (they mirror **`demo_items`**-style paths and MSSQL, **not** `scenario_*`):
 
 | Connector name | Type | Source | Sink |
 |----------------|------|--------|------|
@@ -43,30 +44,34 @@ If you **separately** start the stack’s **Kafka Connect** service and run the 
 | `jdbc-sink-demo` | Debezium JDBC sink | That Kafka topic | Postgres table `demo_items_from_kafka` |
 | `mongo-source-demo` | Debezium MongoDB | Mongo `demo.demo_items` (change streams via **mongos**) | Kafka topic prefix `demomongo` |
 | `mongo-sink-demo` | MongoDB Kafka Connect sink | Topic `demomongo.demo.demo_items` | Mongo `demo.demo_items_from_kafka` |
+| `mssql-source-demo` | Debezium SQL Server | Publisher `dbo.scenario_catalog_mirror_mssql` | Kafka |
+| `mssql-jdbc-sink-demo` | JDBC sink | That topic | Subscriber |
 
-Scripts: [`../../postgres-kafka/register-connectors.sh`](../../postgres-kafka/register-connectors.sh), [`../../mongo-kafka/register-mongo-connectors.sh`](../../mongo-kafka/register-mongo-connectors.sh).  
-**Count for Scenario:** **0** Kafka Connect connectors. **Count if both demo scripts are registered:** **4** connectors (still unrelated to `scenario_products`).
+Scripts: [`../../postgres-kafka/register-connectors.sh`](../../postgres-kafka/register-connectors.sh), [`../../mongo-kafka/register-mongo-connectors.sh`](../../mongo-kafka/register-mongo-connectors.sh), [`../../mssql-kafka/register-mssql-connectors.sh`](../../mssql-kafka/register-mssql-connectors.sh).  
+**Count for Scenario:** **0** Kafka Connect connectors. **Count if all demo scripts are registered:** **6** connectors (still unrelated to moving **`scenario_products`** rows).
 
 ### B) Logical pipelines (what the Scenario UI runs)
 
 | # | Function in `scenario.py` | Plain-language role |
 |---|-----------------------------|---------------------|
-| 1 | `op_seed_catalog` | Faker → Mongo only |
-| 2 | `op_pipeline_mongo_to_postgres_and_kafka` | Mongo → Postgres + Kafka + OpenSearch + Redis |
-| 3 | `op_place_order` | Mongo + Postgres reads → Postgres + Kafka + OpenSearch + Cassandra + Redis |
-| 4 | `op_pipeline_postgres_to_fulfillment_and_kafka` | Postgres → Postgres fulfillment + Kafka + OpenSearch + Cassandra + Redis summary |
+| 1 | `op_seed_catalog` | Faker → Mongo (`scenario_products`, optional `scenario_suppliers`) |
+| 2 | `op_pipeline_mongo_to_postgres_and_kafka` | Mongo → Postgres mirror + Kafka + OpenSearch + Redis (+ MSSQL when set) |
+| 3 | `op_place_order` | Postgres orders + customers + payments + Kafka + OpenSearch + Cassandra + Redis |
+| 4 | `op_pipeline_postgres_to_fulfillment_and_kafka` | Postgres fulfillment + Kafka + OpenSearch + Cassandra + Redis summary |
+| 5 | `op_pipeline_fulfilled_to_shipments` | Postgres shipments + `scenario.shipments.events` + OpenSearch + Cassandra + Redis |
 
-**Count:** **four** user-triggered integration steps.
+**Count:** **five** user-triggered integration steps (plus **Quick order** / **Custom order** both using step 3).
 
 ---
 
 ## 3. Source vs sink (per Scenario step)
 
-Kafka topics (all prefixed `scenario.` in code):
+Kafka topics ( **`scenario.`** in code):
 
 - `scenario.catalog.changes`
 - `scenario.orders.events`
 - `scenario.pipeline.sync`
+- `scenario.shipments.events`
 
 OpenSearch index for mirrored pipeline documents: **`hub-scenario-pipeline`** (`SCENARIO_PIPELINE_OS_INDEX`).
 
@@ -74,8 +79,8 @@ OpenSearch index for mirrored pipeline documents: **`hub-scenario-pipeline`** (`
 
 | Role | System | Detail |
 |------|--------|--------|
-| Source | **Faker** (in-process) | Synthetic catalog fields |
-| Sink | **MongoDB** | `demo.scenario_products` via **mongos** |
+| Source | **Faker** (in-process) | Synthetic catalog + optional supplier fields |
+| Sink | **MongoDB** | `demo.scenario_products`; optional `demo.scenario_suppliers` |
 
 ### Step 2 — Sync catalog
 
@@ -93,11 +98,11 @@ OpenSearch index for mirrored pipeline documents: **`hub-scenario-pipeline`** (`
 |------|--------|--------|
 | Source | **MongoDB** | SKUs (read) |
 | Source | **PostgreSQL** | Prices from `scenario_catalog_mirror` when present |
-| Sink | **PostgreSQL** | Insert `scenario_orders` |
+| Sink | **PostgreSQL** | `scenario_orders`, `scenario_customers` UPSERT, `scenario_payments` |
 | Sink | **Kafka** | `scenario.orders.events` |
 | Sink | **OpenSearch** | Mirror (`api→kafka+os`) |
 | Sink | **Cassandra** | `demo_hub.scenario_timeline` — `ORDER_PLACED` |
-| Sink | **Redis** | `scenario:order:latest:<order_ref>`, recent list, dashboard summary |
+| Sink | **Redis** | `scenario:order:latest:<order_ref>`, `scenario:customer:<email>`, recent list, dashboard summary |
 
 ### Step 4 — Fulfillment
 
@@ -108,7 +113,18 @@ OpenSearch index for mirrored pipeline documents: **`hub-scenario-pipeline`** (`
 | Sink | **Kafka** | `scenario.pipeline.sync` |
 | Sink | **OpenSearch** | Mirror (`postgres→kafka+os`) |
 | Sink | **Cassandra** | `FULFILLMENT_READY` on `scenario_timeline` |
-| Sink | **Redis** | **Dashboard summary refresh only** (no new `scenario:kafka:recent` push in this function) |
+| Sink | **Redis** | **Dashboard summary refresh only** |
+
+### Step 5 — Shipping labels
+
+| Role | System | Detail |
+|------|--------|--------|
+| Source | **PostgreSQL** | Orders with fulfillment rows and **no** `scenario_shipments` row |
+| Sink | **PostgreSQL** | Insert `scenario_shipments` |
+| Sink | **Kafka** | `scenario.shipments.events` |
+| Sink | **OpenSearch** | Mirror (`postgres→kafka+os`) |
+| Sink | **Cassandra** | `SHIPMENT_LABELED`, `scenario_carrier_shipments` |
+| Sink | **Redis** | `scenario:shipments:recent`, dashboard summary |
 
 ---
 
@@ -123,12 +139,13 @@ OpenSearch index for mirrored pipeline documents: **`hub-scenario-pipeline`** (`
 
 ---
 
-## 5. Mermaid: four-step pipeline (matches UI logic)
+## 5. Mermaid: five-step pipeline (matches UI logic)
 
 ```mermaid
 flowchart LR
   subgraph s1 [1 · Seed]
-    F[Faker] --> M[(Mongo demo.scenario_products)]
+    F[Faker] --> M[(scenario_products)]
+    F -. optional .-> SUP[(scenario_suppliers)]
   end
 
   subgraph s2 [2 · Sync]
@@ -139,12 +156,12 @@ flowchart LR
   end
 
   subgraph s3 [3 · Order]
-    M3[(Mongo SKUs)] --> PGO[(Postgres scenario_orders)]
+    M3[(Mongo SKUs)] --> PGO[(orders + customers + payments)]
     PGm[(Postgres mirror prices)] --> PGO
     PGO --> K2[Kafka scenario.orders.events]
     PGO --> OS2[OpenSearch]
     PGO --> CA1[(Cassandra ORDER_PLACED)]
-    PGO --> R2[Redis order cache + summary]
+    PGO --> R2[Redis order + customer hash]
   end
 
   subgraph s4 [4 · Fulfill]
@@ -155,7 +172,15 @@ flowchart LR
     PGF --> R3[Redis summary refresh]
   end
 
-  M -.->|same cluster| M2
+  subgraph s5 [5 · Ship]
+    PGL --> SH[(scenario_shipments)]
+    PGL --> K4[Kafka scenario.shipments.events]
+    PGL --> OS4[OpenSearch]
+    PGL --> CA3[(SHIPMENT_LABELED + carrier_shipments)]
+    PGL --> R4[Redis shipments recent]
+  end
+
+  M -.->|mongos| M2
   M2 --> M3
   PG1 --> PGm
   PGO --> PGF
@@ -167,11 +192,12 @@ flowchart LR
 
 ```mermaid
 flowchart TB
-  A[Seed: Faker → Mongo demo.scenario_products]
+  A[Seed: Faker → Mongo scenario_products + optional scenario_suppliers]
   B[Sync: Postgres mirror + Kafka + OpenSearch + Redis\nscenario.catalog.changes → hub-scenario-pipeline]
-  C[Order: Postgres orders + Kafka + OS + Redis + Cassandra ORDER_PLACED]
-  D[Fulfill: Postgres fulfillment lines + Kafka + OS + Cassandra FULFILLMENT_READY]
-  A --> B --> C --> D
+  C[Order: scenario_orders + customers + payments + Kafka + OS + Redis + Cassandra]
+  D[Fulfill: fulfillment_lines + Kafka + OS + Cassandra FULFILLMENT_READY]
+  E[Ship: scenario_shipments + scenario.shipments.events + carrier_shipments + Redis]
+  A --> B --> C --> D --> E
 ```
 
 ---
@@ -181,24 +207,27 @@ flowchart TB
 ```mermaid
 flowchart TB
   subgraph scenario [Scenario page — hub-demo-ui Python]
-    S1[Step 1–4 buttons]
-    S2[scenario_* tables + scenario.* topics + hub-scenario-pipeline]
+    S1[Steps 1–5 + order form]
+    S2[scenario_* tables + scenario.* topics incl. shipments.events]
     S1 --> S2
   end
 
-  subgraph connect [Optional — other demos only if registered]
+  subgraph connect [Optional — other demos if registered]
     C1[pg-source-demo]
     C2[jdbc-sink-demo]
     C3[mongo-source-demo]
     C4[mongo-sink-demo]
+    C5[mssql-source-demo]
+    C6[mssql-jdbc-sink-demo]
     C1 --> C2
     C3 --> C4
+    C5 --> C6
   end
 
   scenario -.-x|not wired| connect
 ```
 
-The dotted edge means **no automatic link**: Scenario pipelines and these four connectors operate on **different** table/collection names unless you change the code or connector config.
+The dotted edge means **no automatic link**: Scenario pipelines and these connectors operate on **different** table/collection names unless you change the code or connector config.
 
 ---
 
@@ -207,9 +236,9 @@ The dotted edge means **no automatic link**: Scenario pipelines and these four c
 | Item | Value |
 |------|--------|
 | UI | http://localhost:8888/scenario |
-| Mongo collection | `demo.scenario_products` |
-| Postgres | `scenario_catalog_mirror`, `scenario_orders`, `scenario_fulfillment_lines` |
-| Cassandra | `demo_hub.scenario_timeline` |
-| Redis | `scenario:dashboard:summary`, `scenario:kafka:recent`, `scenario:order:latest:*` |
+| Mongo | `demo.scenario_products`, optional `demo.scenario_suppliers` |
+| Postgres | `scenario_catalog_mirror`, `scenario_orders`, `scenario_fulfillment_lines`, `scenario_customers`, `scenario_payments`, `scenario_shipments` |
+| Cassandra | `demo_hub.scenario_timeline`, `demo_hub.scenario_carrier_shipments` |
+| Redis | `scenario:dashboard:summary`, `scenario:kafka:recent`, `scenario:order:latest:*`, `scenario:customer:*`, `scenario:shipments:recent` |
 
 Stack and ports: [`../../../../docker-compose.yml`](../../../../docker-compose.yml). Mongo topology: [`../../mongo-sharded/README.md`](../../mongo-sharded/README.md).
