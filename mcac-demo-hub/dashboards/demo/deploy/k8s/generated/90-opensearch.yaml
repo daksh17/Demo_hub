@@ -39,11 +39,18 @@ spec:
           imagePullPolicy: IfNotPresent
           env:
             - name: OPENSEARCH_JAVA_OPTS
-              value: "-Xms512m -Xmx512m -XX:MaxDirectMemorySize=256m"
+              value: "-Xms1g -Xmx1g -XX:MaxDirectMemorySize=512m"
             - name: DISABLE_SECURITY_PLUGIN
               value: "true"
             - name: DISABLE_INSTALL_DEMO_CONFIG
               value: "true"
+          resources:
+            requests:
+              memory: "1536Mi"
+              cpu: "250m"
+            limits:
+              memory: "2560Mi"
+              cpu: "2"
           volumeMounts:
             - name: config
               mountPath: /usr/share/opensearch/config/opensearch.yml
@@ -114,6 +121,15 @@ spec:
               value: "[\"http://opensearch:9200\"]"
             - name: DISABLE_SECURITY_DASHBOARDS_PLUGIN
               value: "true"
+            - name: NODE_OPTIONS
+              value: "--max-old-space-size=384"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "768Mi"
+              cpu: "500m"
           ports:
             - containerPort: 5601
               name: http

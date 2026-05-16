@@ -26,8 +26,13 @@ echo "=== 4/6 MSSQL tools (Job mssql-demo-bootstrap — sqlcmd + curl) ==="
 echo "=== 5/6 Nodetool exporter ==="
 docker build -t demo-hub/nodetool-exporter:latest -f deploy/docker/nodetool-exporter/Dockerfile deploy/docker/nodetool-exporter
 
-echo "=== 6/6 PostgreSQL + repmgr (matches Compose / POSTGRESQL_IMAGE) ==="
+echo "=== 6/8 PostgreSQL + repmgr (matches Compose / POSTGRESQL_IMAGE) ==="
 docker build -t mcac-demo/postgresql-repmgr:16.6.0 -f deploy/docker/postgres-kafka/Dockerfile.repmgr deploy/docker/postgres-kafka
+
+echo "=== 7/8 Demo tools (client toolbox pod) ==="
+"$DEMO_ROOT/deploy/k8s/scripts/build-demo-tools-image.sh"
+
+echo "=== 8/8 (public) Oracle DB image is pulled on apply: gvenzl/oracle-free:latest ==="
 
 echo ""
 echo "All custom images built. If kind/minikube, load them (example for kind):"
@@ -37,6 +42,7 @@ echo "  kind load docker-image mcac-demo/kafka-connect:2.7.3-mongo-sink"
 echo "  kind load docker-image mcac-demo/mssql-tools:22.04"
 echo "  kind load docker-image demo-hub/nodetool-exporter:latest"
 echo "  kind load docker-image mcac-demo/postgresql-repmgr:16.6.0"
-echo "Then: kubectl rollout restart deployment/kafka-connect deployment/hub-demo-ui deployment/nodetool-exporter statefulset/cassandra -n demo-hub"
+echo "  kind load docker-image demo-hub/demo-tools:latest"
+echo "Then: kubectl rollout restart deployment/kafka-connect deployment/hub-demo-ui deployment/nodetool-exporter deployment/demo-tools statefulset/cassandra -n demo-hub"
 echo "  deployment/mssql-publisher deployment/mssql-subscriber deployment/mssql-exporter-publisher deployment/mssql-exporter-subscriber -n demo-hub"
 echo "  (and rollout restart deployment/postgresql-primary deployment/postgresql-replica-1 deployment/postgresql-replica-2 -n demo-hub after loading Postgres image)"

@@ -85,4 +85,12 @@ kubectl delete job mssql-demo-bootstrap -n "$NS" --ignore-not-found=true
 kubectl apply -f "$GEN/62-mssql.yaml"
 kubectl wait --for=condition=complete job/mssql-demo-bootstrap -n "$NS" --timeout=3600s
 
+echo "Waiting for Oracle (first start can take several minutes)..."
+kubectl rollout status deployment/oracle -n "$NS" --timeout=900s
+
+echo "Applying Oracle demo schema Job..."
+kubectl delete job oracle-demo-bootstrap -n "$NS" --ignore-not-found=true
+kubectl apply -f "$GEN/63-oracle.yaml"
+kubectl wait --for=condition=complete job/oracle-demo-bootstrap -n "$NS" --timeout=3600s
+
 echo "Bootstrap jobs complete. kubectl get jobs -n $NS"

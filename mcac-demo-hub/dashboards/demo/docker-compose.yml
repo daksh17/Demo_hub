@@ -255,9 +255,13 @@ services:
         -c max_wal_senders=8
         -c pg_stat_statements.max=10000
         -c pg_stat_statements.track=all
+          -c pg_stat_statements.save=off
         -c cron.database_name=postgres
+        -c track_io_timing=on
+        -c track_functions=all
     volumes:
       - postgres_primary_data:/bitnami/postgresql
+      - "./deploy/docker/postgres-kafka/98-mcac-cron-host.conf:/bitnami/postgresql/conf/conf.d/98-mcac-cron-host.conf:ro"
       - "./deploy/docker/postgres-kafka/01-init-debezium.sql:/docker-entrypoint-initdb.d/01-init-debezium.sql:ro"
       - "./deploy/docker/postgres-kafka/ensure-physical-replication-slots.sql:/tmp/ensure-physical-replication-slots.sql:ro"
       - "./deploy/docker/postgres-kafka/02-physical-replication-slots.sh:/docker-entrypoint-initdb.d/02-physical-replication-slots.sh:ro"
@@ -265,6 +269,8 @@ services:
       - "./deploy/docker/postgres-kafka/04-scenario-hub-schema-indexes.sql:/docker-entrypoint-initdb.d/04-scenario-hub-schema-indexes.sql:ro"
       - "./deploy/docker/postgres-kafka/05-repmgr-extension.sh:/docker-entrypoint-initdb.d/05-repmgr-extension.sh:ro"
       - "./deploy/docker/postgres-kafka/06-partman-repack-cron-extensions.sh:/docker-entrypoint-initdb.d/06-partman-repack-cron-extensions.sh:ro"
+      - "./deploy/docker/postgres-kafka/07-pg_hba-local-demo-postgres-trust.sh:/docker-entrypoint-initdb.d/07-pg_hba-local-demo-postgres-trust.sh:ro"
+      - "./deploy/docker/postgres-kafka/08-pg-profile-extension.sh:/docker-entrypoint-initdb.d/08-pg-profile-extension.sh:ro"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U demo -d demo -h 127.0.0.1 -p 5432"]
       interval: 5s
@@ -291,9 +297,12 @@ services:
     command:
       - |
         set -euo pipefail
-        echo "postgresql-extensions-ensure: CREATE EXTENSION IF NOT EXISTS (pg_cron on postgres, pg_repack/pg_partman on demo)"
+        echo "postgresql-extensions-ensure: CREATE EXTENSION IF NOT EXISTS (pg_cron/pg_profile on postgres, pg_repack/pg_partman on demo)"
         /opt/bitnami/postgresql/bin/psql -h "$$PGHOST" -p "$$PGPORT" -U "$$PGUSER" -d postgres -v ON_ERROR_STOP=1 \
-          -c "CREATE EXTENSION IF NOT EXISTS pg_cron;"
+          -c "CREATE EXTENSION IF NOT EXISTS pg_cron;" \
+          -c "CREATE EXTENSION IF NOT EXISTS dblink;" \
+          -c "CREATE SCHEMA IF NOT EXISTS profile;" \
+          -c "CREATE EXTENSION IF NOT EXISTS pg_profile SCHEMA profile;"
         /opt/bitnami/postgresql/bin/psql -h "$$PGHOST" -p "$$PGPORT" -U "$$PGUSER" -d demo -v ON_ERROR_STOP=1 \
           -c "CREATE EXTENSION IF NOT EXISTS pg_repack;" \
           -c "CREATE EXTENSION IF NOT EXISTS pg_partman;"
@@ -321,8 +330,11 @@ services:
         -c pg_stat_statements.max=10000
         -c pg_stat_statements.track=all
         -c cron.database_name=postgres
+        -c track_io_timing=on
+        -c track_functions=all
     volumes:
       - postgres_replica1_data:/bitnami/postgresql
+      - "./deploy/docker/postgres-kafka/98-mcac-cron-host.conf:/bitnami/postgresql/conf/conf.d/98-mcac-cron-host.conf:ro"
     depends_on:
       postgresql-primary:
         condition: service_healthy
@@ -356,8 +368,11 @@ services:
         -c pg_stat_statements.max=10000
         -c pg_stat_statements.track=all
         -c cron.database_name=postgres
+        -c track_io_timing=on
+        -c track_functions=all
     volumes:
       - postgres_replica2_data:/bitnami/postgresql
+      - "./deploy/docker/postgres-kafka/98-mcac-cron-host.conf:/bitnami/postgresql/conf/conf.d/98-mcac-cron-host.conf:ro"
     depends_on:
       postgresql-primary:
         condition: service_healthy
@@ -914,7 +929,8 @@ services:
       - DISABLE_INSTALL_DEMO_CONFIG=true
       # Dev: avoid flood-stage blocks when host disk is >95% full (breaks hub-demo-ui index create).
       - cluster.routing.allocation.disk.threshold_enabled=false
-      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m -XX:MaxDirectMemorySize=256m"
+      - "OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g -XX:MaxDirectMemorySize=512m"
+    mem_limit: 2560m
     ulimits:
       nofile:
         soft: 65536
@@ -976,6 +992,10 @@ services:
       - ./deploy/docker/realtime-orders-search-hub/demo-ui/postgres_logical_demo.py:/app/postgres_logical_demo.py:ro
       - ./deploy/docker/realtime-orders-search-hub/demo-ui/postgres_faker_schema.py:/app/postgres_faker_schema.py:ro
       - ./deploy/docker/realtime-orders-search-hub/demo-ui/postgres_schema_clone.py:/app/postgres_schema_clone.py:ro
+      - ./deploy/docker/realtime-orders-search-hub/demo-ui/cassandra_storage_lab.py:/app/cassandra_storage_lab.py:ro
+      - ./deploy/docker/realtime-orders-search-hub/demo-ui/cassandra_partition_lab.py:/app/cassandra_partition_lab.py:ro
+      - ./deploy/docker/realtime-orders-search-hub/demo-ui/cassandra_nodetool_lab.py:/app/cassandra_nodetool_lab.py:ro
+      - ./deploy/docker/realtime-orders-search-hub/demo-ui/cassandra_consistency_lab.py:/app/cassandra_consistency_lab.py:ro
     restart: unless-stopped
     ports:
       - "8888:8888"
@@ -1000,6 +1020,11 @@ services:
       CASSANDRA_WORKLOAD_REQUEST_TIMEOUT_SECONDS: "300"
       CASSANDRA_WORKLOAD_INTER_BATCH_SLEEP_MS: "25"
       CASSANDRA_WORKLOAD_WRITE_RETRIES: "3"
+      CASSANDRA_REQUEST_TIMEOUT_SECONDS: "120"
+      CASSANDRA_MAX_SCHEMA_AGREEMENT_WAIT_SECONDS: "120"
+      OPENSEARCH_BULK_MAX_BYTES: "25165824"
+      OPENSEARCH_WORKLOAD_INTER_BULK_SLEEP_MS: "50"
+      MSSQL_CONNECT_TIMEOUT_SECONDS: "120"
     networks:
       - demo_net
     depends_on:

@@ -21,7 +21,7 @@ flowchart TB
   UI --> T3
   UI --> T4
 
-  WSTORES["/scenario multi-store writes:<br/>Postgres scenario_* incl. customers · payments · shipments<br/>Mongo catalog + scenario_suppliers · MSSQL catalog mirror<br/>OpenSearch · Redis · Cassandra timeline + carrier_shipments"]
+  WSTORES["/scenario multi-store writes:<br/>Postgres scenario_* incl. customers · payments · shipments<br/>Mongo catalog + scenario_suppliers · MSSQL + Oracle catalog mirrors<br/>OpenSearch · Redis · Cassandra timeline + carrier_shipments"]
   UI --> WSTORES
 
   PGdem[(Postgres<br/>public.demo_items)]
@@ -49,6 +49,11 @@ flowchart TB
 
   MSpub[(MSSQL publisher<br/>dbo.scenario_catalog_mirror_mssql)]
   UI -.->|"step 2 MERGE"| MSpub
+
+  ORA[(Oracle FREEPDB1<br/>scenario_catalog_mirror_oracle)]
+  UI -.->|"step 2 MERGE"| ORA
+  ORA --> OREXP[oracle-exporter]
+  OREXP --> PROMO[Prometheus oracle_demo]
 
   subgraph SEC_MS["C3 — SQL Server CDC (Kafka Connect :8083)"]
     direction LR

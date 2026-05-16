@@ -39,12 +39,14 @@ spec:
             - name: VALUE_CONVERTER
               value: "org.apache.kafka.connect.json.JsonConverter"
             - name: KAFKA_HEAP_OPTS
-              value: "-Xms512m -Xmx8192m"
+              value: "-Xms512m -Xmx4096m"
           resources:
             requests:
-              memory: "1Gi"
+              memory: "128Mi"
+              cpu: "50m"
             limits:
-              memory: "10Gi"
+              memory: "8Gi"
+              cpu: "2"
           ports:
             - containerPort: 8083
               name: http

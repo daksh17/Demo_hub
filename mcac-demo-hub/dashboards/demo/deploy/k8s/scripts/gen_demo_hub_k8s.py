@@ -45,14 +45,123 @@ SK_HUB_POSTGRES_LOGICAL_SUB_DSN = "hub-postgres-logical-sub-dsn"
 SK_HUB_POSTGRES_LOGICAL_SUB_ADMIN_DSN = "hub-postgres-logical-sub-admin-dsn"
 SK_HUB_REDIS_URL = "hub-redis-url"
 SK_MSSQL_SA_PASSWORD = "mssql-sa-password"
+SK_ORACLE_PASSWORD = "oracle-sys-password"
+SK_ORACLE_DEMO_PASSWORD = "oracle-demo-password"
 MSSQL_SERVER_IMAGE = "mcr.microsoft.com/mssql/server:2022-CU14-ubuntu-22.04"
 MSSQL_TOOLS_IMAGE = "mcac-demo/mssql-tools:22.04"
+# Oracle 23c Free full-faststart (do not mount emptyDir on oradata).
+ORACLE_IMAGE = "gvenzl/oracle-free:23-full-faststart"
+ORACLE_EXPORTER_IMAGE = "ghcr.io/iamseth/oracledb_exporter:0.5.0"
+DEMO_TOOLS_IMAGE = "demo-hub/demo-tools:latest"
 # Vault: dev in-memory server (demo only — not HA, data lost on pod restart). See deploy/k8s/README.md.
 VAULT_IMAGE = "hashicorp/vault:1.15.6"
 VAULT_DEV_ROOT_TOKEN = "demo-hub-dev-root"
 # Cassandra data disk: use default StorageClass when set to "" (cluster must provide one).
 CASSANDRA_DATA_STORAGE_CLASS = ""
 CASSANDRA_DATA_STORAGE_SIZE = "10Gi"
+# Workload generator bulk indexing can spike heap; 512m OOMs under hub-workload load (demo only).
+OPENSEARCH_JAVA_OPTS = "-Xms1g -Xmx1g -XX:MaxDirectMemorySize=512m"
+OPENSEARCH_CONTAINER_RESOURCES = """          resources:
+            requests:
+              memory: "1536Mi"
+              cpu: "250m"
+            limits:
+              memory: "2560Mi"
+              cpu: "2"
+"""
+# OrbStack / small nodes (~18Gi): uncapped Mongo/Prometheus/Connect OOM each other at startup.
+MONGO_WIRED_TIGER_CACHE_GB = "0.25"
+# Keep requests low so ~18Gi nodes can schedule the full stack; limits cap burst OOM.
+MONGO_CONTAINER_RESOURCES = """          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "1280Mi"
+              cpu: "1"
+"""
+MONGO_MONGOS_RESOURCES = """          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "768Mi"
+              cpu: "500m"
+"""
+ZOOKEEPER_CONTAINER_RESOURCES = """          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+"""
+PROMETHEUS_CONTAINER_RESOURCES = """          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "1536Mi"
+              cpu: "1"
+"""
+GRAFANA_CONTAINER_RESOURCES = """          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "768Mi"
+              cpu: "500m"
+"""
+HUB_DEMO_UI_RESOURCES = """          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "1536Mi"
+              cpu: "2"
+"""
+STRESS_CONTAINER_RESOURCES = """          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "768Mi"
+              cpu: "1"
+"""
+OPENSEARCH_DASHBOARDS_RESOURCES = """          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "768Mi"
+              cpu: "500m"
+"""
+# Many Debezium plugins need ~6–8Gi during scan; keep requests tiny for scheduling on ~18Gi nodes.
+KAFKA_CONNECT_HEAP_OPTS = "-Xms512m -Xmx4096m"
+KAFKA_CONNECT_CONTAINER_RESOURCES = """          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "8Gi"
+              cpu: "2"
+"""
+ORACLE_CONTAINER_RESOURCES = """          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "6Gi"
+              cpu: "2"
+"""
+DEMO_TOOLS_CONTAINER_RESOURCES = """          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "1Gi"
+              cpu: "1"
+"""
 # Local-only image (not on Docker Hub). Tag is NOT :latest so the kubelet does not always try to pull.
 # Build: `docker build -t mcac-demo/mcac-init:local <repo-root>` (see deploy/k8s/scripts/build-mcac-init-image.sh).
 MCAC_INIT_IMAGE = "mcac-demo/mcac-init:local"
@@ -158,6 +267,7 @@ def batch_job(
     env_pairs: list[tuple[str, str]] | None = None,
     env_secret_refs: list[tuple[str, str, str]] | None = None,
     image_pull_policy: str = "IfNotPresent",
+    resources: str | None = None,
 ) -> str:
     cmd = "\n".join(f"            - {jdump(c)}" for c in command)
     deadline = ""
@@ -166,6 +276,7 @@ def batch_job(
     env_blk = ""
     if env_pairs or env_secret_refs:
         env_blk = env_lines(env_pairs or [], env_secret_refs)
+    res_blk = resources or ""
     return f"""apiVersion: batch/v1
 kind: Job
 metadata:
@@ -190,7 +301,7 @@ spec:
           imagePullPolicy: {image_pull_policy}
           command:
 {cmd}
-{env_blk}          volumeMounts:
+{env_blk}{res_blk}          volumeMounts:
             - name: scripts
               mountPath: {mount_path}
               readOnly: true
@@ -199,6 +310,16 @@ spec:
           configMap:
             name: {configmap_name}
             defaultMode: 0755
+"""
+
+
+MONGO_BOOTSTRAP_JOB_RESOURCES = """          resources:
+            requests:
+              memory: "768Mi"
+              cpu: "250m"
+            limits:
+              memory: "2Gi"
+              cpu: "2"
 """
 
 
@@ -293,6 +414,7 @@ def _hub_wait_upstream() -> str:
     cs0 = f"cassandra-0.cassandra-headless.{NS}.svc.cluster.local"
     rd = fqdn_service("redis")
     ms = fqdn_service("mssql-publisher")
+    ora = fqdn_service("oracle")
     tn = fqdn_service("trino")
     return f"""      initContainers:
         - name: wait-hub-deps
@@ -311,17 +433,18 @@ def _hub_wait_upstream() -> str:
                   && nc -z -w 3 {cs0} 9042 2>/dev/null \\
                   && nc -z -w 3 {rd} 6379 2>/dev/null \\
                   && nc -z -w 3 {ms} 1433 2>/dev/null \\
+                  && nc -z -w 3 {ora} 1521 2>/dev/null \\
                   && nc -z -w 3 {tn} 8080 2>/dev/null; then
                   echo "wait-hub-deps: all upstream TCP checks OK (attempt $i)" >&2
                   exit 0
                 fi
                 if [ $((i % 15)) -eq 0 ]; then
-                  echo "wait-hub-deps: attempt $i/200 — kafka:9092=$(p {kh} 9092) opensearch:9200=$(p {oh} 9200) postgres:5432=$(p {pg} 5432) postgres-sub:5432=$(p {pgsub} 5432) cassandra-0:9042=$(p {cs0} 9042) redis:6379=$(p {rd} 6379) mssql-publisher:1433=$(p {ms} 1433) trino:8080=$(p {tn} 8080) (hub skips mongos; Trino init waits mongos -> :8080)" >&2
+                  echo "wait-hub-deps: attempt $i/200 — kafka:9092=$(p {kh} 9092) opensearch:9200=$(p {oh} 9200) postgres:5432=$(p {pg} 5432) postgres-sub:5432=$(p {pgsub} 5432) cassandra-0:9042=$(p {cs0} 9042) redis:6379=$(p {rd} 6379) mssql-publisher:1433=$(p {ms} 1433) oracle:1521=$(p {ora} 1521) trino:8080=$(p {tn} 8080) (hub skips mongos)" >&2
                 fi
                 sleep 2
               done
               echo "timeout waiting for kafka:9092, opensearch:9200, postgresql-primary:5432, postgres-sub:5432," >&2
-              echo "  cassandra-0:9042 (headless), redis:6379, mssql-publisher:1433, trino:8080" >&2
+              echo "  cassandra-0:9042 (headless), redis:6379, mssql-publisher:1433, oracle:1521, trino:8080" >&2
               exit 1
 """
 
@@ -561,6 +684,8 @@ def deployment(
     readiness_probe: str | None = None,
     env_secret_refs: list[tuple[str, str, str]] | None = None,
     image_pull_policy: str = "IfNotPresent",
+    lifecycle_post_start_bash: str | None = None,
+    dshm_size: str | None = None,
 ) -> str:
     ml, pl = lbl(group, name, extra_labels)
     port_block = "\n".join(
@@ -580,19 +705,45 @@ def deployment(
         ev = env_lines(env, env_secret_refs)
     vol_mount = ""
     vol = ""
+    extra_mounts: list[str] = []
+    extra_vols: list[str] = []
     if data_mount:
-        vol_mount = f"""          volumeMounts:
-            - name: data
-              mountPath: {data_mount}
-"""
-        vol = """      volumes:
-        - name: data
-          emptyDir: {}
-"""
+        extra_mounts.append(
+            f"""            - name: data
+              mountPath: {data_mount}"""
+        )
+        extra_vols.append("""        - name: data
+          emptyDir: {}""")
+    if dshm_size:
+        extra_mounts.append(
+            """            - name: dshm
+              mountPath: /dev/shm"""
+        )
+        extra_vols.append(
+            f"""        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: {dshm_size}"""
+        )
+    vol_mount = ""
+    vol = ""
+    if extra_mounts:
+        vol_mount = "          volumeMounts:\n" + "\n".join(extra_mounts) + "\n"
+        vol = "      volumes:\n" + "\n".join(extra_vols) + "\n"
     res = resources or ""
     rprobe = readiness_probe or ""
     cname = name.replace("_", "-")
     init = init_before_containers or ""
+    life = ""
+    if lifecycle_post_start_bash:
+        life = f"""          lifecycle:
+            postStart:
+              exec:
+                command:
+                  - /bin/bash
+                  - -lc
+                  - {jdump(lifecycle_post_start_bash)}
+"""
     sec = ""
     if fs_group is not None:
         sec = f"""      securityContext:
@@ -624,7 +775,7 @@ spec:
         - name: {cname}
           image: {image}
           imagePullPolicy: {image_pull_policy}
-{cmd}{arg}{ev}{res}{vol_mount}          ports:
+{cmd}{arg}{ev}{res}{vol_mount}{life}          ports:
 {port_block}
 {rprobe}{vol}"""
     svc = f"""apiVersion: v1
@@ -658,6 +809,8 @@ def demo_hub_secret_stringdata() -> dict[str, str]:
         SK_HUB_POSTGRES_LOGICAL_SUB_ADMIN_DSN: "postgresql://postgres:postgres@postgres-sub:5432/postgres",
         SK_HUB_REDIS_URL: "redis://:demoredispass@redis:6379/0",
         SK_MSSQL_SA_PASSWORD: "Demo_hub_Mssql_2025!",
+        SK_ORACLE_PASSWORD: "Demo_hub_Oracle_2025!",
+        SK_ORACLE_DEMO_PASSWORD: "demopass",
     }
 
 
@@ -1252,12 +1405,12 @@ spec:
           imagePullPolicy: IfNotPresent
           env:
             - name: OPENSEARCH_JAVA_OPTS
-              value: "-Xms512m -Xmx512m -XX:MaxDirectMemorySize=256m"
+              value: "{OPENSEARCH_JAVA_OPTS}"
             - name: DISABLE_SECURITY_PLUGIN
               value: "true"
             - name: DISABLE_INSTALL_DEMO_CONFIG
               value: "true"
-          volumeMounts:
+{OPENSEARCH_CONTAINER_RESOURCES}          volumeMounts:
             - name: config
               mountPath: /usr/share/opensearch/config/opensearch.yml
               subPath: opensearch.yml
@@ -1304,7 +1457,9 @@ spec:
         [
             ("OPENSEARCH_HOSTS", '["http://opensearch:9200"]'),
             ("DISABLE_SECURITY_DASHBOARDS_PLUGIN", "true"),
+            ("NODE_OPTIONS", "--max-old-space-size=384"),
         ],
+        resources=OPENSEARCH_DASHBOARDS_RESOURCES,
     )
     exp = deployment(
         "opensearch-exporter",
@@ -1427,7 +1582,7 @@ spec:
           ports:
             - containerPort: 9090
               name: http
-      volumes:
+{PROMETHEUS_CONTAINER_RESOURCES}      volumes:
         - name: cfg
           configMap:
             name: prometheus-config
@@ -1568,7 +1723,7 @@ spec:
           ports:
             - containerPort: 3000
               name: http
-      volumes:
+{GRAFANA_CONTAINER_RESOURCES}      volumes:
         - name: grafana-ds
           configMap:
             name: grafana-datasources
@@ -1622,6 +1777,7 @@ def zookeeper_kafka() -> str:
         fs_group=1001,
         strategy_recreate=True,
         readiness_probe=tcp_readiness_probe(2181, initial_delay=15, period=5, failure_threshold=18),
+        resources=ZOOKEEPER_CONTAINER_RESOURCES,
     )
     # Single PLAINTEXT listener on 9092 (matches kafka-connect / hub-demo-ui / exporters).
     kafka_env = [
@@ -1664,7 +1820,7 @@ def zookeeper_kafka() -> str:
 
 
 def _postgres_ha_init_containers(archive_mode: str) -> str:
-    """repmgr check + conf.d snippet for WAL archive (archive_mode on | always)."""
+    """repmgr check + conf.d (cron, WAL) + pg_hba local trust for postgres@demo (demo only)."""
     img = POSTGRESQL_IMAGE
     return f"""      initContainers:
         - name: assert-repmgr-extension
@@ -1675,12 +1831,15 @@ def _postgres_ha_init_containers(archive_mode: str) -> str:
             - -c
             - |
               set -e
-              f=/opt/bitnami/postgresql/share/extension/repmgr.control
-              if [ ! -f "$f" ]; then
-                echo "Missing $f in image {img}." >&2
-                echo "Rebuild: docker build --no-cache -t {img} -f deploy/docker/postgres-kafka/Dockerfile.repmgr deploy/docker/postgres-kafka" >&2
-                exit 1
-              fi
+              for f in \\
+                /opt/bitnami/postgresql/share/extension/repmgr.control \\
+                /opt/bitnami/postgresql/share/extension/pg_profile.control; do
+                if [ ! -f "$f" ]; then
+                  echo "Missing $f in image {img}." >&2
+                  echo "Rebuild: docker build --no-cache -t {img} -f deploy/docker/postgres-kafka/Dockerfile.repmgr deploy/docker/postgres-kafka" >&2
+                  exit 1
+                fi
+              done
         - name: mcac-wal-archive-conf
           image: {img}
           imagePullPolicy: IfNotPresent
@@ -1694,9 +1853,24 @@ def _postgres_ha_init_containers(archive_mode: str) -> str:
               set -e
               conf_dir=/bitnami/postgresql/conf/conf.d
               mkdir -p "$conf_dir"
+              printf '%s\\n' "cron.host = ''" > "$conf_dir/98-mcac-cron-host.conf"
               printf '%s\\n' "archive_mode = ${{MCAC_ARCHIVE_MODE}}" \\
                 "archive_command = '/opt/bitnami/scripts/mcac-wal-archive.sh %p %f'" \\
                 > "$conf_dir/99-mcac-archive.conf"
+          volumeMounts:
+            - name: data
+              mountPath: /bitnami/postgresql
+        - name: mcac-pghba-local-demo
+          image: {img}
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              if [ -f /docker-entrypoint-initdb.d/07-pg_hba-local-demo-postgres-trust.sh ]; then
+                /docker-entrypoint-initdb.d/07-pg_hba-local-demo-postgres-trust.sh
+              fi
           volumeMounts:
             - name: data
               mountPath: /bitnami/postgresql
@@ -1704,6 +1878,17 @@ def _postgres_ha_init_containers(archive_mode: str) -> str:
 
 
 def postgres_ha() -> str:
+    # Bitnami finalizes pg_hba during the main entrypoint (after initContainers / sometimes after initdb.d).
+    # postStart retries prepend + reload until pg_ctl accepts.
+    pg_hba_poststart = (
+        "set +e; for i in $(seq 1 90); do "
+        "if [ -f /opt/bitnami/postgresql/conf/pg_hba.conf ] || [ -f /bitnami/postgresql/conf/pg_hba.conf ] "
+        "|| [ -f /bitnami/postgresql/data/pg_hba.conf ]; then "
+        "/docker-entrypoint-initdb.d/07-pg_hba-local-demo-postgres-trust.sh; "
+        "D=\"${PGDATA:-/bitnami/postgresql/data}\"; "
+        "if /opt/bitnami/postgresql/bin/pg_ctl -D \"$D\" reload -s 2>/dev/null; then exit 0; fi; "
+        "fi; sleep 1; done; exit 0"
+    )
     pg_secret = [
         ("POSTGRESQL_REPLICATION_PASSWORD", SECRET_NAME, SK_POSTGRESQL_REPLICATION_PASSWORD),
         ("POSTGRESQL_PASSWORD", SECRET_NAME, SK_POSTGRESQL_PASSWORD),
@@ -1718,7 +1903,8 @@ def postgres_ha() -> str:
             "POSTGRESQL_EXTRA_FLAGS",
             "-c wal_level=logical -c max_replication_slots=8 -c max_wal_senders=8 "
             "-c pg_stat_statements.max=10000 -c pg_stat_statements.track=all "
-            "-c cron.database_name=postgres",
+            "-c cron.database_name=postgres "
+            "-c track_io_timing=on -c track_functions=all",
         ),
     ]
     docs = [
@@ -1732,6 +1918,7 @@ def postgres_ha() -> str:
             data_mount="/bitnami/postgresql",
             env_secret_refs=pg_secret,
             init_before_containers=_postgres_ha_init_containers("on"),
+            lifecycle_post_start_bash=pg_hba_poststart,
         )
     ]
     rep_base = [
@@ -1747,7 +1934,8 @@ def postgres_ha() -> str:
                 "POSTGRESQL_EXTRA_FLAGS",
                 f"-c wal_level=replica -c primary_slot_name=pgdemo_phys_replica_{slot} "
                 f"-c pg_stat_statements.max=10000 -c pg_stat_statements.track=all "
-                f"-c cron.database_name=postgres",
+                f"-c cron.database_name=postgres "
+                f"-c track_io_timing=on -c track_functions=all",
             ),
         ]
         docs.append(
@@ -1761,6 +1949,7 @@ def postgres_ha() -> str:
                 data_mount="/bitnami/postgresql",
                 env_secret_refs=pg_secret,
                 init_before_containers=_postgres_ha_init_containers("always"),
+                lifecycle_post_start_bash=pg_hba_poststart,
             )
         )
     return join_docs(*docs)
@@ -1849,8 +2038,18 @@ def redis_stack() -> str:
     return join_docs(r, rx)
 
 
+def _mongo_mongod_cmd(*base: str) -> list[str]:
+    return [
+        *base,
+        "--wiredTigerCacheSizeGB",
+        MONGO_WIRED_TIGER_CACHE_GB,
+    ]
+
+
 def _mongo_config_deployments() -> str:
-    cfg_cmd = ["mongod", "--port", "27017", "--configsvr", "--replSet", "configReplSet", "--bind_ip_all"]
+    cfg_cmd = _mongo_mongod_cmd(
+        "mongod", "--port", "27017", "--configsvr", "--replSet", "configReplSet", "--bind_ip_all"
+    )
     docs: list[str] = []
     for i in (1, 2, 3):
         docs.append(
@@ -1864,6 +2063,7 @@ def _mongo_config_deployments() -> str:
                 command=cfg_cmd,
                 extra_labels={"demo-hub.io/mongo-role": "configsvr"},
                 data_mount="/data/db",
+                resources=MONGO_CONTAINER_RESOURCES,
             )
         )
     return join_docs(*docs)
@@ -1876,7 +2076,9 @@ def _mongo_shard_deployments() -> str:
         ("mongo-shard-tac", "tac"),
         ("mongo-shard-toe", "toe"),
     ):
-        cmd = ["mongod", "--port", "27017", "--shardsvr", "--replSet", rs, "--bind_ip_all"]
+        cmd = _mongo_mongod_cmd(
+            "mongod", "--port", "27017", "--shardsvr", "--replSet", rs, "--bind_ip_all"
+        )
         docs.append(
             deployment(
                 svc,
@@ -1888,6 +2090,7 @@ def _mongo_shard_deployments() -> str:
                 command=cmd,
                 extra_labels={"demo-hub.io/mongo-role": "shardsvr", "demo-hub.io/shard-rs": rs},
                 data_mount="/data/db",
+                resources=MONGO_CONTAINER_RESOURCES,
             )
         )
     return join_docs(*docs)
@@ -1907,6 +2110,7 @@ def _mongo_mongos_deployments() -> str:
                 [],
                 command=["mongos", "--configdb", cfg, "--bind_ip_all"],
                 extra_labels={"demo-hub.io/mongo-role": "mongos"},
+                resources=MONGO_MONGOS_RESOURCES,
             )
         )
     return join_docs(*docs)
@@ -1943,6 +2147,9 @@ if ! psql -h "$PGHOST" -U postgres -d postgres -v ON_ERROR_STOP=1 -tc "SELECT 1 
 fi
 psql -h "$PGHOST" -U postgres -d repmgr -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS repmgr;"
 psql -h "$PGHOST" -U postgres -d postgres -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS pg_cron;"
+psql -h "$PGHOST" -U postgres -d postgres -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS dblink;"
+psql -h "$PGHOST" -U postgres -d postgres -v ON_ERROR_STOP=1 -c "CREATE SCHEMA IF NOT EXISTS profile;"
+psql -h "$PGHOST" -U postgres -d postgres -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS pg_profile SCHEMA profile;"
 psql -h "$PGHOST" -U postgres -d demo -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS pg_repack;"
 psql -h "$PGHOST" -U postgres -d demo -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS pg_partman;"
 psql -h "$PGHOST" -U postgres -d demo -v ON_ERROR_STOP=1 -f /scripts/04-scenario-hub-schema-indexes.sql
@@ -2028,6 +2235,8 @@ def mongo_sharded_scripts_and_jobs() -> str:
         idx = "// empty\n"
     chain = """#!/usr/bin/env bash
 set -euo pipefail
+# mongosh runs on Node; cap heap so the Job is less likely to OOM on small clusters.
+export NODE_OPTIONS="${NODE_OPTIONS:--max-old-space-size=1024}"
 bash /scripts/init-config-replica-set.sh
 bash /scripts/init-shard-replica-sets.sh
 bash /scripts/add-shards.sh
@@ -2054,6 +2263,8 @@ echo "mongo sharded bootstrap done."
         ["bash", "/scripts/chain.sh"],
         "mongo-sharded-scripts",
         active_deadline_seconds=7200,
+        env_pairs=[("NODE_OPTIONS", "--max-old-space-size=1024")],
+        resources=MONGO_BOOTSTRAP_JOB_RESOURCES,
     )
     return join_docs(cm, job)
 
@@ -2075,6 +2286,138 @@ def _mssql_wait_server(svc_short: str) -> str:
               echo "timeout waiting for {host}:1433" >&2
               exit 1
 """
+
+
+def _oracle_wait_server() -> str:
+    host = fqdn_service("oracle")
+    return f"""      initContainers:
+        - name: wait-oracle
+          image: alpine:3.19
+          command:
+            - /bin/sh
+            - -c
+            - |
+              apk add --no-cache netcat-openbsd >/dev/null
+              for i in $(seq 1 180); do
+                if nc -z -w 2 {host} 1521 2>/dev/null; then exit 0; fi
+                sleep 3
+              done
+              echo "timeout waiting for {host}:1521" >&2
+              exit 1
+"""
+
+
+def oracle_exporter() -> str:
+    demo_pw = demo_hub_secret_stringdata()[SK_ORACLE_DEMO_PASSWORD]
+    dsn = f"oracle://demo:{demo_pw}@oracle:1521/FREEPDB1"
+    return deployment(
+        "oracle-exporter",
+        "oracle",
+        ORACLE_EXPORTER_IMAGE,
+        1,
+        [(9161, "metrics")],
+        [("DATA_SOURCE_NAME", dsn)],
+        init_before_containers=_oracle_wait_server(),
+        resources="""          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+""",
+        strategy_recreate=True,
+    )
+
+
+def oracle_scripts_and_bootstrap_job() -> str:
+    sql01 = read_repo("oracle/01-demo-schema.sql") or "-- missing 01-demo-schema.sql\n"
+    sql02 = read_repo("oracle/02-hub-scenario-schema.sql") or "-- missing 02-hub-scenario-schema.sql\n"
+    sql03 = read_repo("oracle/03-exporter-grants.sql") or "-- missing 03-exporter-grants.sql\n"
+    init_sh = read_repo("oracle/init-demo-schema.sh") or "#!/bin/bash\nexit 1\n"
+    cm = configmap(
+        "oracle-scripts",
+        "oracle",
+        {
+            "01-demo-schema.sql": sql01,
+            "02-hub-scenario-schema.sql": sql02,
+            "03-exporter-grants.sql": sql03,
+            "init-demo-schema.sh": init_sh,
+        },
+    )
+    job = batch_job(
+        "oracle-demo-bootstrap",
+        "oracle",
+        ORACLE_IMAGE,
+        ["bash", "/scripts/init-demo-schema.sh"],
+        "oracle-scripts",
+        env_pairs=[
+            ("ORACLE_HOST", "oracle"),
+            ("ORACLE_LISTEN_PORT", "1521"),
+            ("ORACLE_SERVICE", "FREEPDB1"),
+        ],
+        env_secret_refs=[
+            ("ORACLE_DEMO_PASSWORD", SECRET_NAME, SK_ORACLE_DEMO_PASSWORD),
+            ("ORACLE_SYS_PASSWORD", SECRET_NAME, SK_ORACLE_PASSWORD),
+        ],
+    )
+    return join_docs(cm, job)
+
+
+def oracle_server() -> str:
+    return deployment(
+        "oracle",
+        "oracle",
+        ORACLE_IMAGE,
+        1,
+        [(1521, "oracle")],
+        [
+            ("APP_USER", "demo"),
+            ("ORACLE_DISABLE_ASYNCH_IO", "true"),
+        ],
+        env_secret_refs=[
+            ("ORACLE_PASSWORD", SECRET_NAME, SK_ORACLE_PASSWORD),
+            ("APP_USER_PASSWORD", SECRET_NAME, SK_ORACLE_DEMO_PASSWORD),
+        ],
+        # faststart image: DB files live in the image — emptyDir on oradata breaks startup.
+        data_mount=None,
+        readiness_probe=tcp_readiness_probe(1521, initial_delay=300, period=20, failure_threshold=60),
+        resources=ORACLE_CONTAINER_RESOURCES,
+        strategy_recreate=True,
+        dshm_size="4Gi",
+    )
+
+
+def oracle_stack() -> str:
+    return join_docs(oracle_server(), oracle_exporter(), oracle_scripts_and_bootstrap_job())
+
+
+def demo_tools_stack() -> str:
+    """Long-running toolbox pod (psql, mongosh, cqlsh, redis-cli, curl, opensearch-cli, ora2pg)."""
+    hints = textwrap.dedent(
+        f"""\
+        # In-cluster endpoints for demo-hub (namespace {NS})
+        export DEMO_HUB_PG=postgresql://demo:demopass@postgresql-primary:5432/demo
+        export DEMO_HUB_REDIS=redis://:demoredispass@redis:6379/0
+        export DEMO_HUB_MONGO=mongodb://mongo-mongos1:27017/
+        export DEMO_HUB_CASSANDRA=cassandra-0.cassandra-headless.{NS}.svc.cluster.local
+        export DEMO_HUB_OPENSEARCH=http://opensearch:9200
+        export DEMO_HUB_ORACLE=demo/demopass@//oracle:1521/FREEPDB1
+        """
+    )
+    cm = configmap("demo-tools-hints", "toolbox", {"endpoints.sh": hints})
+    dep = deployment(
+        "demo-tools",
+        "toolbox",
+        DEMO_TOOLS_IMAGE,
+        1,
+        [(2222, "tools")],
+        [],
+        command=["sleep", "infinity"],
+        resources=DEMO_TOOLS_CONTAINER_RESOURCES,
+        image_pull_policy="Never",
+    )
+    return join_docs(cm, dep)
 
 
 def mssql_server(name: str) -> str:
@@ -2197,7 +2540,7 @@ def kafka_connect() -> str:
         ("STATUS_STORAGE_TOPIC", "pgdemo_connect_statuses"),
         ("KEY_CONVERTER", "org.apache.kafka.connect.json.JsonConverter"),
         ("VALUE_CONVERTER", "org.apache.kafka.connect.json.JsonConverter"),
-        ("KAFKA_HEAP_OPTS", "-Xms512m -Xmx8192m"),
+        ("KAFKA_HEAP_OPTS", KAFKA_CONNECT_HEAP_OPTS),
     ]
     return deployment(
         "kafka-connect",
@@ -2206,12 +2549,7 @@ def kafka_connect() -> str:
         1,
         [(8083, "http")],
         env,
-        resources="""          resources:
-            requests:
-              memory: "1Gi"
-            limits:
-              memory: "10Gi"
-""",
+        resources=KAFKA_CONNECT_CONTAINER_RESOURCES,
     )
 
 
@@ -2278,6 +2616,7 @@ def nodetool_stress() -> str:
         [(9500, "http")],
         [("TLP_STRESS_CASSANDRA_HOST", "cassandra")],
         args=["run", "KeyValue", "--rate", "30", "-d", "1d", "-r", ".8"],
+        resources=STRESS_CONTAINER_RESOURCES,
     )
     return join_docs(nt, st)
 
@@ -2300,10 +2639,20 @@ def hub_demo_ui() -> str:
             ("CASSANDRA_WORKLOAD_REQUEST_TIMEOUT_SECONDS", "300"),
             ("CASSANDRA_WORKLOAD_INTER_BATCH_SLEEP_MS", "25"),
             ("CASSANDRA_WORKLOAD_WRITE_RETRIES", "3"),
+            ("CASSANDRA_REQUEST_TIMEOUT_SECONDS", "120"),
+            ("CASSANDRA_MAX_SCHEMA_AGREEMENT_WAIT_SECONDS", "120"),
+            ("OPENSEARCH_BULK_MAX_BYTES", str(24 * 1024 * 1024)),
+            ("OPENSEARCH_WORKLOAD_INTER_BULK_SLEEP_MS", "50"),
+            ("MSSQL_CONNECT_TIMEOUT_SECONDS", "120"),
             ("MSSQL_HOST", "mssql-publisher"),
             ("MSSQL_USER", "sa"),
             ("MSSQL_DATABASE", "demo"),
             ("MSSQL_ENCRYPT", "off"),
+            ("ORACLE_HOST", "oracle"),
+            ("ORACLE_LISTEN_PORT", "1521"),
+            ("ORACLE_USER", "demo"),
+            ("ORACLE_SERVICE", "FREEPDB1"),
+            ("ORACLE_CONNECT_TIMEOUT_SECONDS", "120"),
             ("TRINO_HTTP", "http://trino:8080"),
         ],
         init_before_containers=_hub_wait_upstream(),
@@ -2316,8 +2665,10 @@ def hub_demo_ui() -> str:
             ("POSTGRES_LOGICAL_SUB_ADMIN_DSN", SECRET_NAME, SK_HUB_POSTGRES_LOGICAL_SUB_ADMIN_DSN),
             ("REDIS_URL", SECRET_NAME, SK_HUB_REDIS_URL),
             ("MSSQL_SA_PASSWORD", SECRET_NAME, SK_MSSQL_SA_PASSWORD),
+            ("ORACLE_PASSWORD", SECRET_NAME, SK_ORACLE_DEMO_PASSWORD),
         ],
         image_pull_policy="Never",
+        resources=HUB_DEMO_UI_RESOURCES,
     )
 
 
@@ -2334,8 +2685,11 @@ Generated Jobs (apply **after** workloads are running):
 | **cassandra-demo-schema** | `demo_hub` keyspace with **RF=3** + placeholder table (ring replication). |
 | **mongo-demo-bootstrap** | Config RS → shard RS → addShard → sharded collections (mirrors `mongo-sharded/*.sh` + `prepare-demo-collections.sh`). |
 | **mssql-demo-bootstrap** | Publisher + subscriber schema (`sqlcmd`), optional replication try, then **register-mssql-connectors.sh** against **kafka-connect:8083** (needs Connect rollout first — see `apply-data-bootstrap.sh`). |
+| **oracle-demo-bootstrap** | Demo schema on **oracle** (`gvenzl/oracle-free`, PDB `FREEPDB1`, user `demo`) — tables, packages, procedures, functions, triggers, views, MVs. |
 
 Re-run: `kubectl delete job -n {NS} <name>` then `kubectl apply -f …` again.
+
+**demo-tools** Deployment: client toolbox pod (`demo-hub/demo-tools:latest`, build `build-demo-tools-image.sh`). `kubectl exec -it deploy/demo-tools -- bash -l`.
 
 Not generated here: **postgres/mongo kafka-connect-register** beyond MSSQL (use host scripts against `kafka-connect:8083` if needed). MCAC agent JAR is populated by StatefulSet **initContainer** (`mcac-copy-agent`); build **`mcac-demo/mcac-init:local`** from the repo-root **Dockerfile** (`deploy/k8s/scripts/build-mcac-init-image.sh`).
 
@@ -2366,6 +2720,8 @@ def main() -> None:
         ("60-mongo-sharded.yaml", mongo_sharded_all_deployments()),
         ("61-mongo-bootstrap-job.yaml", mongo_sharded_scripts_and_jobs()),
         ("62-mssql.yaml", mssql_stack()),
+        ("63-oracle.yaml", oracle_stack()),
+        ("64-demo-tools.yaml", demo_tools_stack()),
         ("70-kafka-connect.yaml", kafka_connect()),
         ("80-exporters.yaml", exporters()),
         ("90-opensearch.yaml", opensearch_stack()),

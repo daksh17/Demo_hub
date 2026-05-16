@@ -38,17 +38,18 @@ spec:
                   && nc -z -w 3 cassandra-0.cassandra-headless.demo-hub.svc.cluster.local 9042 2>/dev/null \
                   && nc -z -w 3 redis.demo-hub.svc.cluster.local 6379 2>/dev/null \
                   && nc -z -w 3 mssql-publisher.demo-hub.svc.cluster.local 1433 2>/dev/null \
+                  && nc -z -w 3 oracle.demo-hub.svc.cluster.local 1521 2>/dev/null \
                   && nc -z -w 3 trino.demo-hub.svc.cluster.local 8080 2>/dev/null; then
                   echo "wait-hub-deps: all upstream TCP checks OK (attempt $i)" >&2
                   exit 0
                 fi
                 if [ $((i % 15)) -eq 0 ]; then
-                  echo "wait-hub-deps: attempt $i/200 — kafka:9092=$(p kafka.demo-hub.svc.cluster.local 9092) opensearch:9200=$(p opensearch.demo-hub.svc.cluster.local 9200) postgres:5432=$(p postgresql-primary.demo-hub.svc.cluster.local 5432) postgres-sub:5432=$(p postgres-sub.demo-hub.svc.cluster.local 5432) cassandra-0:9042=$(p cassandra-0.cassandra-headless.demo-hub.svc.cluster.local 9042) redis:6379=$(p redis.demo-hub.svc.cluster.local 6379) mssql-publisher:1433=$(p mssql-publisher.demo-hub.svc.cluster.local 1433) trino:8080=$(p trino.demo-hub.svc.cluster.local 8080) (hub skips mongos; Trino init waits mongos -> :8080)" >&2
+                  echo "wait-hub-deps: attempt $i/200 — kafka:9092=$(p kafka.demo-hub.svc.cluster.local 9092) opensearch:9200=$(p opensearch.demo-hub.svc.cluster.local 9200) postgres:5432=$(p postgresql-primary.demo-hub.svc.cluster.local 5432) postgres-sub:5432=$(p postgres-sub.demo-hub.svc.cluster.local 5432) cassandra-0:9042=$(p cassandra-0.cassandra-headless.demo-hub.svc.cluster.local 9042) redis:6379=$(p redis.demo-hub.svc.cluster.local 6379) mssql-publisher:1433=$(p mssql-publisher.demo-hub.svc.cluster.local 1433) oracle:1521=$(p oracle.demo-hub.svc.cluster.local 1521) trino:8080=$(p trino.demo-hub.svc.cluster.local 8080) (hub skips mongos)" >&2
                 fi
                 sleep 2
               done
               echo "timeout waiting for kafka:9092, opensearch:9200, postgresql-primary:5432, postgres-sub:5432," >&2
-              echo "  cassandra-0:9042 (headless), redis:6379, mssql-publisher:1433, trino:8080" >&2
+              echo "  cassandra-0:9042 (headless), redis:6379, mssql-publisher:1433, oracle:1521, trino:8080" >&2
               exit 1
       containers:
         - name: hub-demo-ui
@@ -75,6 +76,16 @@ spec:
               value: "25"
             - name: CASSANDRA_WORKLOAD_WRITE_RETRIES
               value: "3"
+            - name: CASSANDRA_REQUEST_TIMEOUT_SECONDS
+              value: "120"
+            - name: CASSANDRA_MAX_SCHEMA_AGREEMENT_WAIT_SECONDS
+              value: "120"
+            - name: OPENSEARCH_BULK_MAX_BYTES
+              value: "25165824"
+            - name: OPENSEARCH_WORKLOAD_INTER_BULK_SLEEP_MS
+              value: "50"
+            - name: MSSQL_CONNECT_TIMEOUT_SECONDS
+              value: "120"
             - name: MSSQL_HOST
               value: "mssql-publisher"
             - name: MSSQL_USER
@@ -83,6 +94,16 @@ spec:
               value: "demo"
             - name: MSSQL_ENCRYPT
               value: "off"
+            - name: ORACLE_HOST
+              value: "oracle"
+            - name: ORACLE_LISTEN_PORT
+              value: "1521"
+            - name: ORACLE_USER
+              value: "demo"
+            - name: ORACLE_SERVICE
+              value: "FREEPDB1"
+            - name: ORACLE_CONNECT_TIMEOUT_SECONDS
+              value: "120"
             - name: TRINO_HTTP
               value: "http://trino:8080"
             - name: POSTGRES_DSN
@@ -120,6 +141,18 @@ spec:
                 secretKeyRef:
                   name: demo-hub-credentials
                   key: mssql-sa-password
+            - name: ORACLE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: oracle-demo-password
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "1536Mi"
+              cpu: "2"
           ports:
             - containerPort: 8888
               name: http

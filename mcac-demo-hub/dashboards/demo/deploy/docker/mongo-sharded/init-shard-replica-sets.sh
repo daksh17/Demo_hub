@@ -26,15 +26,31 @@ for spec in "tic:mongo-shard-tic" "tac:mongo-shard-tac" "toe:mongo-shard-toe"; d
   mongosh "mongodb://${host}:27017" --quiet --eval '
 const rsName = "'"${rsname}"'";
 const h = "'"${host}:27017"'";
-const ok = (() => {
+const hasPrimary = (() => {
   try {
-    return rs.status().ok === 1;
+    const s = rs.status();
+    return s.ok === 1 && s.members.some((m) => m.stateStr === "PRIMARY");
   } catch (e) {
     return false;
   }
 })();
-if (!ok) {
-  rs.initiate({ _id: rsName, members: [{ _id: 0, host: h }] });
+if (!hasPrimary) {
+  let initiated = false;
+  try {
+    rs.initiate({ _id: rsName, members: [{ _id: 0, host: h }] });
+    initiated = true;
+  } catch (e) {
+    if (!String(e).includes("already initialized")) throw e;
+  }
+  if (!initiated) {
+  // Pod restart with stale local metadata: config exists but node is not PRIMARY (mongos code 133).
+    const cfg = db.adminCommand({ replSetGetConfig: 1 }).config;
+    if (cfg && cfg.members && cfg.members.length) {
+      cfg.version = (cfg.version || 1) + 1;
+      cfg.members[0].host = h;
+      db.adminCommand({ replSetReconfig: cfg, force: true });
+    }
+  }
 }
 '
   echo "waiting for PRIMARY on ${rsname}..."

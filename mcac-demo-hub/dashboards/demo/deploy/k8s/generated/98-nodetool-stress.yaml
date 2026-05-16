@@ -89,6 +89,13 @@ spec:
           env:
             - name: TLP_STRESS_CASSANDRA_HOST
               value: "cassandra"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "768Mi"
+              cpu: "1"
           ports:
             - containerPort: 9500
               name: http

@@ -35,5 +35,9 @@ spec:
           value: "25"
         - name: CASSANDRA_WORKLOAD_WRITE_RETRIES
           value: "3"
+        - name: CASSANDRA_REQUEST_TIMEOUT_SECONDS
+          value: "120"
+        - name: CASSANDRA_MAX_SCHEMA_AGREEMENT_WAIT_SECONDS
+          value: "120"
       ports:
         - containerPort: 8888

@@ -37,9 +37,17 @@ docker build "${CACHE_FLAG[@]}" -t "$HUB_DEMO_UI_IMAGE" -f "$UI/Dockerfile" "$UI
 echo "=== kubectl rollout restart deployment/hub-demo-ui -n $NS ==="
 kubectl rollout restart deployment/hub-demo-ui -n "$NS"
 kubectl rollout status deployment/hub-demo-ui -n "$NS" --timeout="$ROLLOUT_TIMEOUT"
-echo "Done. Open /postgres/logical — Refresh status should show setup_revision from postgres_logical_demo.py; click Run setup once if you changed grants."
+
 echo ""
-echo "Kafka UI sanity check (parallel panels marker — expect count ≥ 1):"
-echo "  kubectl exec -n $NS deploy/hub-demo-ui -- grep -c kafkaParallelWrap /app/app.py || true"
-echo "kind/minikube: if nodes don't see your local image: kind load docker-image $HUB_DEMO_UI_IMAGE"
+echo "=== Hub image sanity (in-cluster) ==="
+kubectl exec -n "$NS" deploy/hub-demo-ui -- grep -c 'consistency-lab/diagnostics' /app/app.py || true
+kubectl exec -n "$NS" deploy/hub-demo-ui -- python3 -c "import cassandra_consistency_lab as m; print('LAB_VERSION', m.LAB_VERSION)" || true
+
+echo ""
+echo "Done. K8s hub is NOT on localhost until you port-forward it."
+echo "  ./deploy/k8s/scripts/port-forward-demo-hub.sh   # hub UI default LOCAL_HUB_UI_PORT=16888 (Compose uses 8888)"
+echo "  open http://127.0.0.1:16888/"
+echo "  curl -s http://127.0.0.1:8889/api/cassandra/consistency-lab/diagnostics | jq ."
+echo ""
+echo "Compose-only (volume-mounted app.py): docker compose restart hub-demo-ui"
 echo "Stale layers: NO_CACHE=1 ./deploy/k8s/scripts/redeploy-hub-demo-ui.sh"

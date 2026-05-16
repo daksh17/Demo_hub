@@ -1,0 +1,517 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oracle
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/name: oracle
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: oracle
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: oracle
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: oracle
+        app.kubernetes.io/part-of: demo-hub
+        demo-hub.io/group: oracle
+    spec:
+      containers:
+        - name: oracle
+          image: gvenzl/oracle-free:23-full-faststart
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: APP_USER
+              value: "demo"
+            - name: ORACLE_DISABLE_ASYNCH_IO
+              value: "true"
+            - name: ORACLE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: oracle-sys-password
+            - name: APP_USER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: oracle-demo-password
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "6Gi"
+              cpu: "2"
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+          ports:
+            - containerPort: 1521
+              name: oracle
+          readinessProbe:
+            tcpSocket:
+              port: 1521
+            initialDelaySeconds: 300
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 60
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 4Gi
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: oracle
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/name: oracle
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: oracle
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: oracle
+  ports:
+    - port: 1521
+      targetPort: 1521
+      name: oracle
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oracle-exporter
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/name: oracle-exporter
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: oracle
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: oracle-exporter
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: oracle-exporter
+        app.kubernetes.io/part-of: demo-hub
+        demo-hub.io/group: oracle
+    spec:
+      initContainers:
+        - name: wait-oracle
+          image: alpine:3.19
+          command:
+            - /bin/sh
+            - -c
+            - |
+              apk add --no-cache netcat-openbsd >/dev/null
+              for i in $(seq 1 180); do
+                if nc -z -w 2 oracle.demo-hub.svc.cluster.local 1521 2>/dev/null; then exit 0; fi
+                sleep 3
+              done
+              echo "timeout waiting for oracle.demo-hub.svc.cluster.local:1521" >&2
+              exit 1
+      containers:
+        - name: oracle-exporter
+          image: ghcr.io/iamseth/oracledb_exporter:0.5.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: DATA_SOURCE_NAME
+              value: "oracle://demo:demopass@oracle:1521/FREEPDB1"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          ports:
+            - containerPort: 9161
+              name: metrics
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: oracle-exporter
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/name: oracle-exporter
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: oracle
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: oracle-exporter
+  ports:
+    - port: 9161
+      targetPort: 9161
+      name: metrics
+---
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: oracle-scripts
+  namespace: demo-hub
+  labels:
+    demo-hub.io/group: oracle
+    app.kubernetes.io/part-of: demo-hub
+data:
+  01-demo-schema.sql: |
+    -- Demo hub Oracle schema (FREEPDB1 / user DEMO): tables, PL/SQL, triggers, views, MVs.
+    WHENEVER SQLERROR EXIT SQL.SQLCODE
+    
+    BEGIN
+      EXECUTE IMMEDIATE 'DROP MATERIALIZED VIEW hub_demo_mv_summary';
+    EXCEPTION
+      WHEN OTHERS THEN
+        IF SQLCODE != -12003 THEN RAISE; END IF;
+    END;
+    /
+    
+    BEGIN
+      EXECUTE IMMEDIATE 'DROP VIEW hub_demo_items_v';
+    EXCEPTION
+      WHEN OTHERS THEN
+        IF SQLCODE != -942 THEN RAISE; END IF;
+    END;
+    /
+    
+    BEGIN
+      EXECUTE IMMEDIATE 'DROP TRIGGER hub_demo_items_bu';
+    EXCEPTION
+      WHEN OTHERS THEN
+        IF SQLCODE != -4080 THEN RAISE; END IF;
+    END;
+    /
+    
+    BEGIN
+      EXECUTE IMMEDIATE 'DROP TABLE hub_demo_items CASCADE CONSTRAINTS PURGE';
+    EXCEPTION
+      WHEN OTHERS THEN
+        IF SQLCODE != -942 THEN RAISE; END IF;
+    END;
+    /
+    
+    BEGIN
+      EXECUTE IMMEDIATE 'DROP SEQUENCE hub_demo_seq';
+    EXCEPTION
+      WHEN OTHERS THEN
+        IF SQLCODE != -2289 THEN RAISE; END IF;
+    END;
+    /
+    
+    BEGIN
+      EXECUTE IMMEDIATE 'DROP TYPE hub_item_tab';
+    EXCEPTION
+      WHEN OTHERS THEN
+        IF SQLCODE != -4043 THEN RAISE; END IF;
+    END;
+    /
+    
+    BEGIN
+      EXECUTE IMMEDIATE 'DROP TYPE hub_item_rec FORCE';
+    EXCEPTION
+      WHEN OTHERS THEN
+        IF SQLCODE != -4043 THEN RAISE; END IF;
+    END;
+    /
+    
+    CREATE TABLE hub_demo_items (
+      id NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+      sku VARCHAR2(128) NOT NULL,
+      title VARCHAR2(512) NOT NULL,
+      category VARCHAR2(256),
+      unit_price_cents NUMBER(12) DEFAULT 0 NOT NULL,
+      stock_units NUMBER(12) DEFAULT 0 NOT NULL,
+      updated_at TIMESTAMP(6) DEFAULT SYSTIMESTAMP NOT NULL,
+      CONSTRAINT hub_demo_items_sku_uk UNIQUE (sku)
+    );
+    
+    CREATE SEQUENCE hub_demo_seq START WITH 1000 INCREMENT BY 1 NOCACHE;
+    
+    CREATE OR REPLACE TYPE hub_item_rec AS OBJECT (
+      sku VARCHAR2(128),
+      title VARCHAR2(512),
+      price_cents NUMBER
+    );
+    /
+    
+    CREATE OR REPLACE TYPE hub_item_tab AS TABLE OF hub_item_rec;
+    /
+    
+    CREATE OR REPLACE PACKAGE hub_demo_pkg AS
+      FUNCTION next_sku_prefix RETURN VARCHAR2;
+      PROCEDURE bump_updated(p_id IN NUMBER);
+      FUNCTION catalog_count RETURN NUMBER;
+    END hub_demo_pkg;
+    /
+    
+    CREATE OR REPLACE PACKAGE BODY hub_demo_pkg AS
+      FUNCTION next_sku_prefix RETURN VARCHAR2 IS
+      BEGIN
+        RETURN 'SKU-' || hub_demo_seq.NEXTVAL;
+      END next_sku_prefix;
+    
+      PROCEDURE bump_updated(p_id IN NUMBER) IS
+      BEGIN
+        UPDATE hub_demo_items SET updated_at = SYSTIMESTAMP WHERE id = p_id;
+      END bump_updated;
+    
+      FUNCTION catalog_count RETURN NUMBER IS
+        c NUMBER;
+      BEGIN
+        SELECT COUNT(*) INTO c FROM hub_demo_items;
+        RETURN c;
+      END catalog_count;
+    END hub_demo_pkg;
+    /
+    
+    CREATE OR REPLACE FUNCTION hub_demo_price_dollars(p_cents IN NUMBER) RETURN NUMBER DETERMINISTIC IS
+    BEGIN
+      RETURN ROUND(p_cents / 100, 2);
+    END hub_demo_price_dollars;
+    /
+    
+    CREATE OR REPLACE PROCEDURE hub_demo_upsert_item(
+      p_sku IN VARCHAR2,
+      p_title IN VARCHAR2,
+      p_cents IN NUMBER,
+      p_category IN VARCHAR2 DEFAULT NULL
+    ) IS
+    BEGIN
+      MERGE INTO hub_demo_items t
+      USING (
+        SELECT p_sku sku, p_title title, p_cents cents, p_category category FROM dual
+      ) s
+      ON (t.sku = s.sku)
+      WHEN MATCHED THEN
+        UPDATE SET
+          title = s.title,
+          unit_price_cents = s.cents,
+          category = NVL(s.category, t.category),
+          updated_at = SYSTIMESTAMP
+      WHEN NOT MATCHED THEN
+        INSERT (sku, title, unit_price_cents, category)
+        VALUES (s.sku, s.title, s.cents, s.category);
+    END hub_demo_upsert_item;
+    /
+    
+    CREATE OR REPLACE TRIGGER hub_demo_items_bu
+    BEFORE UPDATE ON hub_demo_items
+    FOR EACH ROW
+    BEGIN
+      :NEW.updated_at := SYSTIMESTAMP;
+    END;
+    /
+    
+    CREATE OR REPLACE VIEW hub_demo_items_v AS
+    SELECT
+      id,
+      sku,
+      title,
+      category,
+      hub_demo_price_dollars(unit_price_cents) AS price_dollars,
+      stock_units,
+      updated_at
+    FROM hub_demo_items;
+    
+    CREATE MATERIALIZED VIEW hub_demo_mv_summary
+    BUILD IMMEDIATE
+    REFRESH ON DEMAND
+    AS
+    SELECT
+      COUNT(*) AS item_count,
+      NVL(SUM(unit_price_cents), 0) AS total_cents,
+      MAX(updated_at) AS last_updated
+    FROM hub_demo_items;
+    
+    BEGIN
+      hub_demo_upsert_item('ORA-DEMO-001', 'Oracle demo widget', 1999, 'gadgets');
+      hub_demo_upsert_item('ORA-DEMO-002', 'Oracle demo gadget', 2999, 'gadgets');
+    END;
+    /
+    
+    COMMIT;
+    
+    SELECT 'oracle demo schema ready' AS status FROM dual;
+    SELECT object_type, COUNT(*) AS cnt
+    FROM user_objects
+    WHERE object_name LIKE 'HUB_DEMO%' OR object_name LIKE 'HUB_ITEM%'
+    GROUP BY object_type
+    ORDER BY object_type;
+
+  02-hub-scenario-schema.sql: |
+    -- Hub scenario mirror + workload tables (user DEMO).
+    WHENEVER SQLERROR EXIT SQL.SQLCODE
+    
+    BEGIN
+      EXECUTE IMMEDIATE 'DROP TABLE hub_workload_oracle';
+    EXCEPTION
+      WHEN OTHERS THEN
+        IF SQLCODE != -942 THEN RAISE; END IF;
+    END;
+    /
+    
+    BEGIN
+      EXECUTE IMMEDIATE 'DROP TABLE scenario_catalog_mirror_oracle';
+    EXCEPTION
+      WHEN OTHERS THEN
+        IF SQLCODE != -942 THEN RAISE; END IF;
+    END;
+    /
+    
+    CREATE TABLE scenario_catalog_mirror_oracle (
+      id NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+      sku VARCHAR2(128) NOT NULL,
+      title VARCHAR2(512) NOT NULL,
+      category VARCHAR2(256),
+      unit_price_cents NUMBER(12) DEFAULT 0 NOT NULL,
+      stock_units NUMBER(12) DEFAULT 0 NOT NULL,
+      source_mongo_id VARCHAR2(96),
+      kafka_msg_key VARCHAR2(160),
+      updated_at TIMESTAMP(6) DEFAULT SYSTIMESTAMP NOT NULL,
+      CONSTRAINT scenario_catalog_mirror_ora_uk UNIQUE (sku)
+    );
+    
+    CREATE TABLE hub_workload_oracle (
+      id NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+      run_id VARCHAR2(32) NOT NULL,
+      seq NUMBER NOT NULL,
+      name VARCHAR2(4000) NOT NULL,
+      created_at TIMESTAMP(6) DEFAULT SYSTIMESTAMP NOT NULL,
+      CONSTRAINT hub_workload_oracle_run_seq_uk UNIQUE (run_id, seq)
+    );
+    
+    CREATE INDEX hub_workload_oracle_run_id_ix ON hub_workload_oracle (run_id);
+    
+    COMMIT;
+
+  03-exporter-grants.sql: |
+    -- Privileges for iamseth/oracledb_exporter (demo user). Run as SYS (see init-demo-schema.sh).
+    WHENEVER SQLERROR EXIT SQL.SQLCODE
+    
+    BEGIN
+      EXECUTE IMMEDIATE 'GRANT SELECT_CATALOG_ROLE TO demo';
+    EXCEPTION
+      WHEN OTHERS THEN
+        -- Role missing on some editions (-1924), or already granted (-1917).
+        IF SQLCODE NOT IN (-1917, -1924) THEN RAISE; END IF;
+    END;
+    /
+    
+    BEGIN
+      EXECUTE IMMEDIATE 'GRANT CREATE SESSION TO demo';
+    EXCEPTION
+      WHEN OTHERS THEN
+        IF SQLCODE NOT IN (-1917, -1924) THEN RAISE; END IF;
+    END;
+    /
+    
+    COMMIT;
+
+  init-demo-schema.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+    DEMO_PW="${ORACLE_DEMO_PASSWORD:?missing ORACLE_DEMO_PASSWORD}"
+    SYS_PW="${ORACLE_SYS_PASSWORD:-}"
+    SVC="${ORACLE_HOST:-oracle}"
+    # Do not use ORACLE_PORT: Kubernetes injects ORACLE_PORT=tcp://<ip>:1521 for Service "oracle".
+    PORT="${ORACLE_LISTEN_PORT:-1521}"
+    SERVICE="${ORACLE_SERVICE:-FREEPDB1}"
+    DEMO_CSTR="demo/${DEMO_PW}@//${SVC}:${PORT}/${SERVICE}"
+    
+    echo "Waiting for Oracle PDB ${SERVICE} at ${SVC}:${PORT} (user demo)..."
+    for i in $(seq 1 180); do
+      if echo "SELECT 1 FROM DUAL;" | sqlplus -s -L "$DEMO_CSTR" 2>/dev/null | grep -qE '^[[:space:]]*1'; then
+        echo "Oracle reachable (attempt $i)"
+        break
+      fi
+      sleep 5
+      if [[ "$i" -eq 180 ]]; then
+        echo "timeout waiting for ${DEMO_CSTR}" >&2
+        exit 1
+      fi
+    done
+    
+    for script in /scripts/01-demo-schema.sql /scripts/02-hub-scenario-schema.sql; do
+      echo "Applying $(basename "$script") as demo..." >&2
+      sqlplus -s -L "$DEMO_CSTR" @"$script"
+    done
+    
+    if [[ -n "$SYS_PW" ]]; then
+      SYS_CSTR="sys/${SYS_PW}@//${SVC}:${PORT}/${SERVICE} as sysdba"
+      echo "Applying 03-exporter-grants.sql as SYS..." >&2
+      sqlplus -s -L "$SYS_CSTR" @/scripts/03-exporter-grants.sql
+    else
+      echo "ORACLE_SYS_PASSWORD unset; skipping 03-exporter-grants.sql (exporter may show limited metrics)." >&2
+    fi
+    
+    echo "oracle-demo-bootstrap done."
+---
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: oracle-demo-bootstrap
+  namespace: demo-hub
+  labels:
+    demo-hub.io/group: oracle
+    app.kubernetes.io/part-of: demo-hub
+spec:
+  activeDeadlineSeconds: 7200
+  ttlSecondsAfterFinished: 86400
+  backoffLimit: 4
+  template:
+    metadata:
+      labels:
+        demo-hub.io/group: oracle
+        app.kubernetes.io/part-of: demo-hub
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: run
+          image: gvenzl/oracle-free:23-full-faststart
+          imagePullPolicy: IfNotPresent
+          command:
+            - "bash"
+            - "/scripts/init-demo-schema.sh"
+          env:
+            - name: ORACLE_HOST
+              value: "oracle"
+            - name: ORACLE_LISTEN_PORT
+              value: "1521"
+            - name: ORACLE_SERVICE
+              value: "FREEPDB1"
+            - name: ORACLE_DEMO_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: oracle-demo-password
+            - name: ORACLE_SYS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: oracle-sys-password
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+      volumes:
+        - name: scripts
+          configMap:
+            name: oracle-scripts
+            defaultMode: 0755

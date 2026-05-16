@@ -1,0 +1,13 @@
+%% Oracle hub scenario path (K8s demo-hub — not Kafka Connect)
+flowchart TD
+  H[hub-demo-ui step 2 or workload target oracle]
+  M[(Mongo scenario_products)]
+  O[(Oracle FREEPDB1<br/>scenario_catalog_mirror_oracle<br/>hub_workload_oracle)]
+  EXP[oracle-exporter :9161]
+  PROM[Prometheus job oracle_demo]
+  GF[Grafana Oracle demo hub]
+
+  M -->|MERGE up to 80 SKUs| H
+  H -->|oracledb| O
+  H -->|workload batches| O
+  O --> EXP --> PROM --> GF

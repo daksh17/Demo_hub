@@ -33,6 +33,15 @@ spec:
             - "--replSet"
             - "configReplSet"
             - "--bind_ip_all"
+            - "--wiredTigerCacheSizeGB"
+            - "0.25"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "1280Mi"
+              cpu: "1"
           volumeMounts:
             - name: data
               mountPath: /data/db
@@ -99,6 +108,15 @@ spec:
             - "--replSet"
             - "configReplSet"
             - "--bind_ip_all"
+            - "--wiredTigerCacheSizeGB"
+            - "0.25"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "1280Mi"
+              cpu: "1"
           volumeMounts:
             - name: data
               mountPath: /data/db
@@ -165,6 +183,15 @@ spec:
             - "--replSet"
             - "configReplSet"
             - "--bind_ip_all"
+            - "--wiredTigerCacheSizeGB"
+            - "0.25"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "1280Mi"
+              cpu: "1"
           volumeMounts:
             - name: data
               mountPath: /data/db
@@ -233,6 +260,15 @@ spec:
             - "--replSet"
             - "tic"
             - "--bind_ip_all"
+            - "--wiredTigerCacheSizeGB"
+            - "0.25"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "1280Mi"
+              cpu: "1"
           volumeMounts:
             - name: data
               mountPath: /data/db
@@ -302,6 +338,15 @@ spec:
             - "--replSet"
             - "tac"
             - "--bind_ip_all"
+            - "--wiredTigerCacheSizeGB"
+            - "0.25"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "1280Mi"
+              cpu: "1"
           volumeMounts:
             - name: data
               mountPath: /data/db
@@ -371,6 +416,15 @@ spec:
             - "--replSet"
             - "toe"
             - "--bind_ip_all"
+            - "--wiredTigerCacheSizeGB"
+            - "0.25"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "1280Mi"
+              cpu: "1"
           volumeMounts:
             - name: data
               mountPath: /data/db
@@ -435,6 +489,13 @@ spec:
             - "--configdb"
             - "configReplSet/mongo-config1:27017,mongo-config2:27017,mongo-config3:27017"
             - "--bind_ip_all"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "768Mi"
+              cpu: "500m"
           ports:
             - containerPort: 27017
               name: mongo
@@ -492,6 +553,13 @@ spec:
             - "--configdb"
             - "configReplSet/mongo-config1:27017,mongo-config2:27017,mongo-config3:27017"
             - "--bind_ip_all"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "768Mi"
+              cpu: "500m"
           ports:
             - containerPort: 27017
               name: mongo
@@ -549,6 +617,13 @@ spec:
             - "--configdb"
             - "configReplSet/mongo-config1:27017,mongo-config2:27017,mongo-config3:27017"
             - "--bind_ip_all"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "768Mi"
+              cpu: "500m"
           ports:
             - containerPort: 27017
               name: mongo

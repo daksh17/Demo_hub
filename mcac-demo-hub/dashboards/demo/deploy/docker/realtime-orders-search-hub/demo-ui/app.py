@@ -3,10 +3,12 @@ Browser UI + API: single-order ingest and configurable multi-DB workload generat
 """
 import asyncio
 import decimal
+import importlib
 import json
 import os
 import re
 import secrets
+import subprocess
 from urllib.parse import unquote, urlparse
 import threading
 import time
@@ -18,7 +20,12 @@ from typing import Any, Literal, Self
 import httpx
 import psycopg
 import redis
-from cassandra.cluster import Cluster, UnresolvableContactPoints
+from cassandra.cluster import (
+    Cluster,
+    EXEC_PROFILE_DEFAULT,
+    ExecutionProfile,
+    UnresolvableContactPoints,
+)
 from cassandra.query import BatchStatement, ConsistencyLevel
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -29,6 +36,10 @@ from starlette.middleware.sessions import SessionMiddleware
 from trino.dbapi import connect as trino_connect
 from trino.exceptions import TrinoConnectionError, TrinoUserError
 
+import cassandra_consistency_lab as cass_cl
+import cassandra_nodetool_lab as cass_nt
+import cassandra_partition_lab as cass_part
+import cassandra_storage_lab as cass_lab
 import postgres_logical_demo as pg_logical
 import postgres_faker_schema as pg_faker_schema
 import postgres_partition_demo as pg_partition
@@ -93,8 +104,18 @@ def _connect_cassandra_cluster(hosts: list[str] | None = None):
     max_attempts = int(os.environ.get("CASSANDRA_CONNECT_MAX_ATTEMPTS", "45"))
     delay_sec = float(os.environ.get("CASSANDRA_CONNECT_RETRY_DELAY_SEC", "2"))
     last_err: Exception | None = None
+    # Driver default request_timeout (~10s) is too low for DDL / schema agreement on small demo rings
+    # (GC pauses → "Connection defunct by heartbeat" / OperationTimedOut).
+    _cass_req_timeout = float(os.environ.get("CASSANDRA_REQUEST_TIMEOUT_SECONDS", "120"))
+    _cass_schema_wait = int(os.environ.get("CASSANDRA_MAX_SCHEMA_AGREEMENT_WAIT_SECONDS", "90"))
+    _cass_profile = ExecutionProfile(request_timeout=_cass_req_timeout)
     for attempt in range(1, max_attempts + 1):
-        cluster = Cluster(hosts, connect_timeout=15)
+        cluster = Cluster(
+            hosts,
+            connect_timeout=15,
+            max_schema_agreement_wait=_cass_schema_wait,
+            execution_profiles={EXEC_PROFILE_DEFAULT: _cass_profile},
+        )
         try:
             return cluster, cluster.connect()
         except UnresolvableContactPoints as e:
@@ -133,7 +154,10 @@ CASSANDRA_WORKLOAD_WRITE_RETRIES = int(
 WORKLOAD_REDIS_PREFIX = os.environ.get("WORKLOAD_REDIS_PREFIX", "hub:wl:")
 # OpenSearch default http.max_content_length is often 100 MiB; stay under to avoid HTTP 413 on /_bulk.
 OPENSEARCH_BULK_MAX_BYTES = int(
-    os.environ.get("OPENSEARCH_BULK_MAX_BYTES", str(48 * 1024 * 1024))
+    os.environ.get("OPENSEARCH_BULK_MAX_BYTES", str(24 * 1024 * 1024))
+)
+OPENSEARCH_WORKLOAD_INTER_BULK_SLEEP_MS = float(
+    os.environ.get("OPENSEARCH_WORKLOAD_INTER_BULK_SLEEP_MS", "50")
 )
 # Debezium Postgres snapshot loads full TEXT per row into heap; multi‑MiB names OOM Connect (default ~2–4G).
 POSTGRES_WORKLOAD_NAME_MAX_CHARS = int(
@@ -152,7 +176,7 @@ _cassandra_session = None
 _cassandra_insert_prep = None
 
 ALLOWED_TARGETS = frozenset(
-    {"postgres", "mongo", "redis", "cassandra", "opensearch", "mssql"}
+    {"postgres", "mongo", "redis", "cassandra", "opensearch", "mssql", "oracle"}
 )
 
 TRINO_ALLOWED_CATALOGS = frozenset(
@@ -501,7 +525,8 @@ NAV = """
     <a href="/">Single order</a> · <a href="/workload">Workload</a> ·
     <a href="/reads">Read-back</a> · <a href="/scenario">Scenario</a> ·
     <a href="/kafka">Kafka lab</a> ·
-    <a href="/postgres">Postgres</a> · <a href="/trino">Trino</a> ·
+    <a href="/postgres">Postgres</a> · <a href="/cassandra">Cassandra</a> ·
+    <a href="/cassandra/nodetool-lab">Nodetool</a> · <a href="/trino">Trino</a> ·
     <a href="/connections">External DBs</a>
   </nav>
 """
@@ -514,6 +539,17 @@ POSTGRES_BAR = """
     · <a href="/postgres/logical">Logical replication</a>
     · <a href="/postgres/faker-schema">Faker schema objects</a>
     · <a href="/postgres/partitions">Partitions (partman + cron)</a>
+  </div>
+"""
+
+CASSANDRA_BAR = """
+  <div style="margin:0 0 1rem;font-size:0.88rem;color:#8899a6;line-height:1.5;">
+    <span style="color:#71767b">Cassandra hub</span>
+    · <a href="/cassandra">Overview</a>
+    · <a href="/cassandra/storage-model">Partition vs clustering vs RDBMS</a>
+    · <a href="/cassandra/partition-lab">Custom PK / CK + Faker + tokens</a>
+    · <a href="/cassandra/nodetool-lab">Nodetool (pod exec or JMX)</a>
+    · <a href="/cassandra/consistency-lab">Consistency · bulk read/write perf</a>
   </div>
 """
 
@@ -626,7 +662,7 @@ WORKLOAD_PAGE = f"""<!DOCTYPE html>
   <h1>Workload generator</h1>
   <p>Writes synthetic rows in <strong>batches</strong>. <strong>Payload block size (KB)</strong> repeats filler bytes per record (larger = heavier writes).
     <strong>Postgres</strong> stores the pad inside <code>demo_items.name</code> with a <strong>CDC‑safe max length</strong> (default 16&nbsp;KiB; override <code>POSTGRES_WORKLOAD_NAME_MAX_CHARS</code>) so Debezium snapshot does not OOM Kafka Connect on huge pads.     <strong>Cassandra</strong> puts the pad in <code>label</code> (truncated); each batch row count is <strong>capped automatically</strong> so size stays under Cassandra&apos;s limit (prevents <code>Batch too large</code>). Sustained + large payloads can overload demo nodes (coordinator timeout / code 1100)—raise <code>CASSANDRA_WORKLOAD_REQUEST_TIMEOUT_SECONDS</code>, set <code>CASSANDRA_WORKLOAD_INTER_BATCH_SLEEP_MS</code> (e.g. 15–40), or lower payload / sustain duration.
-    OpenSearch uses index <code>hub-workload</code>. <strong>SQL Server</strong> (when <code>MSSQL_HOST</code> is set on the hub) inserts into <code>demo.dbo.hub_workload_mssql</code> on the <strong>publisher</strong> — same <code>wl-&lt;run_id&gt;-&lt;seq&gt;</code> naming; not enabled for CDC (keeps Debezium topics focused on the catalog mirror). REST: <code>http://localhost:9200</code>, Dashboards: <code>http://localhost:5601</code>. Grafana: <strong>SQL Server (demo hub)</strong> dashboard (awaragi exporter) plus Mongo, Redis, Kafka, Cassandra, ….</p>
+    OpenSearch uses index <code>hub-workload</code>. <strong>SQL Server</strong> (when <code>MSSQL_HOST</code> is set) writes <code>demo.dbo.hub_workload_mssql</code>; <strong>Oracle</strong> (when <code>ORACLE_HOST</code> is set) writes <code>hub_workload_oracle</code> on <code>FREEPDB1</code> — same <code>wl-&lt;run_id&gt;-&lt;seq&gt;</code> naming. Grafana: <strong>Oracle (demo hub)</strong> and <strong>SQL Server (demo hub)</strong> dashboards plus Mongo, Redis, Kafka, Cassandra, ….</p>
   <form id="f">
     <label>Total records (1–100000)</label>
     <input type="number" name="total_records" value="200" min="1" max="100000"/>
@@ -659,6 +695,7 @@ WORKLOAD_PAGE = f"""<!DOCTYPE html>
       <label><input type="checkbox" name="tg" value="cassandra" checked /> Cassandra <code>demo_hub.orders</code></label>
       <label><input type="checkbox" name="tg" value="opensearch" checked /> OpenSearch <code>hub-workload</code></label>
       <label><input type="checkbox" name="tg" value="mssql" /> SQL Server <code>demo.dbo.hub_workload_mssql</code> (publisher)</label>
+      <label><input type="checkbox" name="tg" value="oracle" /> Oracle <code>hub_workload_oracle</code> (FREEPDB1)</label>
     </fieldset>
     <button type="submit" id="run">Run workload</button>
   </form>
@@ -746,7 +783,7 @@ READS_PAGE = f"""<!DOCTYPE html>
   {NAV}
   <h1>Read workload data (Redis + others)</h1>
   <p>Poll the same stores the workload uses. <strong>Redis</strong> reads keys <code>hub:wl:&lt;run_id&gt;:0 .. n-1</code>.
-    <strong>SQL Server</strong> returns recent rows from <code>dbo.hub_workload_mssql</code> for the given <code>run_id</code>.
+    <strong>SQL Server</strong> returns recent rows from <code>dbo.hub_workload_mssql</code>; <strong>Oracle</strong> from <code>hub_workload_oracle</code> for the given <code>run_id</code>.
     Paste the <code>run_id</code> from a workload response (the page saves the last one in the browser), or generate a random id.
     Cap per store is <code>{WORKLOAD_READ_SAMPLE_LIMIT_MAX}</code> (raise with env <code>WORKLOAD_READ_SAMPLE_LIMIT_MAX</code> on hub-demo-ui).</p>
   <div class="row">
@@ -774,6 +811,7 @@ READS_PAGE = f"""<!DOCTYPE html>
       <label><input type="checkbox" class="tg" value="cassandra" checked/> Cassandra</label>
       <label><input type="checkbox" class="tg" value="opensearch" checked/> OpenSearch</label>
       <label><input type="checkbox" class="tg" value="mssql"/> SQL Server</label>
+      <label><input type="checkbox" class="tg" value="oracle"/> Oracle</label>
     </div>
   </fieldset>
   <div class="row">
@@ -1045,7 +1083,7 @@ _SCENARIO_PAGE_TEMPLATE = """<!DOCTYPE html>
       </div>
         <p class="hint"><strong>Mongo</strong> is the <em>catalog service</em>: rich product docs in <code>demo.scenario_products</code> plus optional vendor roster <code>demo.scenario_suppliers</code>.
         <strong>Postgres</strong> holds a <em>relational mirror</em> (<code>scenario_catalog_mirror</code>), <em>orders</em> (<code>scenario_orders</code>), <em>fulfillment lines</em> (<code>scenario_fulfillment_lines</code>), <em>customers</em> (<code>scenario_customers</code>), <em>payments</em> (<code>scenario_payments</code>), and <em>shipments</em> (<code>scenario_shipments</code>).
-        <strong>SQL Server</strong> (when <code>MSSQL_HOST</code> + <code>MSSQL_SA_PASSWORD</code> are set — Compose/K8s: <code>mssql-publisher</code>) gets a second mirror <code>dbo.scenario_catalog_mirror_mssql</code> on step 2 for <em>Debezium CDC</em> → Kafka → JDBC sink to the subscriber; workload generator can also write <code>dbo.hub_workload_mssql</code>.
+        <strong>SQL Server</strong> (when <code>MSSQL_HOST</code> is set — K8s: <code>mssql-publisher</code>) gets mirror <code>dbo.scenario_catalog_mirror_mssql</code> on step 2 for <em>Debezium CDC</em>. <strong>Oracle</strong> (when <code>ORACLE_HOST</code> is set — K8s: <code>oracle</code>) gets <code>scenario_catalog_mirror_oracle</code> on the same pipeline step. Workload generator can write <code>hub_workload_mssql</code> / <code>hub_workload_oracle</code>.
         <strong>Kafka</strong> gets event payloads for integration testing; the same JSON is written to <strong>OpenSearch</strong> index <code>hub-scenario-pipeline</code> (simulating what a Kafka→OpenSearch sink would index).
         <strong>Redis</strong> stores a small dashboard summary + a rolling list of recent pipeline events + per-order cache keys.
         <strong>Cassandra</strong> appends an <em>order timeline</em> (<code>demo_hub.scenario_timeline</code>) for steps 3–5 and a carrier-partitioned shipment lookup (<code>scenario_carrier_shipments</code>) when labels are created.</p>
@@ -1057,7 +1095,7 @@ _SCENARIO_PAGE_TEMPLATE = """<!DOCTYPE html>
       </details>
       <details class="behind">
         <summary>2 · Sync catalog → Postgres + Kafka + OpenSearch</summary>
-        <p class="hint">Runs <code>op_pipeline_mongo_to_postgres_and_kafka</code>: reads up to 80 products from Mongo, <strong>UPSERTs</strong> into Postgres <code>scenario_catalog_mirror</code>. When <code>MSSQL_HOST</code> is set (Compose: <code>mssql-publisher</code>), each product is also <strong>MERGE</strong>d into SQL Server <code>dbo.scenario_catalog_mirror_mssql</code> for Debezium CDC → Kafka → JDBC sink to the subscriber. For each row it sends a message to Kafka topic <code>scenario.catalog.changes</code> (if the broker is reachable) and <strong>indexes the same payload</strong> into OpenSearch <code>hub-scenario-pipeline</code> with direction <code>mongo→kafka+os</code>. Pushes a short entry onto Redis list <code>scenario:kafka:recent</code> and refreshes <code>scenario:dashboard:summary</code> (counts from Postgres + Mongo).</p>
+        <p class="hint">Runs <code>op_pipeline_mongo_to_postgres_and_kafka</code>: reads up to 80 products from Mongo, <strong>UPSERTs</strong> into Postgres <code>scenario_catalog_mirror</code>. When <code>MSSQL_HOST</code> / <code>ORACLE_HOST</code> are set, each product is also merged into SQL Server <code>dbo.scenario_catalog_mirror_mssql</code> and/or Oracle <code>scenario_catalog_mirror_oracle</code>. For each row it sends a message to Kafka topic <code>scenario.catalog.changes</code> (if the broker is reachable) and <strong>indexes the same payload</strong> into OpenSearch <code>hub-scenario-pipeline</code>. Pushes a short entry onto Redis list <code>scenario:kafka:recent</code> and refreshes <code>scenario:dashboard:summary</code>.</p>
       </details>
       <details class="behind">
         <summary>3 · Place order (Faker + map)</summary>
@@ -1131,9 +1169,11 @@ _SCENARIO_PAGE_TEMPLATE = """<!DOCTYPE html>
         <a href="/scenario/data/mongo">Mongo</a>
         <a href="/scenario/data/redis">Redis</a>
         <a href="/scenario/data/cassandra">Cassandra</a>
+        <a href="/cassandra">Cassandra hub</a>
         <a href="/scenario/data/opensearch">OpenSearch</a>
         <a href="/scenario/data/kafka">Kafka (meta)</a>
         <a href="/scenario/data/mssql">SQL Server</a>
+        <a href="/scenario/data/oracle">Oracle</a>
       </div>
     </div>
     <aside class="diagram-aside">
@@ -1179,16 +1219,26 @@ _SCENARIO_PAGE_TEMPLATE = """<!DOCTYPE html>
   </div>
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
   <script>
+    async function parseApiJson(r) {
+      const text = await r.text();
+      try {
+        return text ? JSON.parse(text) : {};
+      } catch (_) {
+        const msg = (text || r.statusText || String(r.status)).trim();
+        throw new Error(msg.slice(0, 500) || "non-JSON response");
+      }
+    }
     async function call(path, st, out) {
       st.textContent = "…";
       st.className = "";
       out.textContent = "";
       try {
         const r = await fetch(path, { method: "POST" });
-        const data = await r.json();
+        const data = await parseApiJson(r);
         out.textContent = JSON.stringify(data, null, 2);
-        st.textContent = r.ok && data.ok !== false ? "OK." : "See JSON.";
-        st.className = r.ok && data.ok !== false ? "ok" : "err";
+        const ok = r.ok && data.ok !== false;
+        st.textContent = ok ? "OK." : (data.detail ? String(data.detail) : "See JSON.");
+        st.className = ok ? "ok" : "err";
       } catch (e) {
         st.textContent = String(e);
         st.className = "err";
@@ -1243,8 +1293,8 @@ _SCENARIO_PAGE_TEMPLATE = """<!DOCTYPE html>
       st.className = "";
       try {
         const r = await fetch("/api/scenario/faker-profile");
-        const d = await r.json();
-        if (!r.ok) throw new Error(d.detail || JSON.stringify(d));
+        const d = await parseApiJson(r);
+        if (!r.ok) throw new Error(typeof d.detail === "string" ? d.detail : JSON.stringify(d.detail || d));
         document.getElementById("loc_preset").value = "";
         document.getElementById("customer_name").value = d.customer_name || "";
         document.getElementById("customer_email").value = d.customer_email || "";
@@ -2052,6 +2102,700 @@ POSTGRES_LANDING_PAGE = f"""<!DOCTYPE html>
 """
 
 
+CASSANDRA_LANDING_PAGE = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Cassandra — hub demo</title>
+  <style>
+    :root {{ font-family: ui-sans-serif, system-ui, sans-serif; background: #0f1419; color: #e7e9ea; }}
+    body {{ max-width: 48rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.55; }}
+    a {{ color: #6cb5f4; }}
+    h1 {{ font-size: 1.4rem; font-weight: 600; margin-bottom: 0.35rem; }}
+    p.lead {{ color: #8899a6; font-size: 0.95rem; margin: 0 0 1.25rem; }}
+    .tiles {{ display: grid; gap: 1rem; grid-template-columns: 1fr; }}
+    @media (min-width: 560px) {{ .tiles {{ grid-template-columns: 1fr 1fr; }} }}
+    .tile {{
+      display: block; padding: 1rem 1.15rem; border-radius: 12px;
+      border: 1px solid #38444d; background: #16181c; text-decoration: none; color: inherit;
+      transition: border-color 0.15s ease, background 0.15s ease;
+    }}
+    .tile:hover {{ border-color: #6cb5f4; background: #1a1f26; }}
+    .tile h2 {{ font-size: 1.05rem; margin: 0 0 0.35rem; color: #e7e9ea; }}
+    .tile p {{ margin: 0; font-size: 0.88rem; color: #8899a6; line-height: 1.45; }}
+    .tile .tag {{ display: inline-block; margin-top: 0.65rem; font-size: 0.72rem; letter-spacing: 0.03em;
+      text-transform: uppercase; color: #6cb5f4; }}
+    ul.more {{ margin: 1.5rem 0 0; padding-left: 1.15rem; color: #8899a6; font-size: 0.9rem; }}
+    ul.more li {{ margin: 0.35rem 0; }}
+    code {{ font-size: 0.88em; background: #252a30; padding: 0.1em 0.35em; border-radius: 4px; }}
+  </style>
+</head>
+<body>
+  {NAV}
+  <h1>Cassandra</h1>
+  <p class="lead">Demos for how this hub uses Apache Cassandra (ring in K8s / single node in Compose). Default keyspace <code>demo_hub</code> from <code>CASSANDRA_KEYSPACE</code>.</p>
+  <div class="tiles">
+    <a class="tile" href="/cassandra/storage-model">
+      <h2>Partition key · clustering key · vs RDBMS</h2>
+      <p>Hands-on tables <code>hub_cass_lab_*</code>: same logical inserts, different clustering order; wide partition by <code>user_id</code>. Compare storage intuition with row-oriented SQL.</p>
+      <span class="tag">Teaching lab</span>
+    </a>
+    <a class="tile" href="/cassandra/partition-lab">
+      <h2>Custom partition / clustering + Faker</h2>
+      <p>Define composite <strong>partition</strong> and <strong>clustering</strong> columns (typed), optional extras, create <code>hub_cass_user_*</code>, seed with Faker, inspect <code>system.peers</code> / tokens and replica hints from the driver.</p>
+      <span class="tag">Advanced lab</span>
+    </a>
+    <a class="tile" href="/cassandra/nodetool-lab">
+      <h2>Nodetool from the hub</h2>
+      <p>Run read-only <strong>nodetool</strong> commands and read stdout/stderr. Uses <strong>kubectl exec</strong> into a Cassandra pod when configured, otherwise <strong>remote JMX</strong> to <code>CASSANDRA_HOSTS</code> (port 7199).</p>
+      <span class="tag">Ops / teaching</span>
+    </a>
+    <a class="tile" href="/cassandra/consistency-lab">
+      <h2>Consistency level · bulk read/write performance</h2>
+      <p>Benchmark batched writes and point reads on <code>hub_cass_cl_bench</code> with separate <strong>write</strong> and <strong>read</strong> consistency levels. Compare ONE, LOCAL_ONE, QUORUM, LOCAL_QUORUM, ALL, and more.</p>
+      <span class="tag">Performance lab</span>
+    </a>
+    <a class="tile" href="/scenario/data/cassandra">
+      <h2>Scenario · Cassandra data</h2>
+      <p>Read-only JSON for timeline / scenario tables mirrored into the hub keyspace when the pipeline runs.</p>
+      <span class="tag">Read-only JSON</span>
+    </a>
+  </div>
+  <ul class="more">
+    <li><a href="/">Single order</a> — also writes <code>demo_hub.orders</code> (simple PK).</li>
+    <li><a href="/workload">Workload</a> — optional Cassandra batch target.</li>
+    <li><a href="/connections">External DBs</a> — session override for <code>CASSANDRA_HOSTS</code> / keyspace.</li>
+  </ul>
+</body>
+</html>
+"""
+
+
+CASSANDRA_STORAGE_LAB_PAGE = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Cassandra — partition vs clustering</title>
+  <style>
+    :root {{ font-family: ui-sans-serif, system-ui, sans-serif; background: #0f1419; color: #e7e9ea; }}
+    body {{ max-width: 52rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.55; }}
+    a {{ color: #6cb5f4; }}
+    h1 {{ font-size: 1.35rem; font-weight: 600; }}
+    h2 {{ font-size: 1.1rem; margin-top: 1.75rem; color: #cfd9de; }}
+    p.note {{ color: #8899a6; font-size: 0.9rem; }}
+    pre {{ background: #16181c; border: 1px solid #2f3336; border-radius: 8px; padding: 0.85rem; overflow: auto; font-size: 0.78rem; }}
+    .panel {{ border: 1px solid #38444d; border-radius: 10px; padding: 1rem 1.1rem; margin: 1rem 0; background: #16181c; }}
+    .panel h3 {{ margin: 0 0 0.5rem; font-size: 1rem; }}
+    .cap {{ color: #8899a6; font-size: 0.85rem; margin-top: 0.65rem; }}
+    button {{
+      background: #1d9bf0; color: #fff; border: 0; border-radius: 9999px;
+      padding: 0.55rem 1.15rem; font-size: 0.95rem; font-weight: 600; cursor: pointer; margin: 0.35rem 0.5rem 0 0;
+    }}
+    button.secondary {{ background: #38444d; }}
+    .err {{ color: #f66; }} .ok {{ color: #7af87a; }}
+    table {{ border-collapse: collapse; width: 100%; font-size: 0.82rem; margin-top: 0.5rem; }}
+    th, td {{ border: 1px solid #2f3336; padding: 0.35rem 0.5rem; text-align: left; }}
+    th {{ background: #1a1f26; color: #8899a6; }}
+    code {{ font-size: 0.88em; background: #252a30; padding: 0.08em 0.3em; border-radius: 4px; }}
+  </style>
+</head>
+<body>
+  {NAV}
+  {CASSANDRA_BAR}
+  <h1>How Cassandra stores rows vs RDBMS intuition</h1>
+  <p class="note">Uses live <strong>CQL</strong> against your hub keyspace (from env / <a href="/connections">session</a>). Creates idempotent teaching tables <code>hub_cass_lab_*</code> — not the hub&apos;s <code>orders</code> workload table. On slow rings, raise <code>CASSANDRA_REQUEST_TIMEOUT_SECONDS</code> (default 120s in the hub driver) or <code>CASSANDRA_MAX_SCHEMA_AGREEMENT_WAIT_SECONDS</code> on the Deployment.</p>
+
+  <h2>RDBMS (Postgres / typical SQL)</h2>
+  <p>Heap or index-organized table: a <strong>primary key</strong> is a logical uniqueness constraint. Physically, rows usually live in arbitrary pages; <strong>secondary indexes</strong> map alternate keys → heap row IDs. <code>ORDER BY</code> on a column without a matching index requires sorting at query time.</p>
+
+  <h2>Cassandra</h2>
+  <p><strong>Partition key</strong> (all columns in the outer <code>( )</code> group of <code>PRIMARY KEY</code>) decides which node/token range owns the data. Within that partition, <strong>clustering columns</strong> define on-disk sort order for rows. A row is unique by the <em>full</em> primary key (partition + clustering). There is no global table order across partitions.</p>
+
+  <h2>Exercise</h2>
+  <p class="note">Click <strong>Load demo</strong> to create tables (if needed), seed sample rows, and render panels. <strong>Replace &amp; re-seed</strong> truncates lab tables first. Env <code>CASSANDRA_HOSTS</code> must reach the ring from this hub process.</p>
+  <div>
+    <button type="button" id="labGo">Load demo</button>
+    <button type="button" class="secondary" id="labReplace">Replace &amp; re-seed</button>
+  </div>
+  <p id="labSt"></p>
+  <div id="labRoot"></div>
+
+  <script>
+    const labSt = document.getElementById("labSt");
+    const labRoot = document.getElementById("labRoot");
+    async function pj(method, url, body) {{
+      const r = await fetch(url, {{
+        method,
+        headers: {{ "Content-Type": "application/json" }},
+        body: body === undefined ? undefined : JSON.stringify(body),
+      }});
+      const data = await r.json().catch(() => ({{}}));
+      return {{ r, data }};
+    }}
+    function esc(s) {{
+      return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+    }}
+    function renderTable(rows) {{
+      if (!rows || !rows.length) return "<p class='note'>No rows.</p>";
+      const cols = Object.keys(rows[0]);
+      let h = "<table><tr>" + cols.map(c => "<th>" + esc(c) + "</th>").join("") + "</tr>";
+      for (const row of rows) {{
+        h += "<tr>" + cols.map(c => "<td>" + esc(row[c] ?? "") + "</td>").join("") + "</tr>";
+      }}
+      return h + "</table>";
+    }}
+    function renderDemo(data) {{
+      let h = "";
+      if (data.steps && data.steps.length) {{
+        h += "<div class='panel'><h3>Steps</h3><pre>" + data.steps.map(esc).join("\\n") + "</pre></div>";
+      }}
+      for (const p of (data.panels || [])) {{
+        h += "<div class='panel'><h3>" + esc(p.title) + "</h3>";
+        h += "<pre>" + esc(p.cql) + "</pre>";
+        h += renderTable(p.rows);
+        h += "<p class='cap'>" + esc(p.caption) + "</p></div>";
+      }}
+      labRoot.innerHTML = h;
+    }}
+    async function loadDemo() {{
+      labSt.textContent = "Loading…";
+      labSt.className = "";
+      labRoot.innerHTML = "";
+      try {{
+        const r = await fetch("/api/cassandra/storage-lab/demo");
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || data.error || r.status);
+        labSt.textContent = "OK — keyspace " + (data.keyspace || "");
+        labSt.className = "ok";
+        renderDemo(data);
+      }} catch (e) {{
+        labSt.textContent = String(e);
+        labSt.className = "err";
+      }}
+    }}
+    async function replaceSeed() {{
+      labSt.textContent = "Replacing…";
+      labSt.className = "";
+      try {{
+        const {{ r, data }} = await pj("POST", "/api/cassandra/storage-lab/setup", {{ replace: true }});
+        if (!r.ok) throw new Error(data.detail || data.error || r.status);
+        labSt.textContent = (data.steps || []).join(" ");
+        labSt.className = "ok";
+        await loadDemo();
+      }} catch (e) {{
+        labSt.textContent = String(e);
+        labSt.className = "err";
+      }}
+    }}
+    document.getElementById("labGo").addEventListener("click", loadDemo);
+    document.getElementById("labReplace").addEventListener("click", replaceSeed);
+  </script>
+</body>
+</html>
+"""
+
+
+CASSANDRA_PARTITION_LAB_PAGE = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Cassandra — custom partition lab</title>
+  <style>
+    :root {{ font-family: ui-sans-serif, system-ui, sans-serif; background: #0f1419; color: #e7e9ea; }}
+    body {{ max-width: 56rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }}
+    a {{ color: #6cb5f4; }}
+    textarea#jspec {{ width: 100%; min-height: 16rem; font-family: ui-monospace, monospace; font-size: 0.78rem;
+      background: #16181c; color: #e7e9ea; border: 1px solid #38444d; border-radius: 8px; padding: 0.6rem; box-sizing: border-box; }}
+    pre#jout {{ background: #16181c; border: 1px solid #2f3336; border-radius: 8px; padding: 0.85rem; overflow: auto; font-size: 0.78rem; max-height: 40rem; }}
+    button {{ background: #1d9bf0; color: #fff; border: 0; border-radius: 9999px; padding: 0.5rem 1rem; font-weight: 600; cursor: pointer; margin: 0.35rem 0.5rem 0 0; }}
+    button.secondary {{ background: #38444d; }}
+    p.note {{ color: #8899a6; font-size: 0.9rem; }}
+    .err {{ color: #f66; }} .ok {{ color: #7af87a; }}
+  </style>
+</head>
+<body>
+  {NAV}
+  {CASSANDRA_BAR}
+  <h1>Custom partition / clustering + Faker + topology</h1>
+  <p class="note">Tables: <code>hub_cass_user_&lt;suffix&gt;</code> in the hub keyspace. Column types: text, int, bigint, boolean, double, timestamp, uuid, timeuuid, tinyint, inet.
+    <strong>Partition tokens</strong> runs <code>SELECT token(pk…), pk… GROUP BY pk…</code> then maps Murmur3 tokens to replicas when <code>token_map</code> is available. <strong>Topology</strong> reads <code>system.peers</code> / <code>system.local</code> (vnodes list many tokens per host).</p>
+  <p><button type="button" id="bEx">Load example JSON</button></p>
+  <textarea id="jspec"></textarea>
+  <p><button type="button" id="bCreate">Create table</button>
+     <button type="button" id="bSeed">Seed Faker rows</button>
+     <button type="button" class="secondary" id="bTopo">Ring / nodes (system)</button>
+     <button type="button" class="secondary" id="bTok">Partition tokens + replicas</button>
+     <button type="button" class="secondary" id="bDrop">Drop table</button></p>
+  <p id="pSt"></p>
+  <pre id="jout"></pre>
+  <script>
+    const el = document.getElementById("jspec");
+    const jout = document.getElementById("jout");
+    const pSt = document.getElementById("pSt");
+    const ex = {{
+      "table_suffix": "faker_events",
+      "partition_key": [{{"name":"tenant","cql_type":"text"}},{{"name":"bucket","cql_type":"text"}}],
+      "clustering_key": [{{"name":"seq","cql_type":"int"}}],
+      "extra_columns": [{{"name":"note","cql_type":"text"}}],
+      "clustering_order": [{{"name":"seq","order":"ASC"}}],
+      "replace_if_exists": true,
+      "n_rows": 120,
+      "partitions_wide": 16,
+      "seed": 7
+    }};
+    document.getElementById("bEx").addEventListener("click", () => {{
+      el.value = JSON.stringify(ex, null, 2);
+      pSt.textContent = "Example loaded";
+      pSt.className = "ok";
+    }});
+    function read() {{
+      return JSON.parse(el.value || "{{}}");
+    }}
+    async function pj(method, url, body) {{
+      const r = await fetch(url, {{
+        method,
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify(body),
+      }});
+      const data = await r.json().catch(() => ({{}}));
+      return {{ r, data }};
+    }}
+    document.getElementById("bCreate").addEventListener("click", async () => {{
+      pSt.textContent = ""; jout.textContent = "";
+      try {{
+        const j = read();
+        const body = {{
+          table_suffix: j.table_suffix,
+          partition_key: j.partition_key,
+          clustering_key: j.clustering_key || [],
+          extra_columns: j.extra_columns || [],
+          clustering_order: j.clustering_order || null,
+          replace_if_exists: !!j.replace_if_exists
+        }};
+        const {{ r, data }} = await pj("POST", "/api/cassandra/partition-lab/create", body);
+        if (!r.ok) throw new Error(data.detail || r.status);
+        jout.textContent = JSON.stringify(data, null, 2);
+        pSt.textContent = "Created";
+        pSt.className = "ok";
+      }} catch (e) {{ pSt.textContent = String(e); pSt.className = "err"; }}
+    }});
+    document.getElementById("bSeed").addEventListener("click", async () => {{
+      pSt.textContent = ""; jout.textContent = "";
+      try {{
+        const j = read();
+        const body = {{
+          table_suffix: j.table_suffix,
+          partition_key: j.partition_key,
+          clustering_key: j.clustering_key || [],
+          extra_columns: j.extra_columns || [],
+          n_rows: j.n_rows || 100,
+          partitions_wide: j.partitions_wide || 12,
+          seed: j.seed === undefined ? null : j.seed
+        }};
+        const {{ r, data }} = await pj("POST", "/api/cassandra/partition-lab/seed", body);
+        if (!r.ok) throw new Error(data.detail || r.status);
+        jout.textContent = JSON.stringify(data, null, 2);
+        pSt.textContent = "Seeded";
+        pSt.className = "ok";
+      }} catch (e) {{ pSt.textContent = String(e); pSt.className = "err"; }}
+    }});
+    document.getElementById("bTopo").addEventListener("click", async () => {{
+      pSt.textContent = ""; jout.textContent = "";
+      try {{
+        const r = await fetch("/api/cassandra/partition-lab/topology");
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || r.status);
+        jout.textContent = JSON.stringify(data, null, 2);
+        pSt.textContent = "Topology";
+        pSt.className = "ok";
+      }} catch (e) {{ pSt.textContent = String(e); pSt.className = "err"; }}
+    }});
+    document.getElementById("bTok").addEventListener("click", async () => {{
+      pSt.textContent = ""; jout.textContent = "";
+      try {{
+        const j = read();
+        const parts = (j.partition_key || []).map((c) => c.name);
+        const body = {{ table_suffix: j.table_suffix, partition_columns: parts }};
+        const {{ r, data }} = await pj("POST", "/api/cassandra/partition-lab/partition-tokens", body);
+        if (!r.ok) throw new Error(data.detail || r.status);
+        jout.textContent = JSON.stringify(data, null, 2);
+        pSt.textContent = "Tokens";
+        pSt.className = "ok";
+      }} catch (e) {{ pSt.textContent = String(e); pSt.className = "err"; }}
+    }});
+    document.getElementById("bDrop").addEventListener("click", async () => {{
+      pSt.textContent = ""; jout.textContent = "";
+      try {{
+        const j = read();
+        const {{ r, data }} = await pj("POST", "/api/cassandra/partition-lab/drop", {{ table_suffix: j.table_suffix }});
+        if (!r.ok) throw new Error(data.detail || r.status);
+        jout.textContent = JSON.stringify(data, null, 2);
+        pSt.textContent = "Dropped";
+        pSt.className = "ok";
+      }} catch (e) {{ pSt.textContent = String(e); pSt.className = "err"; }}
+    }});
+  </script>
+</body>
+</html>
+"""
+
+
+CASSANDRA_NODETOOL_LAB_PAGE = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Cassandra — nodetool lab</title>
+  <style>
+    :root {{ font-family: ui-sans-serif, system-ui, sans-serif; background: #0f1419; color: #e7e9ea; }}
+    body {{ max-width: 56rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }}
+    a {{ color: #6cb5f4; }}
+    p.note {{ color: #8899a6; font-size: 0.9rem; }}
+    label {{ display: block; margin: 0.5rem 0 0.2rem; font-size: 0.85rem; color: #8899a6; }}
+    input[type="text"] {{
+      width: 100%; max-width: 28rem; padding: 0.4rem 0.5rem; border-radius: 6px;
+      border: 1px solid #38444d; background: #16181c; color: #e7e9ea; box-sizing: border-box;
+      font-family: ui-monospace, monospace; font-size: 0.82rem;
+    }}
+    #cmdBar {{ display: flex; flex-wrap: wrap; gap: 0.35rem 0.5rem; margin: 0.75rem 0; }}
+    #cmdBar button {{
+      background: #38444d; color: #e7e9ea; border: 0; border-radius: 8px;
+      padding: 0.35rem 0.65rem; font-size: 0.82rem; font-weight: 600; cursor: pointer;
+    }}
+    #cmdBar button:hover {{ background: #4a5560; }}
+    #cmdBar button.primary {{ background: #1d9bf0; color: #fff; }}
+    pre#ntOut {{
+      background: #16181c; border: 1px solid #2f3336; border-radius: 8px;
+      padding: 0.85rem; overflow: auto; font-size: 0.78rem; max-height: 36rem;
+      white-space: pre-wrap; word-break: break-word;
+    }}
+    #hintBox {{ font-size: 0.82rem; color: #8899a6; margin: 0.5rem 0 1rem; }}
+    .err {{ color: #f66; }} .ok {{ color: #7af87a; }}
+    #st {{ min-height: 1.25rem; font-size: 0.9rem; margin: 0.35rem 0; }}
+  </style>
+</head>
+<body>
+  {NAV}
+  {CASSANDRA_BAR}
+  <h1>Nodetool from the hub</h1>
+  <p class="note">Commands are <strong>whitelisted</strong> (read-only / informational). Optional extra tokens apply to subcommands that need a keyspace or table (e.g. <code>tablestats demo_hub</code>).</p>
+  <p class="note"><strong>Kubernetes:</strong> set <code>CASSANDRA_NODETOOL_KUBECTL_NAMESPACE</code> and <code>CASSANDRA_NODETOOL_KUBECTL_POD</code> on the hub Deployment so nodetool runs <em>inside</em> the Cassandra pod (in-cluster JMX). Optional <code>CASSANDRA_NODETOOL_KUBECTL_CONTAINER</code>. Mount a ServiceAccount with <code>pods/exec</code>.</p>
+  <p class="note"><strong>Docker Compose:</strong> default is <strong>remote JMX</strong> to the first <code>CASSANDRA_HOSTS</code> entry on port <code>7199</code> (override with <code>CASSANDRA_NODETOOL_JMX_HOST</code> or the field below).</p>
+  <div id="hintBox"></div>
+  <label for="ntExtra">Extra arguments (space-separated, optional)</label>
+  <input type="text" id="ntExtra" placeholder="e.g. demo_hub  or  demo_hub orders" autocomplete="off"/>
+  <label for="ntJmx">JMX host override (remote mode only, optional)</label>
+  <input type="text" id="ntJmx" placeholder="cassandra2" autocomplete="off"/>
+  <p id="st"></p>
+  <div id="cmdBar"></div>
+  <pre id="ntOut"></pre>
+  <script>
+    const st = document.getElementById("st");
+    const ntOut = document.getElementById("ntOut");
+    const cmdBar = document.getElementById("cmdBar");
+    const hintBox = document.getElementById("hintBox");
+    const ntExtra = document.getElementById("ntExtra");
+    const ntJmx = document.getElementById("ntJmx");
+
+    function esc(s) {{
+      return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+    }}
+
+    async function loadHints() {{
+      st.textContent = "Loading hints…";
+      st.className = "";
+      try {{
+        const r = await fetch("/api/cassandra/nodetool-lab/hints");
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || r.status);
+        let hb = "<strong>Transport:</strong> " + esc(data.transport || "");
+        if (data.transport === "kubectl" && data.kubectl) {{
+          hb += " — <code>" + esc(data.kubectl.namespace) + "</code> / pod <code>" + esc(data.kubectl.pod) + "</code>";
+          if (data.kubectl.container) hb += " / container <code>" + esc(data.kubectl.container) + "</code>";
+        }} else if (data.remote_jmx) {{
+          hb += " — default JMX host <code>" + esc(data.remote_jmx.default_host || "") + "</code> port " + esc(String(data.remote_jmx.port));
+        }}
+        hb += "<br/><code>nodetool</code> on PATH: " + esc(String(data.nodetool_on_path)) +
+              " · <code>kubectl</code> on PATH: " + esc(String(data.kubectl_on_path));
+        hintBox.innerHTML = hb;
+        cmdBar.innerHTML = "";
+        for (const c of (data.allowed_commands || [])) {{
+          const b = document.createElement("button");
+          b.type = "button";
+          b.textContent = c;
+          b.addEventListener("click", () => run(c));
+          cmdBar.appendChild(b);
+        }}
+        st.textContent = "Ready";
+        st.className = "ok";
+      }} catch (e) {{
+        st.textContent = String(e);
+        st.className = "err";
+      }}
+    }}
+
+    async function run(command) {{
+      st.textContent = "Running " + command + "…";
+      st.className = "";
+      ntOut.textContent = "";
+      const body = {{
+        command,
+        extra_args: ntExtra.value.trim(),
+        jmx_host: ntJmx.value.trim() || null
+      }};
+      try {{
+        const r = await fetch("/api/cassandra/nodetool-lab/run", {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify(body),
+        }});
+        const data = await r.json().catch(() => ({{}}));
+        if (!r.ok) throw new Error(data.detail || data.message || r.status);
+        let t = "";
+        if (data.argv) t += "$ " + data.argv.map((x) => JSON.stringify(x)).join(" ") + "\\n\\n";
+        if (data.stdout) t += data.stdout;
+        if (data.stderr) t += (t ? "\\n" : "") + "stderr:\\n" + data.stderr;
+        t += "\\n---\\nexit " + String(data.returncode);
+        ntOut.textContent = t;
+        st.textContent = data.returncode === 0 ? "OK" : "Finished (non-zero exit)";
+        st.className = data.returncode === 0 ? "ok" : "err";
+      }} catch (e) {{
+        st.textContent = String(e);
+        st.className = "err";
+      }}
+    }}
+
+    loadHints();
+  </script>
+</body>
+</html>
+"""
+
+
+CASSANDRA_CONSISTENCY_LAB_PAGE = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Cassandra — consistency performance</title>
+  <style>
+    :root {{ font-family: ui-sans-serif, system-ui, sans-serif; background: #0f1419; color: #e7e9ea; }}
+    body {{ max-width: 58rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }}
+    a {{ color: #6cb5f4; }}
+    p.note {{ color: #8899a6; font-size: 0.9rem; }}
+    label {{ display: block; margin: 0.5rem 0 0.2rem; font-size: 0.85rem; color: #8899a6; }}
+    input[type="number"], select {{
+      padding: 0.4rem 0.5rem; border-radius: 6px; border: 1px solid #38444d;
+      background: #16181c; color: #e7e9ea; font-size: 0.88rem;
+    }}
+    input[type="number"] {{ width: 6rem; }}
+    select {{ min-width: 10rem; }}
+    .row {{ display: flex; flex-wrap: wrap; gap: 1rem 1.5rem; align-items: flex-end; margin: 0.75rem 0; }}
+    button {{
+      background: #1d9bf0; color: #fff; border: 0; border-radius: 9999px;
+      padding: 0.5rem 1rem; font-weight: 600; cursor: pointer; margin: 0.35rem 0.5rem 0 0;
+    }}
+    button.secondary {{ background: #38444d; }}
+    table {{ border-collapse: collapse; width: 100%; font-size: 0.82rem; margin-top: 0.75rem; }}
+    th, td {{ border: 1px solid #2f3336; padding: 0.4rem 0.55rem; text-align: left; }}
+    th {{ background: #1a1f26; color: #8899a6; }}
+    pre#out {{ background: #16181c; border: 1px solid #2f3336; border-radius: 8px;
+      padding: 0.85rem; overflow: auto; font-size: 0.78rem; max-height: 28rem; }}
+    .panel {{ border: 1px solid #38444d; border-radius: 10px; padding: 1rem; margin: 1rem 0; background: #16181c; }}
+    .err {{ color: #f66; }} .ok {{ color: #7af87a; }}
+    code {{ font-size: 0.88em; background: #252a30; padding: 0.08em 0.3em; border-radius: 4px; }}
+  </style>
+</head>
+<body>
+  {NAV}
+  {CASSANDRA_BAR}
+  <h1>Consistency level · bulk read/write performance</h1>
+  <p class="note">Table <code>hub_cass_cl_bench</code> in the hub keyspace. <strong>Writes</strong> use batched <code>INSERT</code> with your write CL; <strong>reads</strong> are point lookups by <code>(bench_id, seq)</code> with your read CL. Higher CL (e.g. <code>QUORUM</code>, <code>ALL</code>) usually costs more latency on a multi-node ring.</p>
+
+  <div class="panel">
+    <h2 style="margin:0 0 0.5rem;font-size:1rem;">Single run</h2>
+    <div class="row">
+      <div><label for="wcl">Write consistency</label><select id="wcl"></select></div>
+      <div><label for="rcl">Read consistency</label><select id="rcl"></select></div>
+      <div><label for="nrows">Rows</label><input type="number" id="nrows" value="500" min="1" max="50000"/></div>
+      <div><label for="bs">Write batch size (1–256)</label><input type="number" id="bs" value="50" min="1" max="256"/></div>
+    </div>
+    <label><input type="checkbox" id="replace"/> Replace table (drop &amp; recreate)</label>
+    <div style="margin-top:0.75rem">
+      <button type="button" id="runBtn">Run benchmark</button>
+      <button type="button" class="secondary" id="cmpBtn">Compare common levels (matrix)</button>
+    </div>
+    <p id="st" style="min-height:1.2rem;margin:0.5rem 0 0"></p>
+  </div>
+
+  <div id="singleOut"></div>
+  <pre id="out" style="display:none"></pre>
+
+  <script>
+    const st = document.getElementById("st");
+    const singleOut = document.getElementById("singleOut");
+    const out = document.getElementById("out");
+    const wcl = document.getElementById("wcl");
+    const rcl = document.getElementById("rcl");
+
+    function esc(s) {{
+      return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+    }}
+
+    function apiErrDetail(data, r) {{
+      const d = data && data.detail;
+      if (typeof d === "string") return d;
+      if (Array.isArray(d)) {{
+        return d.map((x) => {{
+          const loc = (x.loc || []).filter((p) => p !== "body").join(".");
+          return (loc ? loc + ": " : "") + (x.msg || JSON.stringify(x));
+        }}).join("; ");
+      }}
+      if (d && typeof d === "object") return JSON.stringify(d);
+      return (data && data.error) || (r && (r.statusText || String(r.status))) || "request failed";
+    }}
+
+    function benchParams() {{
+      const n_rows = Math.min(50000, Math.max(1, parseInt(document.getElementById("nrows").value, 10) || 500));
+      const batch_size = Math.min(256, Math.max(1, parseInt(document.getElementById("bs").value, 10) || 50));
+      document.getElementById("nrows").value = String(n_rows);
+      document.getElementById("bs").value = String(batch_size);
+      return {{ n_rows, batch_size }};
+    }}
+
+    function fillSelect(sel, levels, def) {{
+      sel.innerHTML = "";
+      for (const n of levels) {{
+        const o = document.createElement("option");
+        o.value = n;
+        o.textContent = n;
+        if (n === def) o.selected = true;
+        sel.appendChild(o);
+      }}
+    }}
+
+    async function loadChoices() {{
+      const r = await fetch("/api/cassandra/consistency-lab/choices");
+      const data = await r.json();
+      if (!r.ok) throw new Error(apiErrDetail(data, r));
+      const writeLevels = (data.write_levels || data.levels || []).map(x => x.value || x.name);
+      const readLevels = (data.read_levels || data.levels || []).map(x => x.value || x.name);
+      fillSelect(wcl, writeLevels.length ? writeLevels : readLevels, "LOCAL_ONE");
+      fillSelect(rcl, readLevels.length ? readLevels : writeLevels, "LOCAL_ONE");
+      if (data.lab_version) {{
+        st.textContent = "Lab " + data.lab_version + " loaded";
+        st.className = "ok";
+      }}
+    }}
+
+    function renderSingle(data) {{
+      let h = "<div class='panel'><h3 style='margin:0 0 0.5rem'>Results</h3>";
+      h += "<p class='note'>bench_id <code>" + esc(data.bench_id) + "</code> · " +
+           esc(data.n_rows) + " rows · batch " + esc(data.batch_size) + "</p>";
+      h += "<table><tr><th>Phase</th><th>CL</th><th>Count</th><th>Elapsed (ms)</th><th>ops/s</th><th>avg ms/op</th></tr>";
+      for (const p of [data.write, data.read]) {{
+        h += "<tr><td>" + esc(p.phase) + "</td><td>" + esc(p.consistency) + "</td><td>" +
+             esc(p.count) + "</td><td>" + esc(p.elapsed_ms) + "</td><td>" + esc(p.ops_per_sec) +
+             "</td><td>" + esc(p.avg_ms_per_op) + "</td></tr>";
+      }}
+      h += "</table></div>";
+      singleOut.innerHTML = h;
+      out.style.display = "none";
+    }}
+
+    function renderMatrix(data) {{
+      let h = "<div class='panel'><h3 style='margin:0 0 0.5rem'>Compare matrix</h3>";
+      h += "<p class='note'>" + esc(data.n_rows) + " rows · batch " + esc(data.batch_size) + "</p>";
+      h += "<table><tr><th>Write CL</th><th>Read CL</th><th>Write ops/s</th><th>Read ops/s</th><th>Write ms</th><th>Read ms</th></tr>";
+      for (const row of (data.results || [])) {{
+        if (row.error) {{
+          h += "<tr><td>" + esc(row.write_consistency) + "</td><td>" + esc(row.read_consistency) +
+               "</td><td colspan='4' class='err'>" + esc(row.error) + "</td></tr>";
+        }} else {{
+          h += "<tr><td>" + esc(row.write_consistency) + "</td><td>" + esc(row.read_consistency) +
+               "</td><td>" + esc(row.write_ops_per_sec) + "</td><td>" + esc(row.read_ops_per_sec) +
+               "</td><td>" + esc(row.write_elapsed_ms) + "</td><td>" + esc(row.read_elapsed_ms) + "</td></tr>";
+        }}
+      }}
+      h += "</table></div>";
+      singleOut.innerHTML = h;
+      out.style.display = "none";
+    }}
+
+    async function runSingle() {{
+      st.textContent = "Running…";
+      st.className = "";
+      singleOut.innerHTML = "";
+      const {{ n_rows, batch_size }} = benchParams();
+      const body = {{
+        write_consistency: wcl.value,
+        read_consistency: rcl.value,
+        n_rows,
+        batch_size,
+        replace_table: document.getElementById("replace").checked,
+      }};
+      try {{
+        const r = await fetch("/api/cassandra/consistency-lab/run", {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify(body),
+        }});
+        const data = await r.json().catch(() => ({{}}));
+        if (!r.ok) throw new Error(apiErrDetail(data, r));
+        st.textContent = "Done";
+        st.className = "ok";
+        renderSingle(data);
+      }} catch (e) {{
+        const msg = e.message || String(e);
+        st.textContent = msg.split("\\n")[0];
+        st.className = "err";
+        out.style.display = "block";
+        out.textContent = msg;
+      }}
+    }}
+
+    async function runCompare() {{
+      st.textContent = "Compare matrix (may take a few minutes)…";
+      st.className = "";
+      singleOut.innerHTML = "";
+      const {{ n_rows, batch_size }} = benchParams();
+      const body = {{
+        n_rows: Math.min(n_rows, 2000),
+        batch_size,
+        replace_table: document.getElementById("replace").checked,
+      }};
+      try {{
+        const r = await fetch("/api/cassandra/consistency-lab/compare", {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify(body),
+        }});
+        const data = await r.json().catch(() => ({{}}));
+        if (!r.ok) throw new Error(apiErrDetail(data, r));
+        st.textContent = "Compare done";
+        st.className = "ok";
+        renderMatrix(data);
+      }} catch (e) {{
+        const msg = e.message || String(e);
+        st.textContent = msg.split("\\n")[0];
+        st.className = "err";
+        out.style.display = "block";
+        out.textContent = msg;
+      }}
+    }}
+
+    document.getElementById("runBtn").addEventListener("click", runSingle);
+    document.getElementById("cmpBtn").addEventListener("click", runCompare);
+    loadChoices().catch(e => {{ st.textContent = e.message || String(e); st.className = "err"; }});
+  </script>
+</body>
+</html>
+"""
+
+
 POSTGRES_FAKER_SCHEMA_PAGE = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2519,7 +3263,7 @@ POSTGRES_PARTITION_PAGE = f"""<!DOCTYPE html>
   <h1>PostgreSQL partitioning (demo DB)</h1>
   <p class="note">Uses <code>POSTGRES_ADMIN_DSN</code> (must include password) against database <code>demo</code> for DDL and partman. Inserts use <code>POSTGRES_DSN</code> as the hub&apos;s application role (typically <code>demo</code>). RANGE tables register with <code>pg_partman</code>; LIST/HASH use fixed child partitions (cron runs maintenance globally but is a no-op for those parents).</p>
   <h2 class="sec">SQL for current choices</h2>
-  <p class="note">Updates when you change strategy, cron checkbox, or expression. Schema for <code>create_parent</code> / <code>CALL run_maintenance_proc()</code> is resolved from <code>demo</code> when the hub can connect; otherwise the preview shows <code>&lt;partman_schema&gt;</code>.</p>
+  <p class="note">Updates when you change strategy, cron checkbox, or expression. Schema for <code>create_parent</code> / <code>CALL run_maintenance_proc()</code> is resolved from <code>demo</code> when the hub can connect; otherwise the preview uses <code>&lt;partman_schema&gt;</code>.</p>
   <pre id="pkSqlPreview" class="sql-preview">Loading…</pre>
   <label for="pkKind">Partition strategy</label>
   <select id="pkKind">
@@ -2544,6 +3288,7 @@ POSTGRES_PARTITION_PAGE = f"""<!DOCTYPE html>
     <button type="button" class="secondary" id="pkStatus">Refresh status</button>
     <button type="button" class="secondary" id="pkMaint">Run maintenance now</button>
     <button type="button" class="secondary" id="pkUnCron">Remove cron job</button>
+    <button type="button" class="secondary" id="pkRepairCron">Fix pg_cron socket (nodename)</button>
     <button type="button" class="secondary" id="pkSeedBtn">Insert extra Faker rows</button>
   </div>
   <p id="st"></p>
@@ -2632,6 +3377,16 @@ POSTGRES_PARTITION_PAGE = f"""<!DOCTYPE html>
       pkOut.textContent = JSON.stringify(data, null, 2);
       const ok = r.ok && data && data.ok === true;
       st.textContent = ok ? "Cron removed (if it existed)." : (data.detail || "Failed");
+      st.className = ok ? "ok" : "err";
+    }});
+    document.getElementById("pkRepairCron").addEventListener("click", async () => {{
+      st.textContent = "Repairing pg_cron nodename…";
+      const {{ r, data }} = await pj("POST", "/api/postgres/partition-demo/repair-cron-nodename", {{}});
+      pkOut.textContent = JSON.stringify(data, null, 2);
+      const ok = r.ok && data && data.ok === true;
+      st.textContent = ok
+        ? `Repair OK (${{data.updated}} job row(s) updated). Wait for next schedule or check job_run_details.`
+        : (data.detail || data.hint || data.error || "Failed");
       st.className = ok ? "ok" : "err";
     }});
     document.getElementById("pkSeedBtn").addEventListener("click", async () => {{
@@ -3189,6 +3944,87 @@ class PostgresPartitionDemoSeedBody(BaseModel):
     n: int = Field(default=10, ge=1, le=200)
 
 
+class CassandraStorageLabSetupBody(BaseModel):
+    replace: bool = False
+
+
+CassPartCqlType = Literal[
+    "text",
+    "int",
+    "bigint",
+    "boolean",
+    "double",
+    "timestamp",
+    "uuid",
+    "timeuuid",
+    "tinyint",
+    "inet",
+]
+
+
+class CassPartLabCol(BaseModel):
+    name: str = Field(pattern=r"^[a-z][a-z0-9_]{0,62}$")
+    cql_type: CassPartCqlType
+
+
+class CassPartLabClusterOrder(BaseModel):
+    name: str = Field(pattern=r"^[a-z][a-z0-9_]{0,62}$")
+    order: Literal["ASC", "DESC"] = "ASC"
+
+
+class CassPartLabCreateBody(BaseModel):
+    table_suffix: str = Field(pattern=r"^[a-z][a-z0-9_]{0,40}$")
+    partition_key: list[CassPartLabCol] = Field(min_length=1, max_length=4)
+    clustering_key: list[CassPartLabCol] = Field(default_factory=list, max_length=4)
+    extra_columns: list[CassPartLabCol] = Field(default_factory=list, max_length=12)
+    clustering_order: list[CassPartLabClusterOrder] | None = None
+    replace_if_exists: bool = True
+
+
+class CassPartLabSeedBody(BaseModel):
+    table_suffix: str = Field(pattern=r"^[a-z][a-z0-9_]{0,40}$")
+    partition_key: list[CassPartLabCol] = Field(min_length=1, max_length=4)
+    clustering_key: list[CassPartLabCol] = Field(default_factory=list, max_length=4)
+    extra_columns: list[CassPartLabCol] = Field(default_factory=list, max_length=12)
+    n_rows: int = Field(120, ge=1, le=5000)
+    partitions_wide: int = Field(12, ge=1, le=2000)
+    seed: int | None = Field(None, ge=0, le=2_147_483_647)
+
+
+class CassPartLabTokensBody(BaseModel):
+    table_suffix: str = Field(pattern=r"^[a-z][a-z0-9_]{0,40}$")
+    partition_columns: list[str] = Field(..., min_length=1, max_length=8)
+
+
+class CassPartLabDropBody(BaseModel):
+    table_suffix: str = Field(pattern=r"^[a-z][a-z0-9_]{0,40}$")
+
+
+class CassNodetoolRunBody(BaseModel):
+    command: str = Field(..., min_length=2, max_length=48)
+    extra_args: str = Field("", max_length=500)
+    jmx_host: str | None = Field(None, max_length=253)
+
+
+CASS_CL_COMPARE_DEFAULT = ("ONE", "LOCAL_ONE", "QUORUM", "LOCAL_QUORUM", "ALL")
+
+
+class CassClBenchBody(BaseModel):
+    write_consistency: str = "LOCAL_ONE"
+    read_consistency: str = "LOCAL_ONE"
+    n_rows: int = Field(500, ge=1, le=50_000)
+    batch_size: int = Field(50, ge=1, le=256)
+    replace_table: bool = False
+
+
+class CassClCompareBody(BaseModel):
+    n_rows: int = Field(200, ge=1, le=5_000)
+    batch_size: int = Field(50, ge=1, le=256)
+    write_levels: list[str] | None = None
+    read_levels: list[str] | None = None
+    replace_table: bool = False
+
+
 class PostgresFakerSchemaBody(BaseModel):
     database: Literal["demo_logical_pub", "demo_logical_sub"] = "demo_logical_pub"
     preset: Literal["mixed", "people", "commerce"] = "mixed"
@@ -3615,6 +4451,7 @@ def _execute_workload_wave(
         try:
             n = 0
             os_chunk = _opensearch_bulk_chunk_size(pad, bs)
+            os_sleep_s = max(0.0, OPENSEARCH_WORKLOAD_INTER_BULK_SLEEP_MS / 1000.0)
             with httpx.Client(timeout=120.0) as hc:
                 _ensure_hub_opensearch_for_cfg(hc, cfg)
                 for start in range(0, total_records, os_chunk):
@@ -3655,6 +4492,8 @@ def _execute_workload_wave(
                         raise RuntimeError(
                             "bulk item failure: " + json.dumps(bulk, default=str)[:2000]
                         )
+                    if os_sleep_s > 0.0 and start + os_chunk < total_records:
+                        time.sleep(os_sleep_s)
             counts["opensearch"] = n
         except Exception as e:
             errors["opensearch"] = str(e)
@@ -3670,6 +4509,18 @@ def _execute_workload_wave(
                 counts["mssql"] = n
         except Exception as e:
             errors["mssql"] = str(e)
+
+    if "oracle" in targets:
+        try:
+            n, err = scenario.workload_oracle_batch(
+                run_id, seq_base, total_records, bs, pad
+            )
+            if err:
+                errors["oracle"] = err
+            else:
+                counts["oracle"] = n
+        except Exception as e:
+            errors["oracle"] = str(e)
 
     return counts, errors
 
@@ -3842,6 +4693,21 @@ def _workload_read_sample(req: WorkloadReadRequest) -> dict:
             out["ok"] = False
             out["errors"]["mssql"] = str(e)
 
+    if "oracle" in tg:
+        try:
+            om = scenario.fetch_workload_sample_oracle(req.run_id, lim)
+            if om.get("ok"):
+                out["samples"]["oracle"] = {
+                    "count": om.get("count", 0),
+                    "rows": om.get("rows", []),
+                }
+            else:
+                out["ok"] = False
+                out["errors"]["oracle"] = om.get("error", "unknown")
+        except Exception as e:
+            out["ok"] = False
+            out["errors"]["oracle"] = str(e)
+
     return out
 
 
@@ -3945,6 +4811,31 @@ async def postgres_faker_schema_page():
 @app.get("/postgres/partitions", response_class=HTMLResponse)
 async def postgres_partitions_page():
     return HTMLResponse(POSTGRES_PARTITION_PAGE)
+
+
+@app.get("/cassandra", response_class=HTMLResponse)
+async def cassandra_hub_page():
+    return HTMLResponse(CASSANDRA_LANDING_PAGE)
+
+
+@app.get("/cassandra/storage-model", response_class=HTMLResponse)
+async def cassandra_storage_model_page():
+    return HTMLResponse(CASSANDRA_STORAGE_LAB_PAGE)
+
+
+@app.get("/cassandra/partition-lab", response_class=HTMLResponse)
+async def cassandra_partition_lab_page():
+    return HTMLResponse(CASSANDRA_PARTITION_LAB_PAGE)
+
+
+@app.get("/cassandra/nodetool-lab", response_class=HTMLResponse)
+async def cassandra_nodetool_lab_page():
+    return HTMLResponse(CASSANDRA_NODETOOL_LAB_PAGE)
+
+
+@app.get("/cassandra/consistency-lab", response_class=HTMLResponse)
+async def cassandra_consistency_lab_page():
+    return HTMLResponse(CASSANDRA_CONSISTENCY_LAB_PAGE)
 
 
 @app.get("/postgres-logical")
@@ -4350,6 +5241,31 @@ async def api_postgres_partition_demo_remove_cron():
         ) from e
 
 
+@app.post("/api/postgres/partition-demo/repair-cron-nodename")
+async def api_postgres_partition_demo_repair_cron_nodename():
+    cfg = get_runtime_config()
+    pwd = _pg_password_from_dsn(cfg.postgres_admin_dsn)
+    if not pwd:
+        raise HTTPException(
+            status_code=500,
+            detail="POSTGRES_ADMIN_DSN must include a password (postgresql://user:pass@host/db)",
+        )
+    try:
+        return await asyncio.to_thread(
+            pg_partition.partition_demo_repair_pg_cron_nodename,
+            cfg.postgres_admin_dsn,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except psycopg.Error as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"{type(e).__name__}: {e}",
+        ) from e
+
+
 @app.post("/api/postgres/partition-demo/seed")
 async def api_postgres_partition_demo_seed(body: PostgresPartitionDemoSeedBody):
     cfg = get_runtime_config()
@@ -4368,6 +5284,309 @@ async def api_postgres_partition_demo_seed(body: PostgresPartitionDemoSeedBody):
         raise HTTPException(
             status_code=500,
             detail=f"{type(e).__name__}: {e}",
+        ) from e
+
+
+def _cass_storage_lab_demo_sync(cfg):
+    sess, _ = get_hub_cassandra_handles(cfg)
+    return cass_lab.run_demo(sess, cfg.cassandra_keyspace)
+
+
+def _cass_storage_lab_setup_sync(cfg, replace: bool):
+    sess, _ = get_hub_cassandra_handles(cfg)
+    return cass_lab.setup_lab(sess, cfg.cassandra_keyspace, replace=replace)
+
+
+@app.get("/api/cassandra/storage-lab/demo")
+async def api_cassandra_storage_lab_demo():
+    cfg = get_runtime_config()
+    try:
+        return await asyncio.to_thread(_cass_storage_lab_demo_sync, cfg)
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Cassandra storage lab unavailable: {type(e).__name__}: {e}",
+        ) from e
+
+
+@app.post("/api/cassandra/storage-lab/setup")
+async def api_cassandra_storage_lab_setup(
+    body: CassandraStorageLabSetupBody = CassandraStorageLabSetupBody(),
+):
+    cfg = get_runtime_config()
+    try:
+        return await asyncio.to_thread(_cass_storage_lab_setup_sync, cfg, body.replace)
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Cassandra storage lab setup failed: {type(e).__name__}: {e}",
+        ) from e
+
+
+def _cass_part_create_sync(cfg, body: CassPartLabCreateBody):
+    sess, _ = get_hub_cassandra_handles(cfg)
+    pk = [(c.name, c.cql_type) for c in body.partition_key]
+    ck = [(c.name, c.cql_type) for c in body.clustering_key]
+    ex = [(c.name, c.cql_type) for c in body.extra_columns]
+    co = [(o.name, o.order) for o in body.clustering_order] if body.clustering_order else None
+    return cass_part.create_table(
+        sess,
+        cfg.cassandra_keyspace,
+        table_suffix=body.table_suffix,
+        partition_key=pk,
+        clustering_key=ck,
+        extra_columns=ex,
+        clustering_order=co,
+        replace_if_exists=body.replace_if_exists,
+    )
+
+
+def _cass_part_seed_sync(cfg, body: CassPartLabSeedBody):
+    sess, _ = get_hub_cassandra_handles(cfg)
+    pk = [(c.name, c.cql_type) for c in body.partition_key]
+    ck = [(c.name, c.cql_type) for c in body.clustering_key]
+    ex = [(c.name, c.cql_type) for c in body.extra_columns]
+    tbl = cass_part.user_table_name(body.table_suffix)
+    return cass_part.seed_faker(
+        sess,
+        cfg.cassandra_keyspace,
+        tbl,
+        partition_key=pk,
+        clustering_key=ck,
+        extra_columns=ex,
+        n_rows=body.n_rows,
+        partitions_wide=body.partitions_wide,
+        seed=body.seed,
+    )
+
+
+def _cass_part_topology_sync(cfg):
+    sess, _ = get_hub_cassandra_handles(cfg)
+    return cass_part.fetch_topology(sess)
+
+
+def _cass_part_tokens_sync(cfg, body: CassPartLabTokensBody):
+    sess, _ = get_hub_cassandra_handles(cfg)
+    cols = [str(c).strip() for c in body.partition_columns]
+    tbl = cass_part.user_table_name(body.table_suffix)
+    return cass_part.partition_token_summary(
+        sess, cfg.cassandra_keyspace, tbl, cols
+    )
+
+
+def _cass_part_drop_sync(cfg, body: CassPartLabDropBody):
+    sess, _ = get_hub_cassandra_handles(cfg)
+    return cass_part.drop_user_table(sess, cfg.cassandra_keyspace, body.table_suffix)
+
+
+@app.post("/api/cassandra/partition-lab/create")
+async def api_cassandra_partition_lab_create(body: CassPartLabCreateBody):
+    cfg = get_runtime_config()
+    try:
+        return await asyncio.to_thread(_cass_part_create_sync, cfg, body)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Cassandra partition lab: {type(e).__name__}: {e}",
+        ) from e
+
+
+@app.post("/api/cassandra/partition-lab/seed")
+async def api_cassandra_partition_lab_seed(body: CassPartLabSeedBody):
+    cfg = get_runtime_config()
+    try:
+        return await asyncio.to_thread(_cass_part_seed_sync, cfg, body)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Cassandra partition lab seed: {type(e).__name__}: {e}",
+        ) from e
+
+
+@app.get("/api/cassandra/partition-lab/topology")
+async def api_cassandra_partition_lab_topology():
+    cfg = get_runtime_config()
+    try:
+        return await asyncio.to_thread(_cass_part_topology_sync, cfg)
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Cassandra topology: {type(e).__name__}: {e}",
+        ) from e
+
+
+@app.post("/api/cassandra/partition-lab/partition-tokens")
+async def api_cassandra_partition_lab_partition_tokens(body: CassPartLabTokensBody):
+    cfg = get_runtime_config()
+    try:
+        return await asyncio.to_thread(_cass_part_tokens_sync, cfg, body)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Cassandra partition tokens: {type(e).__name__}: {e}",
+        ) from e
+
+
+@app.post("/api/cassandra/partition-lab/drop")
+async def api_cassandra_partition_lab_drop(body: CassPartLabDropBody):
+    cfg = get_runtime_config()
+    try:
+        return await asyncio.to_thread(_cass_part_drop_sync, cfg, body)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Cassandra partition lab drop: {type(e).__name__}: {e}",
+        ) from e
+
+
+def _cass_nt_hints_sync(cfg):
+    return cass_nt.hints(cfg.cassandra_hosts)
+
+
+def _cass_nt_run_sync(cfg, body: CassNodetoolRunBody):
+    return cass_nt.run_nodetool(
+        cfg.cassandra_hosts,
+        body.command,
+        body.extra_args or None,
+        body.jmx_host,
+    )
+
+
+@app.get("/api/cassandra/nodetool-lab/hints")
+async def api_cassandra_nodetool_lab_hints():
+    cfg = get_runtime_config()
+    try:
+        return await asyncio.to_thread(_cass_nt_hints_sync, cfg)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Cassandra nodetool hints: {type(e).__name__}: {e}",
+        ) from e
+
+
+@app.post("/api/cassandra/nodetool-lab/run")
+async def api_cassandra_nodetool_lab_run(body: CassNodetoolRunBody):
+    cfg = get_runtime_config()
+    try:
+        return await asyncio.to_thread(_cass_nt_run_sync, cfg, body)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except subprocess.TimeoutExpired as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"nodetool timed out after {e.timeout}s",
+        ) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Cassandra nodetool: {type(e).__name__}: {e}",
+        ) from e
+
+
+def _reload_cass_cl():
+    """Pick up volume-mounted cassandra_consistency_lab.py without full container restart."""
+    import cassandra_consistency_lab as mod
+
+    return importlib.reload(mod)
+
+
+def _cass_cl_bench_sync(cfg, body: CassClBenchBody):
+    mod = _reload_cass_cl()
+    diag = mod.module_diagnostics()
+    if not diag.get("ok"):
+        raise RuntimeError(
+            f"stale cassandra_consistency_lab.py at {diag.get('path')!r} "
+            f"(lab_version={diag.get('lab_version')!r}, stale_execute_cl_kwarg="
+            f"{diag.get('stale_execute_cl_kwarg')!r}). "
+            "Rebuild hub-demo-ui image or restart the pod after updating the file."
+        )
+    sess, _ = get_hub_cassandra_handles(cfg)
+    return mod.run_benchmark(
+        sess,
+        cfg.cassandra_keyspace,
+        write_cl_name=body.write_consistency,
+        read_cl_name=body.read_consistency,
+        n_rows=body.n_rows,
+        batch_size=body.batch_size,
+        replace_table=body.replace_table,
+    )
+
+
+def _cass_cl_compare_sync(cfg, body: CassClCompareBody):
+    mod = _reload_cass_cl()
+    diag = mod.module_diagnostics()
+    if not diag.get("ok"):
+        raise RuntimeError(
+            f"stale cassandra_consistency_lab.py — rebuild/restart hub-demo-ui "
+            f"(see diagnostics: {diag})"
+        )
+    sess, _ = get_hub_cassandra_handles(cfg)
+    wlevels = body.write_levels or list(CASS_CL_COMPARE_DEFAULT)
+    rlevels = body.read_levels or list(CASS_CL_COMPARE_DEFAULT)
+    return mod.run_compare_matrix(
+        sess,
+        cfg.cassandra_keyspace,
+        n_rows=body.n_rows,
+        batch_size=body.batch_size,
+        write_levels=wlevels,
+        read_levels=rlevels,
+        replace_table=body.replace_table,
+    )
+
+
+@app.get("/api/cassandra/consistency-lab/diagnostics")
+async def api_cassandra_consistency_lab_diagnostics():
+    mod = _reload_cass_cl()
+    return mod.module_diagnostics()
+
+
+@app.get("/api/cassandra/consistency-lab/choices")
+async def api_cassandra_consistency_lab_choices():
+    mod = _reload_cass_cl()
+    return {**mod.consistency_choices(), **mod.lab_info(), "diagnostics": mod.module_diagnostics()}
+
+
+@app.post("/api/cassandra/consistency-lab/run")
+async def api_cassandra_consistency_lab_run(body: CassClBenchBody):
+    cfg = get_runtime_config()
+    try:
+        return await asyncio.to_thread(_cass_cl_bench_sync, cfg, body)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        import traceback
+
+        raise HTTPException(
+            status_code=503,
+            detail=f"Cassandra consistency lab: {type(e).__name__}: {e}\n{traceback.format_exc()}",
+        ) from e
+
+
+@app.post("/api/cassandra/consistency-lab/compare")
+async def api_cassandra_consistency_lab_compare(body: CassClCompareBody):
+    cfg = get_runtime_config()
+    try:
+        return await asyncio.to_thread(_cass_cl_compare_sync, cfg, body)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        import traceback
+
+        raise HTTPException(
+            status_code=503,
+            detail=f"Cassandra consistency compare: {type(e).__name__}: {e}\n{traceback.format_exc()}",
         ) from e
 
 
@@ -4439,6 +5658,22 @@ async def faker_order_redirect():
     return RedirectResponse(url="/scenario", status_code=307)
 
 
+def _scenario_api(fn, *args, **kwargs):
+    """Return scenario dicts as JSON; map failures to HTTPException (never plain 500 text)."""
+    try:
+        out = fn(*args, **kwargs)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"{type(e).__name__}: {e}",
+        ) from e
+    if isinstance(out, dict) and out.get("ok") is False:
+        raise HTTPException(status_code=503, detail=out)
+    return out
+
+
 @app.get("/api/scenario/faker-profile")
 async def api_scenario_faker_profile():
     return scenario.build_faker_customer_bundle()
@@ -4456,7 +5691,8 @@ class ScenarioCustomOrderRequest(BaseModel):
 @app.post("/api/scenario/order/custom")
 async def api_scenario_order_custom(req: ScenarioCustomOrderRequest):
     cass, _ = get_hub_cassandra_handles(get_runtime_config())
-    return scenario.op_place_order(
+    return _scenario_api(
+        scenario.op_place_order,
         req.lines_count,
         cassandra_session=cass,
         customer_email=req.customer_email,
@@ -4486,25 +5722,27 @@ async def api_scenario_seed(count: int = 24, suppliers: int = 10):
 
 @app.post("/api/scenario/pipeline/mongo-sync")
 async def api_scenario_mongo_sync():
-    return scenario.op_pipeline_mongo_to_postgres_and_kafka()
+    return _scenario_api(scenario.op_pipeline_mongo_to_postgres_and_kafka)
 
 
 @app.post("/api/scenario/order")
 async def api_scenario_order():
     cass, _ = get_hub_cassandra_handles(get_runtime_config())
-    return scenario.op_place_order(cassandra_session=cass)
+    return _scenario_api(scenario.op_place_order, cassandra_session=cass)
 
 
 @app.post("/api/scenario/pipeline/fulfill")
 async def api_scenario_fulfill():
     cass, _ = get_hub_cassandra_handles(get_runtime_config())
-    return scenario.op_pipeline_postgres_to_fulfillment_and_kafka(cass)
+    return _scenario_api(
+        scenario.op_pipeline_postgres_to_fulfillment_and_kafka, cass
+    )
 
 
 @app.post("/api/scenario/pipeline/ship")
 async def api_scenario_ship():
     cass, _ = get_hub_cassandra_handles(get_runtime_config())
-    return scenario.op_pipeline_fulfilled_to_shipments(cass)
+    return _scenario_api(scenario.op_pipeline_fulfilled_to_shipments, cass)
 
 
 @app.get("/api/scenario/view/{store}")
@@ -4526,6 +5764,8 @@ async def api_scenario_view(store: str):
             return scenario.fetch_view_kafka_meta()
         if key == "mssql":
             return scenario.fetch_view_mssql()
+        if key == "oracle":
+            return scenario.fetch_view_oracle()
     except Exception as e:
         raise HTTPException(500, str(e)) from e
     raise HTTPException(404, f"unknown store: {store}")

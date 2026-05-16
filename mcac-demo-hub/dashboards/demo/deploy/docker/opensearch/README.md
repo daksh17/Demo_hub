@@ -86,9 +86,17 @@ curl -s "http://localhost:9200/demo-docs/_search?pretty"
 
 Then open **Dashboards** at http://localhost:5601 and create an index pattern for **`demo-docs`**.
 
+## Workload generator (`hub-workload`)
+
+The hub UI **Workload** page bulk-indexes into **`hub-workload`**. Large **payload_kb × total_records** spikes heap and can OOM a **512m** JVM (pod exit code 137 / `Killed` in logs).
+
+**Demo defaults (Compose + K8s):** **1g** heap (`OPENSEARCH_JAVA_OPTS`), **~2.5Gi** cgroup limit on K8s, hub **`OPENSEARCH_BULK_MAX_BYTES=24MiB`** and **50ms** pause between bulk requests. Tune on the hub Deployment: `OPENSEARCH_BULK_MAX_BYTES`, `OPENSEARCH_WORKLOAD_INTER_BULK_SLEEP_MS` (set `0` to disable throttle).
+
+If OpenSearch still dies under sustained load, lower **payload_kb** / **batch size**, uncheck OpenSearch for a run, or raise heap (e.g. `-Xms2g -Xmx2g`) and matching pod `limits.memory`.
+
 ## Data
 
-Persistent volume **`opensearch_data`**.
+Persistent volume **`opensearch_data`** (Compose). Kubernetes uses **`emptyDir`** on the OpenSearch Deployment (data lost on pod delete).
 
 ## Grafana (import by dashboard ID)
 

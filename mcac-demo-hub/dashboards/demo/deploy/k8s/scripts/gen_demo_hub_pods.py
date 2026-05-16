@@ -150,11 +150,13 @@ ENV_BY_SERVICE: dict[str, list[tuple[str, str]]] = {
         ("CASSANDRA_WORKLOAD_REQUEST_TIMEOUT_SECONDS", "300"),
         ("CASSANDRA_WORKLOAD_INTER_BATCH_SLEEP_MS", "25"),
         ("CASSANDRA_WORKLOAD_WRITE_RETRIES", "3"),
+        ("CASSANDRA_REQUEST_TIMEOUT_SECONDS", "120"),
+        ("CASSANDRA_MAX_SCHEMA_AGREEMENT_WAIT_SECONDS", "120"),
     ],
 }
 
 OPENSEARCH_ENV: list[tuple[str, str]] = [
-    ("OPENSEARCH_JAVA_OPTS", "-Xms512m -Xmx512m -XX:MaxDirectMemorySize=256m"),
+    ("OPENSEARCH_JAVA_OPTS", "-Xms1g -Xmx1g -XX:MaxDirectMemorySize=512m"),
     ("DISABLE_SECURITY_PLUGIN", "true"),
     ("DISABLE_INSTALL_DEMO_CONFIG", "true"),
 ]

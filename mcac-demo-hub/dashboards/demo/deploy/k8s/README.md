@@ -26,8 +26,11 @@ The cluster **cannot pull** these names from Docker Hub. Build them with Docker 
 | **`mcac-demo/mssql-tools:22.04`** | **`mssql-demo-bootstrap`** Job (`sqlcmd`, schema + `register-mssql-connectors.sh`) | [`deploy/k8s/scripts/build-mssql-tools-image.sh`](scripts/build-mssql-tools-image.sh) |
 | **`demo-hub/nodetool-exporter:latest`** | Scrapes `nodetool` metrics | `docker build -t demo-hub/nodetool-exporter:latest -f deploy/docker/nodetool-exporter/Dockerfile deploy/docker/nodetool-exporter` |
 | **`mcac-demo/postgresql-repmgr:16.6.0`** | Bitnami-style Postgres + repmgr (primary/replicas) | See **`build-all-custom-images.sh`** step 6 |
+| **`demo-hub/demo-tools:latest`** | Client toolbox pod (`psql`, `mongosh`, `cqlsh`, `redis-cli`, `curl`, `opensearch-cli`, `ora2pg`) | [`deploy/k8s/scripts/build-demo-tools-image.sh`](scripts/build-demo-tools-image.sh) |
 
-**Public images** (no local build): **`mcr.microsoft.com/mssql/server:2022-CU14-ubuntu-22.04`** (publisher + subscriber), **`awaragi/prometheus-mssql-exporter`**.
+**Public images** (no local build): **`mcr.microsoft.com/mssql/server:2022-CU14-ubuntu-22.04`** (publisher + subscriber), **`gvenzl/oracle-free:23-full-faststart`** (Oracle 23c Free PDB `FREEPDB1`; bootstrap Job `oracle-demo-bootstrap`), **`ghcr.io/iamseth/oracledb_exporter:0.5.0`**, **`awaragi/prometheus-mssql-exporter`**.
+
+**Oracle bootstrap note:** pods in `demo-hub` inherit `ORACLE_PORT=tcp://…` from the `oracle` Service. Scripts use **`ORACLE_LISTEN_PORT=1521`** instead — see [`deploy/docker/oracle/README.md`](../docker/oracle/README.md).
 
 **One command** (runs all custom builds):
 
@@ -84,33 +87,34 @@ ClusterIPs are **not** on `127.0.0.1` until you forward. In a **second terminal*
 
 Leave it running. Defaults map **localhost** ports to services/pods in **`demo-hub`** (see script header for **`SKIP_PROMETHEUS=1`** if Prometheus is down, **`SKIP_MSSQL=1`** if SQL Server forwards fail).
 
-**Override local ports** (host already using 9042, 5432, …):
+**Local ports (K8s defaults)** use the **16xxx–19xxx** range so they do not clash with **Docker Compose** host ports (Postgres **15432–15434**, Redis **6379**, Mongo **27025**, hub **8888**, OpenSearch **9200**, MSSQL **14331–14332**) or OS services on **5432** / **27017** / **1433**. Override any **`LOCAL_*`** variable before starting the script.
 
-| Environment variable | Default | Remote target |
-|---------------------|---------|---------------|
-| **`LOCAL_PG_PORT`** | 5432 | `svc/postgresql-primary:5432` |
-| **`LOCAL_PG_REPLICA_1_PORT`** | 5433 | `svc/postgresql-replica-1:5432` |
-| **`LOCAL_PG_REPLICA_2_PORT`** | 5434 | `svc/postgresql-replica-2:5432` |
-| **`LOCAL_CQL_PORT`** | 9042 | **`pod/cassandra-0:9042`** (stable coordinator) |
-| **`LOCAL_MONGO_PORT`** | 27017 | `svc/mongo-mongos1:27017` |
-| **`LOCAL_REDIS_PORT`** | 6379 | `svc/redis:6379` |
-| **`LOCAL_GRAFANA_PORT`** | 3000 | `svc/grafana:3000` |
-| **`LOCAL_PROM_PORT`** | 9090 | `svc/prometheus:9090` |
-| **`LOCAL_HUB_UI_PORT`** | 8888 | `svc/hub-demo-ui:8888` |
-| **`LOCAL_KAFKA_CONNECT_PORT`** | 8083 | `svc/kafka-connect:8083` |
-| **`LOCAL_KAFKA_BROKER_PORT`** | 9092 | `svc/kafka:9092` (broker for Kafka UI / clients; **`SKIP_KAFKA_BROKER=1`** if Compose Kafka already binds **9092**) |
-| **`LOCAL_TRINO_PORT`** | 8088 | `svc/trino:8080` (coordinator UI; use **`SKIP_TRINO=1`** if Trino is not deployed) |
-| **`LOCAL_OPENSEARCH_PORT`** | 9200 | `svc/opensearch:9200` |
-| **`LOCAL_OS_DASHBOARDS_PORT`** | 5601 | `svc/opensearch-dashboards:5601` |
-| **`LOCAL_VAULT_PORT`** | 8200 | `svc/vault:8200` |
-| **`LOCAL_MSSQL_PUBLISHER_PORT`** | 14333 | `svc/mssql-publisher:1433` (localhost ↔ publisher; SA password matches Secret **`mssql-sa-password`**, default **`Demo_hub_Mssql_2025!`** — override echo with **`MSSQL_SA_PASSWORD_HINT`**) |
-| **`LOCAL_MSSQL_SUBSCRIBER_PORT`** | 14334 | `svc/mssql-subscriber:1433` (subscriber instance) |
+| Environment variable | K8s default (localhost) | Compose host (reference) | Remote target |
+|---------------------|-------------------------|--------------------------|---------------|
+| **`LOCAL_PG_PORT`** | **16432** | 15432 | `svc/postgresql-primary:5432` |
+| **`LOCAL_PG_REPLICA_1_PORT`** | **16433** | 15433 | `svc/postgresql-replica-1:5432` |
+| **`LOCAL_PG_REPLICA_2_PORT`** | **16434** | 15434 | `svc/postgresql-replica-2:5432` |
+| **`LOCAL_PG_LOGICAL_SUB_PORT`** | **16435** | — | `svc/postgres-sub:5432` |
+| **`LOCAL_REDIS_PORT`** | **16379** | 6379 | `svc/redis:6379` |
+| **`LOCAL_MONGO_PORT`** | **16217** | 27025 (mongos1) | `svc/mongo-mongos1:27017` |
+| **`LOCAL_MSSQL_PUBLISHER_PORT`** | **16331** | 14331 | `svc/mssql-publisher:1433` |
+| **`LOCAL_MSSQL_SUBSCRIBER_PORT`** | **16332** | 14332 | `svc/mssql-subscriber:1433` |
+| **`LOCAL_HUB_UI_PORT`** | **16888** | 8888 | `svc/hub-demo-ui:8888` |
+| **`LOCAL_OPENSEARCH_PORT`** | **19200** | 9200 | `svc/opensearch:9200` |
+| **`LOCAL_OS_DASHBOARDS_PORT`** | **15601** | 5601 | `svc/opensearch-dashboards:5601` |
+| **`LOCAL_CQL_PORT`** | **19042** | 19442 (cassandra-1) | **`pod/cassandra-0:9042`** |
+| **`LOCAL_KAFKA_BROKER_PORT`** | **19092** | 9092 | `svc/kafka:9092` (**`SKIP_KAFKA_BROKER=1`** if Compose Kafka uses **9092**) |
+| **`LOCAL_KAFKA_CONNECT_PORT`** | **18083** | 8083 | `svc/kafka-connect:8083` |
+| **`LOCAL_TRINO_PORT`** | **18088** | — | `svc/trino:8080` |
+| **`LOCAL_GRAFANA_PORT`** | **13000** | 3000 | `svc/grafana:3000` |
+| **`LOCAL_PROM_PORT`** | **19090** | 9090 | `svc/prometheus:9090` |
+| **`LOCAL_VAULT_PORT`** | **18200** | — | `svc/vault:8200` |
 
-Example — use **19042** on the host for CQL:
+Example — Postgres + hub after forward:
 
 ```bash
-LOCAL_CQL_PORT=19042 ./deploy/k8s/scripts/port-forward-demo-hub.sh
-# then: cqlsh 127.0.0.1 19042
+psql "postgresql://demo:demopass@127.0.0.1:16432/demo"
+open http://127.0.0.1:16888/scenario
 ```
 
 **`NS`** — different namespace: `NS=my-ns ./deploy/k8s/scripts/port-forward-demo-hub.sh` (stack must exist there).
@@ -378,6 +382,7 @@ If **`describe pod`** shows **`FailedScheduling`** and **`disk-pressure`** (or *
 
 - **Disk pressure:** Free space on the host (Docker/OrbStack disk, prune unused images/volumes). Until the taint clears, new pods may not schedule.
 - **Insufficient resources:** The demo requests a lot of RAM/CPU; a single small node cannot fit every pod. Free resources or run a subset of manifests.
+- **Many pods OOMKilled at once:** On OrbStack (~18Gi), uncapped workloads (Mongo, Prometheus, kafka-connect 8g heap) fight for RAM. Regenerate (`python3 deploy/k8s/scripts/gen_demo_hub_k8s.py`) and re-apply — the generator caps Mongo WiredTiger cache, hub/Prometheus/Grafana limits, and Connect heap for local K8s. Give OrbStack **≥20Gi** memory in Docker Desktop / OrbStack settings if possible.
 
 See **[Troubleshooting](#troubleshooting)** for stack-specific issues.
 
@@ -448,19 +453,20 @@ chmod +x deploy/k8s/scripts/port-forward-demo-hub.sh
 
 Then open or connect locally:
 
-| Service | URL / connection |
-|--------|-------------------|
-| **Grafana** | http://127.0.0.1:3000/ |
-| **Prometheus** | http://127.0.0.1:9090/ |
-| **Hub demo UI** | http://127.0.0.1:8888/ · **Faker + map → `scenario_orders`:** http://127.0.0.1:8888/scenario (step **3 · Place order**; `/faker-order` redirects here) |
-| **OpenSearch** (REST API) | http://127.0.0.1:9200/ |
-| **OpenSearch Dashboards** | http://127.0.0.1:5601/ (same URL the hub UI home page links to) |
-| **Postgres** | `psql "postgresql://demo:demopass@127.0.0.1:5432/demo"` |
-| **Cassandra** | `cqlsh 127.0.0.1 9042` |
-| **MongoDB (mongos)** | `mongosh "mongodb://127.0.0.1:27017/"` |
-| **Redis** | `redis-cli -h 127.0.0.1 -p 6379 -a demoredispass` (or URI `redis://:demoredispass@127.0.0.1:6379/0`) |
+| Service | URL / connection (K8s port-forward defaults) |
+|--------|------------------------------------------------|
+| **Grafana** | http://127.0.0.1:13000/ |
+| **Prometheus** | http://127.0.0.1:19090/ |
+| **Hub demo UI** | http://127.0.0.1:16888/ · **Scenario:** http://127.0.0.1:16888/scenario |
+| **OpenSearch** (REST API) | http://127.0.0.1:19200/ |
+| **OpenSearch Dashboards** | http://127.0.0.1:15601/ |
+| **Postgres** | `psql "postgresql://demo:demopass@127.0.0.1:16432/demo"` (superuser: `postgres` / `postgres`) |
+| **Cassandra** | `cqlsh 127.0.0.1 19042` |
+| **MongoDB (mongos)** | `mongosh "mongodb://127.0.0.1:16217/"` |
+| **Redis** | `redis-cli -h 127.0.0.1 -p 16379 -a demoredispass` |
+| **SQL Server publisher** | `sqlcmd -S 127.0.0.1,16331 -U sa -P 'Demo_hub_Mssql_2025!' -C` |
 
-If a port is already in use locally, override before running the script, e.g. `LOCAL_PROM_PORT=19090 LOCAL_GRAFANA_PORT=13000 LOCAL_REDIS_PORT=16379 ./deploy/k8s/scripts/port-forward-demo-hub.sh`. For OpenSearch use `LOCAL_OPENSEARCH_PORT` / `LOCAL_OS_DASHBOARDS_PORT` (defaults **9200** / **5601**). **Cassandra on the host:** set **`LOCAL_CQL_PORT`** (default **9042**); full **`LOCAL_*`** table: [Quick start, step 4](#4-port-forward-from-your-laptop).
+If a port is already in use, override **`LOCAL_*`** env vars (full table: [Quick start, step 4](#4-port-forward-from-your-laptop)).
 
 If **`kubectl port-forward`** prints **Connection refused** on **:9090** (often with **socat** in the message), the **Prometheus container is not listening** — usually **CrashLoopBackOff** or not **Ready**. Fix the pod (`kubectl logs deploy/prometheus -n demo-hub`), or temporarily skip that forward so other ports still work: **`SKIP_PROMETHEUS=1 ./deploy/k8s/scripts/port-forward-demo-hub.sh`**.
 

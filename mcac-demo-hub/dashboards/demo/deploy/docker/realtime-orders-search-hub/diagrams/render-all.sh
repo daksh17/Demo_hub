@@ -6,7 +6,7 @@ cd "$DIR"
 CLI="${MERMAID_CLI:-npx --yes @mermaid-js/mermaid-cli@11.4.0}"
 for f in 00-component-context 01-sequence-order-flow 02-flowchart-postgres-path \
          03-flowchart-mongo-path 04-flowchart-cassandra-redis-os 05-flowchart-mssql-path \
-         06-flowchart-multi-db-faker-connect-overview; do
+         06-flowchart-multi-db-faker-connect-overview 07-flowchart-oracle-path; do
   echo "Rendering ${f}.mmd -> ${f}.svg"
   if [[ "${f}" == "06-flowchart-multi-db-faker-connect-overview" ]]; then
     $CLI -i "${f}.mmd" -o "${f}.svg" -b transparent -w 2400

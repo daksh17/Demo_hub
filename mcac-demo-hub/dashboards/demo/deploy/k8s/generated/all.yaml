@@ -27,6 +27,8 @@ stringData:
   hub-postgres-logical-sub-admin-dsn: postgresql://postgres:postgres@postgres-sub:5432/postgres
   hub-redis-url: redis://:demoredispass@redis:6379/0
   mssql-sa-password: Demo_hub_Mssql_2025!
+  oracle-sys-password: Demo_hub_Oracle_2025!
+  oracle-demo-password: demopass
 ---
 
 apiVersion: v1
@@ -183,7 +185,9 @@ spec:
                           hub-postgres-logical-sub-dsn=postgresql://demo:demopass@postgres-sub:5432/demo \
                           hub-postgres-logical-sub-admin-dsn=postgresql://postgres:postgres@postgres-sub:5432/postgres \
                           hub-redis-url=redis://:demoredispass@redis:6379/0 \
-                          mssql-sa-password='Demo_hub_Mssql_2025!'
+                          mssql-sa-password='Demo_hub_Mssql_2025!' \
+                          oracle-sys-password='Demo_hub_Oracle_2025!' \
+                          oracle-demo-password=demopass
               vault kv put secret/demo-hub/kafka-connect/pg-source \
                           database.hostname=postgresql-primary \
                           database.port=5432 \
@@ -604,6 +608,19 @@ data:
             labels:
               mssql_role: subscriber
               mssql_cluster: demo-hub
+
+      # Oracle 23c Free (iamseth/oracledb_exporter — demo PDB FREEPDB1)
+      - job_name: "oracle_demo"
+        scrape_interval: 30s
+        scrape_timeout: 25s
+        metrics_path: /metrics
+        scheme: http
+        static_configs:
+          - targets:
+              - oracle-exporter:9161
+            labels:
+              oracle_cluster: demo-hub
+              oracle_service: FREEPDB1
 ---
 
 apiVersion: v1
@@ -665,6 +682,13 @@ spec:
           ports:
             - containerPort: 9090
               name: http
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "1536Mi"
+              cpu: "1"
       volumes:
         - name: cfg
           configMap:
@@ -8248,6 +8272,275 @@ data:
       "timezone": "browser",
       "title": "OpenSearch overview (demo)",
       "uid": "demo-opensearch",
+      "version": 1
+    }
+---
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-db-oracle-demo-overview-json
+  namespace: demo-hub
+  labels:
+    demo-hub.io/group: observability
+    app.kubernetes.io/part-of: demo-hub
+data:
+  oracle-demo-overview.json: |
+    {
+      "annotations": { "list": [] },
+      "description": "Oracle 23c Free demo (gvenzl/oracle-free) via iamseth/oracledb_exporter. Job oracle_demo; PDB FREEPDB1 user demo.",
+      "editable": true,
+      "gnetId": null,
+      "graphTooltip": 1,
+      "hideControls": false,
+      "id": null,
+      "links": [],
+      "refresh": "30s",
+      "rows": [
+        {
+          "collapse": false,
+          "collapsed": false,
+          "height": "300px",
+          "panels": [
+            {
+              "aliasColors": {},
+              "bars": false,
+              "dashLength": 10,
+              "dashes": false,
+              "datasource": "$PROMETHEUS_DS",
+              "fill": 1,
+              "fillGradient": 0,
+              "gridPos": { "h": 8, "w": 8, "x": 0, "y": 0 },
+              "id": 801,
+              "legend": { "alignAsTable": true, "avg": false, "current": true, "max": true, "min": false, "show": true, "values": true },
+              "lines": true,
+              "linewidth": 1,
+              "nullPointMode": "null",
+              "percentage": false,
+              "pointradius": 2,
+              "points": false,
+              "renderer": "flot",
+              "seriesOverrides": [],
+              "spaceLength": 10,
+              "stack": false,
+              "steppedLine": false,
+              "targets": [
+                {
+                  "expr": "oracledb_up{job=\"oracle_demo\"}",
+                  "format": "time_series",
+                  "intervalFactor": 2,
+                  "legendFormat": "{{instance}}",
+                  "refId": "A"
+                }
+              ],
+              "thresholds": [],
+              "title": "oracledb_up (scrape health)",
+              "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+              "type": "graph",
+              "xaxis": { "mode": "time", "show": true, "values": [] },
+              "yaxes": [
+                { "format": "short", "logBase": 1, "max": 1, "min": 0, "show": true },
+                { "format": "short", "logBase": 1, "show": false }
+              ]
+            },
+            {
+              "aliasColors": {},
+              "bars": false,
+              "dashLength": 10,
+              "dashes": false,
+              "datasource": "$PROMETHEUS_DS",
+              "fill": 1,
+              "fillGradient": 0,
+              "gridPos": { "h": 8, "w": 8, "x": 8, "y": 0 },
+              "id": 802,
+              "legend": { "alignAsTable": true, "avg": false, "current": true, "max": true, "min": false, "show": true, "values": true },
+              "lines": true,
+              "linewidth": 1,
+              "nullPointMode": "null",
+              "percentage": false,
+              "pointradius": 2,
+              "points": false,
+              "renderer": "flot",
+              "seriesOverrides": [],
+              "spaceLength": 10,
+              "stack": false,
+              "steppedLine": false,
+              "targets": [
+                {
+                  "expr": "oracledb_sessions_activity{job=\"oracle_demo\"}",
+                  "format": "time_series",
+                  "intervalFactor": 2,
+                  "legendFormat": "{{status}}",
+                  "refId": "A"
+                }
+              ],
+              "thresholds": [],
+              "title": "Session activity (oracledb_sessions_activity)",
+              "tooltip": { "shared": true, "sort": 2, "value_type": "individual" },
+              "type": "graph",
+              "xaxis": { "mode": "time", "show": true, "values": [] },
+              "yaxes": [
+                { "format": "short", "logBase": 1, "min": 0, "show": true },
+                { "format": "short", "logBase": 1, "show": false }
+              ]
+            },
+            {
+              "aliasColors": {},
+              "bars": false,
+              "dashLength": 10,
+              "dashes": false,
+              "datasource": "$PROMETHEUS_DS",
+              "fill": 1,
+              "fillGradient": 0,
+              "gridPos": { "h": 8, "w": 8, "x": 16, "y": 0 },
+              "id": 803,
+              "legend": { "alignAsTable": true, "avg": true, "current": true, "max": true, "min": false, "show": true, "values": true },
+              "lines": true,
+              "linewidth": 1,
+              "nullPointMode": "null",
+              "percentage": false,
+              "pointradius": 2,
+              "points": false,
+              "renderer": "flot",
+              "seriesOverrides": [],
+              "spaceLength": 10,
+              "stack": false,
+              "steppedLine": false,
+              "targets": [
+                {
+                  "expr": "rate(oracledb_activity_execute_count{job=\"oracle_demo\"}[5m])",
+                  "format": "time_series",
+                  "intervalFactor": 2,
+                  "legendFormat": "execute/s",
+                  "refId": "A"
+                }
+              ],
+              "thresholds": [],
+              "title": "SQL execute rate",
+              "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+              "type": "graph",
+              "xaxis": { "mode": "time", "show": true, "values": [] },
+              "yaxes": [
+                { "format": "short", "logBase": 1, "min": 0, "show": true },
+                { "format": "short", "logBase": 1, "show": false }
+              ]
+            },
+            {
+              "aliasColors": {},
+              "bars": false,
+              "dashLength": 10,
+              "dashes": false,
+              "datasource": "$PROMETHEUS_DS",
+              "fill": 1,
+              "fillGradient": 0,
+              "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+              "id": 804,
+              "legend": { "alignAsTable": true, "avg": false, "current": true, "max": true, "min": false, "show": true, "values": true },
+              "lines": true,
+              "linewidth": 1,
+              "nullPointMode": "null",
+              "percentage": false,
+              "pointradius": 2,
+              "points": false,
+              "renderer": "flot",
+              "seriesOverrides": [],
+              "spaceLength": 10,
+              "stack": false,
+              "steppedLine": false,
+              "targets": [
+                {
+                  "expr": "oracledb_tablespace_used_percent{job=\"oracle_demo\"}",
+                  "format": "time_series",
+                  "intervalFactor": 2,
+                  "legendFormat": "{{tablespace}}",
+                  "refId": "A"
+                }
+              ],
+              "thresholds": [],
+              "title": "Tablespace used %",
+              "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+              "type": "graph",
+              "xaxis": { "mode": "time", "show": true, "values": [] },
+              "yaxes": [
+                { "format": "percent", "logBase": 1, "max": 100, "min": 0, "show": true },
+                { "format": "short", "logBase": 1, "show": false }
+              ]
+            },
+            {
+              "aliasColors": {},
+              "bars": false,
+              "dashLength": 10,
+              "dashes": false,
+              "datasource": "$PROMETHEUS_DS",
+              "fill": 1,
+              "fillGradient": 0,
+              "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+              "id": 805,
+              "legend": { "alignAsTable": true, "avg": true, "current": false, "max": true, "min": false, "show": true, "values": true },
+              "lines": true,
+              "linewidth": 1,
+              "nullPointMode": "null",
+              "percentage": false,
+              "pointradius": 2,
+              "points": false,
+              "renderer": "flot",
+              "seriesOverrides": [],
+              "spaceLength": 10,
+              "stack": false,
+              "steppedLine": false,
+              "targets": [
+                {
+                  "expr": "rate(oracledb_wait_time_user_io{job=\"oracle_demo\"}[5m])",
+                  "format": "time_series",
+                  "intervalFactor": 2,
+                  "legendFormat": "user_io wait/s",
+                  "refId": "A"
+                }
+              ],
+              "thresholds": [],
+              "title": "User I/O wait time rate",
+              "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+              "type": "graph",
+              "xaxis": { "mode": "time", "show": true, "values": [] },
+              "yaxes": [
+                { "format": "short", "logBase": 1, "min": 0, "show": true },
+                { "format": "short", "logBase": 1, "show": false }
+              ]
+            }
+          ],
+          "repeat": null,
+          "showTitle": true,
+          "title": "Oracle (demo hub, oracledb_exporter)",
+          "titleSize": "h6",
+          "type": "row"
+        }
+      ],
+      "schemaVersion": 14,
+      "style": "dark",
+      "tags": ["oracle", "demo"],
+      "templating": {
+        "list": [
+          {
+            "current": { "text": "prometheus", "value": "prometheus" },
+            "hide": 2,
+            "label": null,
+            "name": "PROMETHEUS_DS",
+            "options": [],
+            "query": "prometheus",
+            "refresh": 1,
+            "regex": "",
+            "type": "datasource"
+          }
+        ]
+      },
+      "time": { "from": "now-1h", "to": "now" },
+      "timepicker": {
+        "refresh_intervals": ["5s", "10s", "30s", "1m", "5m", "15m", "30m", "1h"],
+        "time_options": ["5m", "15m", "1h", "6h", "12h", "24h"]
+      },
+      "timezone": "browser",
+      "title": "Oracle (demo hub)",
+      "uid": "demo-oracle",
       "version": 1
     }
 ---
@@ -18325,6 +18618,13 @@ spec:
           ports:
             - containerPort: 3000
               name: http
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "768Mi"
+              cpu: "500m"
       volumes:
         - name: grafana-ds
           configMap:
@@ -18366,6 +18666,11 @@ spec:
                   items:
                     - key: "opensearch-demo-overview.json"
                       path: "opensearch-demo-overview.json"
+              - configMap:
+                  name: grafana-db-oracle-demo-overview-json
+                  items:
+                    - key: "oracle-demo-overview.json"
+                      path: "oracle-demo-overview.json"
               - configMap:
                   name: grafana-db-overview-json
                   items:
@@ -18443,6 +18748,13 @@ spec:
               value: "yes"
             - name: ZOO_LISTEN_ALLIPS_ENABLED
               value: "yes"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
           volumeMounts:
             - name: data
               mountPath: /bitnami/zookeeper
@@ -19070,12 +19382,15 @@ spec:
             - -c
             - |
               set -e
-              f=/opt/bitnami/postgresql/share/extension/repmgr.control
-              if [ ! -f "$f" ]; then
-                echo "Missing $f in image mcac-demo/postgresql-repmgr:16.6.0." >&2
-                echo "Rebuild: docker build --no-cache -t mcac-demo/postgresql-repmgr:16.6.0 -f deploy/docker/postgres-kafka/Dockerfile.repmgr deploy/docker/postgres-kafka" >&2
-                exit 1
-              fi
+              for f in \
+                /opt/bitnami/postgresql/share/extension/repmgr.control \
+                /opt/bitnami/postgresql/share/extension/pg_profile.control; do
+                if [ ! -f "$f" ]; then
+                  echo "Missing $f in image mcac-demo/postgresql-repmgr:16.6.0." >&2
+                  echo "Rebuild: docker build --no-cache -t mcac-demo/postgresql-repmgr:16.6.0 -f deploy/docker/postgres-kafka/Dockerfile.repmgr deploy/docker/postgres-kafka" >&2
+                  exit 1
+                fi
+              done
         - name: mcac-wal-archive-conf
           image: mcac-demo/postgresql-repmgr:16.6.0
           imagePullPolicy: IfNotPresent
@@ -19089,9 +19404,24 @@ spec:
               set -e
               conf_dir=/bitnami/postgresql/conf/conf.d
               mkdir -p "$conf_dir"
+              printf '%s\n' "cron.host = ''" > "$conf_dir/98-mcac-cron-host.conf"
               printf '%s\n' "archive_mode = ${MCAC_ARCHIVE_MODE}" \
                 "archive_command = '/opt/bitnami/scripts/mcac-wal-archive.sh %p %f'" \
                 > "$conf_dir/99-mcac-archive.conf"
+          volumeMounts:
+            - name: data
+              mountPath: /bitnami/postgresql
+        - name: mcac-pghba-local-demo
+          image: mcac-demo/postgresql-repmgr:16.6.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              if [ -f /docker-entrypoint-initdb.d/07-pg_hba-local-demo-postgres-trust.sh ]; then
+                /docker-entrypoint-initdb.d/07-pg_hba-local-demo-postgres-trust.sh
+              fi
           volumeMounts:
             - name: data
               mountPath: /bitnami/postgresql
@@ -19111,7 +19441,7 @@ spec:
             - name: POSTGRESQL_SHARED_PRELOAD_LIBRARIES
               value: "repmgr,pgaudit,pg_stat_statements,pg_cron"
             - name: POSTGRESQL_EXTRA_FLAGS
-              value: "-c wal_level=logical -c max_replication_slots=8 -c max_wal_senders=8 -c pg_stat_statements.max=10000 -c pg_stat_statements.track=all -c cron.database_name=postgres"
+              value: "-c wal_level=logical -c max_replication_slots=8 -c max_wal_senders=8 -c pg_stat_statements.max=10000 -c pg_stat_statements.track=all -c cron.database_name=postgres -c track_io_timing=on -c track_functions=all"
             - name: POSTGRESQL_REPLICATION_PASSWORD
               valueFrom:
                 secretKeyRef:
@@ -19125,6 +19455,13 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /bitnami/postgresql
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                  - /bin/bash
+                  - -lc
+                  - "set +e; for i in $(seq 1 90); do if [ -f /opt/bitnami/postgresql/conf/pg_hba.conf ] || [ -f /bitnami/postgresql/conf/pg_hba.conf ] || [ -f /bitnami/postgresql/data/pg_hba.conf ]; then /docker-entrypoint-initdb.d/07-pg_hba-local-demo-postgres-trust.sh; D=\"${PGDATA:-/bitnami/postgresql/data}\"; if /opt/bitnami/postgresql/bin/pg_ctl -D \"$D\" reload -s 2>/dev/null; then exit 0; fi; fi; sleep 1; done; exit 0"
           ports:
             - containerPort: 5432
               name: pg
@@ -19182,12 +19519,15 @@ spec:
             - -c
             - |
               set -e
-              f=/opt/bitnami/postgresql/share/extension/repmgr.control
-              if [ ! -f "$f" ]; then
-                echo "Missing $f in image mcac-demo/postgresql-repmgr:16.6.0." >&2
-                echo "Rebuild: docker build --no-cache -t mcac-demo/postgresql-repmgr:16.6.0 -f deploy/docker/postgres-kafka/Dockerfile.repmgr deploy/docker/postgres-kafka" >&2
-                exit 1
-              fi
+              for f in \
+                /opt/bitnami/postgresql/share/extension/repmgr.control \
+                /opt/bitnami/postgresql/share/extension/pg_profile.control; do
+                if [ ! -f "$f" ]; then
+                  echo "Missing $f in image mcac-demo/postgresql-repmgr:16.6.0." >&2
+                  echo "Rebuild: docker build --no-cache -t mcac-demo/postgresql-repmgr:16.6.0 -f deploy/docker/postgres-kafka/Dockerfile.repmgr deploy/docker/postgres-kafka" >&2
+                  exit 1
+                fi
+              done
         - name: mcac-wal-archive-conf
           image: mcac-demo/postgresql-repmgr:16.6.0
           imagePullPolicy: IfNotPresent
@@ -19201,9 +19541,24 @@ spec:
               set -e
               conf_dir=/bitnami/postgresql/conf/conf.d
               mkdir -p "$conf_dir"
+              printf '%s\n' "cron.host = ''" > "$conf_dir/98-mcac-cron-host.conf"
               printf '%s\n' "archive_mode = ${MCAC_ARCHIVE_MODE}" \
                 "archive_command = '/opt/bitnami/scripts/mcac-wal-archive.sh %p %f'" \
                 > "$conf_dir/99-mcac-archive.conf"
+          volumeMounts:
+            - name: data
+              mountPath: /bitnami/postgresql
+        - name: mcac-pghba-local-demo
+          image: mcac-demo/postgresql-repmgr:16.6.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              if [ -f /docker-entrypoint-initdb.d/07-pg_hba-local-demo-postgres-trust.sh ]; then
+                /docker-entrypoint-initdb.d/07-pg_hba-local-demo-postgres-trust.sh
+              fi
           volumeMounts:
             - name: data
               mountPath: /bitnami/postgresql
@@ -19223,7 +19578,7 @@ spec:
             - name: POSTGRESQL_SHARED_PRELOAD_LIBRARIES
               value: "repmgr,pgaudit,pg_stat_statements,pg_cron"
             - name: POSTGRESQL_EXTRA_FLAGS
-              value: "-c wal_level=replica -c primary_slot_name=pgdemo_phys_replica_1 -c pg_stat_statements.max=10000 -c pg_stat_statements.track=all -c cron.database_name=postgres"
+              value: "-c wal_level=replica -c primary_slot_name=pgdemo_phys_replica_1 -c pg_stat_statements.max=10000 -c pg_stat_statements.track=all -c cron.database_name=postgres -c track_io_timing=on -c track_functions=all"
             - name: POSTGRESQL_REPLICATION_PASSWORD
               valueFrom:
                 secretKeyRef:
@@ -19237,6 +19592,13 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /bitnami/postgresql
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                  - /bin/bash
+                  - -lc
+                  - "set +e; for i in $(seq 1 90); do if [ -f /opt/bitnami/postgresql/conf/pg_hba.conf ] || [ -f /bitnami/postgresql/conf/pg_hba.conf ] || [ -f /bitnami/postgresql/data/pg_hba.conf ]; then /docker-entrypoint-initdb.d/07-pg_hba-local-demo-postgres-trust.sh; D=\"${PGDATA:-/bitnami/postgresql/data}\"; if /opt/bitnami/postgresql/bin/pg_ctl -D \"$D\" reload -s 2>/dev/null; then exit 0; fi; fi; sleep 1; done; exit 0"
           ports:
             - containerPort: 5432
               name: pg
@@ -19294,12 +19656,15 @@ spec:
             - -c
             - |
               set -e
-              f=/opt/bitnami/postgresql/share/extension/repmgr.control
-              if [ ! -f "$f" ]; then
-                echo "Missing $f in image mcac-demo/postgresql-repmgr:16.6.0." >&2
-                echo "Rebuild: docker build --no-cache -t mcac-demo/postgresql-repmgr:16.6.0 -f deploy/docker/postgres-kafka/Dockerfile.repmgr deploy/docker/postgres-kafka" >&2
-                exit 1
-              fi
+              for f in \
+                /opt/bitnami/postgresql/share/extension/repmgr.control \
+                /opt/bitnami/postgresql/share/extension/pg_profile.control; do
+                if [ ! -f "$f" ]; then
+                  echo "Missing $f in image mcac-demo/postgresql-repmgr:16.6.0." >&2
+                  echo "Rebuild: docker build --no-cache -t mcac-demo/postgresql-repmgr:16.6.0 -f deploy/docker/postgres-kafka/Dockerfile.repmgr deploy/docker/postgres-kafka" >&2
+                  exit 1
+                fi
+              done
         - name: mcac-wal-archive-conf
           image: mcac-demo/postgresql-repmgr:16.6.0
           imagePullPolicy: IfNotPresent
@@ -19313,9 +19678,24 @@ spec:
               set -e
               conf_dir=/bitnami/postgresql/conf/conf.d
               mkdir -p "$conf_dir"
+              printf '%s\n' "cron.host = ''" > "$conf_dir/98-mcac-cron-host.conf"
               printf '%s\n' "archive_mode = ${MCAC_ARCHIVE_MODE}" \
                 "archive_command = '/opt/bitnami/scripts/mcac-wal-archive.sh %p %f'" \
                 > "$conf_dir/99-mcac-archive.conf"
+          volumeMounts:
+            - name: data
+              mountPath: /bitnami/postgresql
+        - name: mcac-pghba-local-demo
+          image: mcac-demo/postgresql-repmgr:16.6.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              if [ -f /docker-entrypoint-initdb.d/07-pg_hba-local-demo-postgres-trust.sh ]; then
+                /docker-entrypoint-initdb.d/07-pg_hba-local-demo-postgres-trust.sh
+              fi
           volumeMounts:
             - name: data
               mountPath: /bitnami/postgresql
@@ -19335,7 +19715,7 @@ spec:
             - name: POSTGRESQL_SHARED_PRELOAD_LIBRARIES
               value: "repmgr,pgaudit,pg_stat_statements,pg_cron"
             - name: POSTGRESQL_EXTRA_FLAGS
-              value: "-c wal_level=replica -c primary_slot_name=pgdemo_phys_replica_2 -c pg_stat_statements.max=10000 -c pg_stat_statements.track=all -c cron.database_name=postgres"
+              value: "-c wal_level=replica -c primary_slot_name=pgdemo_phys_replica_2 -c pg_stat_statements.max=10000 -c pg_stat_statements.track=all -c cron.database_name=postgres -c track_io_timing=on -c track_functions=all"
             - name: POSTGRESQL_REPLICATION_PASSWORD
               valueFrom:
                 secretKeyRef:
@@ -19349,6 +19729,13 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /bitnami/postgresql
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                  - /bin/bash
+                  - -lc
+                  - "set +e; for i in $(seq 1 90); do if [ -f /opt/bitnami/postgresql/conf/pg_hba.conf ] || [ -f /bitnami/postgresql/conf/pg_hba.conf ] || [ -f /bitnami/postgresql/data/pg_hba.conf ]; then /docker-entrypoint-initdb.d/07-pg_hba-local-demo-postgres-trust.sh; D=\"${PGDATA:-/bitnami/postgresql/data}\"; if /opt/bitnami/postgresql/bin/pg_ctl -D \"$D\" reload -s 2>/dev/null; then exit 0; fi; fi; sleep 1; done; exit 0"
           ports:
             - containerPort: 5432
               name: pg
@@ -19478,6 +19865,9 @@ data:
     fi
     psql -h "$PGHOST" -U postgres -d repmgr -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS repmgr;"
     psql -h "$PGHOST" -U postgres -d postgres -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS pg_cron;"
+    psql -h "$PGHOST" -U postgres -d postgres -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS dblink;"
+    psql -h "$PGHOST" -U postgres -d postgres -v ON_ERROR_STOP=1 -c "CREATE SCHEMA IF NOT EXISTS profile;"
+    psql -h "$PGHOST" -U postgres -d postgres -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS pg_profile SCHEMA profile;"
     psql -h "$PGHOST" -U postgres -d demo -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS pg_repack;"
     psql -h "$PGHOST" -U postgres -d demo -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS pg_partman;"
     psql -h "$PGHOST" -U postgres -d demo -v ON_ERROR_STOP=1 -f /scripts/04-scenario-hub-schema-indexes.sql
@@ -19591,16 +19981,58 @@ data:
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     
+    ALTER TABLE scenario_orders ADD COLUMN IF NOT EXISTS ship_lat DOUBLE PRECISION;
+    ALTER TABLE scenario_orders ADD COLUMN IF NOT EXISTS ship_lon DOUBLE PRECISION;
+    ALTER TABLE scenario_orders ADD COLUMN IF NOT EXISTS ship_label TEXT;
+    
+    CREATE TABLE IF NOT EXISTS scenario_customers (
+      customer_email TEXT PRIMARY KEY,
+      customer_name TEXT,
+      loyalty_tier TEXT NOT NULL DEFAULT 'standard',
+      orders_placed INT NOT NULL DEFAULT 0,
+      lifetime_cents BIGINT NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    
+    CREATE TABLE IF NOT EXISTS scenario_payments (
+      id SERIAL PRIMARY KEY,
+      order_ref TEXT NOT NULL REFERENCES scenario_orders(order_ref) ON DELETE CASCADE,
+      payment_method TEXT NOT NULL,
+      amount_cents INT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'captured',
+      processor_ref TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    
+    CREATE TABLE IF NOT EXISTS scenario_shipments (
+      id SERIAL PRIMARY KEY,
+      order_ref TEXT NOT NULL REFERENCES scenario_orders(order_ref) ON DELETE CASCADE,
+      carrier TEXT NOT NULL,
+      tracking_id TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'label_created',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE(order_ref)
+    );
+    
     ALTER TABLE public.scenario_catalog_mirror OWNER TO demo;
     ALTER TABLE public.scenario_orders OWNER TO demo;
     ALTER TABLE public.scenario_fulfillment_lines OWNER TO demo;
+    ALTER TABLE public.scenario_customers OWNER TO demo;
+    ALTER TABLE public.scenario_payments OWNER TO demo;
+    ALTER TABLE public.scenario_shipments OWNER TO demo;
     
     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.scenario_catalog_mirror TO demo;
     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.scenario_orders TO demo;
     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.scenario_fulfillment_lines TO demo;
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.scenario_customers TO demo;
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.scenario_payments TO demo;
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.scenario_shipments TO demo;
     GRANT SELECT ON TABLE public.scenario_catalog_mirror TO replicator;
     GRANT SELECT ON TABLE public.scenario_orders TO replicator;
     GRANT SELECT ON TABLE public.scenario_fulfillment_lines TO replicator;
+    GRANT SELECT ON TABLE public.scenario_customers TO replicator;
+    GRANT SELECT ON TABLE public.scenario_payments TO replicator;
+    GRANT SELECT ON TABLE public.scenario_shipments TO replicator;
     
     CREATE EXTENSION IF NOT EXISTS pg_trgm;
     
@@ -19622,6 +20054,15 @@ data:
     CREATE INDEX IF NOT EXISTS idx_scenario_fulfill_sku ON scenario_fulfillment_lines (sku);
     CREATE INDEX IF NOT EXISTS idx_scenario_fulfill_order_sku ON scenario_fulfillment_lines (order_ref, sku);
     CREATE INDEX IF NOT EXISTS idx_scenario_fulfill_brin_created ON scenario_fulfillment_lines USING BRIN (created_at);
+    
+    CREATE INDEX IF NOT EXISTS idx_scenario_customers_tier ON scenario_customers (loyalty_tier);
+    CREATE INDEX IF NOT EXISTS idx_scenario_customers_updated ON scenario_customers (updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_scenario_payments_order ON scenario_payments (order_ref);
+    CREATE INDEX IF NOT EXISTS idx_scenario_payments_method ON scenario_payments (payment_method, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_scenario_payments_brin_created ON scenario_payments USING BRIN (created_at);
+    CREATE INDEX IF NOT EXISTS idx_scenario_shipments_carrier ON scenario_shipments (carrier);
+    CREATE INDEX IF NOT EXISTS idx_scenario_shipments_tracking ON scenario_shipments (tracking_id);
+    CREATE INDEX IF NOT EXISTS idx_scenario_shipments_brin_created ON scenario_shipments USING BRIN (created_at);
 ---
 
 apiVersion: batch/v1
@@ -19878,6 +20319,15 @@ spec:
             - "--replSet"
             - "configReplSet"
             - "--bind_ip_all"
+            - "--wiredTigerCacheSizeGB"
+            - "0.25"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "1280Mi"
+              cpu: "1"
           volumeMounts:
             - name: data
               mountPath: /data/db
@@ -19944,6 +20394,15 @@ spec:
             - "--replSet"
             - "configReplSet"
             - "--bind_ip_all"
+            - "--wiredTigerCacheSizeGB"
+            - "0.25"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "1280Mi"
+              cpu: "1"
           volumeMounts:
             - name: data
               mountPath: /data/db
@@ -20010,6 +20469,15 @@ spec:
             - "--replSet"
             - "configReplSet"
             - "--bind_ip_all"
+            - "--wiredTigerCacheSizeGB"
+            - "0.25"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "1280Mi"
+              cpu: "1"
           volumeMounts:
             - name: data
               mountPath: /data/db
@@ -20078,6 +20546,15 @@ spec:
             - "--replSet"
             - "tic"
             - "--bind_ip_all"
+            - "--wiredTigerCacheSizeGB"
+            - "0.25"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "1280Mi"
+              cpu: "1"
           volumeMounts:
             - name: data
               mountPath: /data/db
@@ -20147,6 +20624,15 @@ spec:
             - "--replSet"
             - "tac"
             - "--bind_ip_all"
+            - "--wiredTigerCacheSizeGB"
+            - "0.25"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "1280Mi"
+              cpu: "1"
           volumeMounts:
             - name: data
               mountPath: /data/db
@@ -20216,6 +20702,15 @@ spec:
             - "--replSet"
             - "toe"
             - "--bind_ip_all"
+            - "--wiredTigerCacheSizeGB"
+            - "0.25"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "1280Mi"
+              cpu: "1"
           volumeMounts:
             - name: data
               mountPath: /data/db
@@ -20280,6 +20775,13 @@ spec:
             - "--configdb"
             - "configReplSet/mongo-config1:27017,mongo-config2:27017,mongo-config3:27017"
             - "--bind_ip_all"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "768Mi"
+              cpu: "500m"
           ports:
             - containerPort: 27017
               name: mongo
@@ -20337,6 +20839,13 @@ spec:
             - "--configdb"
             - "configReplSet/mongo-config1:27017,mongo-config2:27017,mongo-config3:27017"
             - "--bind_ip_all"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "768Mi"
+              cpu: "500m"
           ports:
             - containerPort: 27017
               name: mongo
@@ -20394,6 +20903,13 @@ spec:
             - "--configdb"
             - "configReplSet/mongo-config1:27017,mongo-config2:27017,mongo-config3:27017"
             - "--bind_ip_all"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "768Mi"
+              cpu: "500m"
           ports:
             - containerPort: 27017
               name: mongo
@@ -20431,6 +20947,8 @@ data:
   chain.sh: |
     #!/usr/bin/env bash
     set -euo pipefail
+    # mongosh runs on Node; cap heap so the Job is less likely to OOM on small clusters.
+    export NODE_OPTIONS="${NODE_OPTIONS:--max-old-space-size=1024}"
     bash /scripts/init-config-replica-set.sh
     bash /scripts/init-shard-replica-sets.sh
     bash /scripts/add-shards.sh
@@ -20531,15 +21049,31 @@ data:
       mongosh "mongodb://${host}:27017" --quiet --eval '
     const rsName = "'"${rsname}"'";
     const h = "'"${host}:27017"'";
-    const ok = (() => {
+    const hasPrimary = (() => {
       try {
-        return rs.status().ok === 1;
+        const s = rs.status();
+        return s.ok === 1 && s.members.some((m) => m.stateStr === "PRIMARY");
       } catch (e) {
         return false;
       }
     })();
-    if (!ok) {
-      rs.initiate({ _id: rsName, members: [{ _id: 0, host: h }] });
+    if (!hasPrimary) {
+      let initiated = false;
+      try {
+        rs.initiate({ _id: rsName, members: [{ _id: 0, host: h }] });
+        initiated = true;
+      } catch (e) {
+        if (!String(e).includes("already initialized")) throw e;
+      }
+      if (!initiated) {
+      // Pod restart with stale local metadata: config exists but node is not PRIMARY (mongos code 133).
+        const cfg = db.adminCommand({ replSetGetConfig: 1 }).config;
+        if (cfg && cfg.members && cfg.members.length) {
+          cfg.version = (cfg.version || 1) + 1;
+          cfg.members[0].host = h;
+          db.adminCommand({ replSetReconfig: cfg, force: true });
+        }
+      }
     }
     '
       echo "waiting for PRIMARY on ${rsname}..."
@@ -20995,6 +21529,16 @@ spec:
           command:
             - "bash"
             - "/scripts/chain.sh"
+          env:
+            - name: NODE_OPTIONS
+              value: "--max-old-space-size=1024"
+          resources:
+            requests:
+              memory: "768Mi"
+              cpu: "250m"
+            limits:
+              memory: "2Gi"
+              cpu: "2"
           volumeMounts:
             - name: scripts
               mountPath: /scripts
@@ -21743,6 +22287,603 @@ spec:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
+  name: oracle
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/name: oracle
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: oracle
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: oracle
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: oracle
+        app.kubernetes.io/part-of: demo-hub
+        demo-hub.io/group: oracle
+    spec:
+      containers:
+        - name: oracle
+          image: gvenzl/oracle-free:23-full-faststart
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: APP_USER
+              value: "demo"
+            - name: ORACLE_DISABLE_ASYNCH_IO
+              value: "true"
+            - name: ORACLE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: oracle-sys-password
+            - name: APP_USER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: oracle-demo-password
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "6Gi"
+              cpu: "2"
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+          ports:
+            - containerPort: 1521
+              name: oracle
+          readinessProbe:
+            tcpSocket:
+              port: 1521
+            initialDelaySeconds: 300
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 60
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 4Gi
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: oracle
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/name: oracle
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: oracle
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: oracle
+  ports:
+    - port: 1521
+      targetPort: 1521
+      name: oracle
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oracle-exporter
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/name: oracle-exporter
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: oracle
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: oracle-exporter
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: oracle-exporter
+        app.kubernetes.io/part-of: demo-hub
+        demo-hub.io/group: oracle
+    spec:
+      initContainers:
+        - name: wait-oracle
+          image: alpine:3.19
+          command:
+            - /bin/sh
+            - -c
+            - |
+              apk add --no-cache netcat-openbsd >/dev/null
+              for i in $(seq 1 180); do
+                if nc -z -w 2 oracle.demo-hub.svc.cluster.local 1521 2>/dev/null; then exit 0; fi
+                sleep 3
+              done
+              echo "timeout waiting for oracle.demo-hub.svc.cluster.local:1521" >&2
+              exit 1
+      containers:
+        - name: oracle-exporter
+          image: ghcr.io/iamseth/oracledb_exporter:0.5.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: DATA_SOURCE_NAME
+              value: "oracle://demo:demopass@oracle:1521/FREEPDB1"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          ports:
+            - containerPort: 9161
+              name: metrics
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: oracle-exporter
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/name: oracle-exporter
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: oracle
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: oracle-exporter
+  ports:
+    - port: 9161
+      targetPort: 9161
+      name: metrics
+---
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: oracle-scripts
+  namespace: demo-hub
+  labels:
+    demo-hub.io/group: oracle
+    app.kubernetes.io/part-of: demo-hub
+data:
+  01-demo-schema.sql: |
+    -- Demo hub Oracle schema (FREEPDB1 / user DEMO): tables, PL/SQL, triggers, views, MVs.
+    WHENEVER SQLERROR EXIT SQL.SQLCODE
+    
+    BEGIN
+      EXECUTE IMMEDIATE 'DROP MATERIALIZED VIEW hub_demo_mv_summary';
+    EXCEPTION
+      WHEN OTHERS THEN
+        IF SQLCODE != -12003 THEN RAISE; END IF;
+    END;
+    /
+    
+    BEGIN
+      EXECUTE IMMEDIATE 'DROP VIEW hub_demo_items_v';
+    EXCEPTION
+      WHEN OTHERS THEN
+        IF SQLCODE != -942 THEN RAISE; END IF;
+    END;
+    /
+    
+    BEGIN
+      EXECUTE IMMEDIATE 'DROP TRIGGER hub_demo_items_bu';
+    EXCEPTION
+      WHEN OTHERS THEN
+        IF SQLCODE != -4080 THEN RAISE; END IF;
+    END;
+    /
+    
+    BEGIN
+      EXECUTE IMMEDIATE 'DROP TABLE hub_demo_items CASCADE CONSTRAINTS PURGE';
+    EXCEPTION
+      WHEN OTHERS THEN
+        IF SQLCODE != -942 THEN RAISE; END IF;
+    END;
+    /
+    
+    BEGIN
+      EXECUTE IMMEDIATE 'DROP SEQUENCE hub_demo_seq';
+    EXCEPTION
+      WHEN OTHERS THEN
+        IF SQLCODE != -2289 THEN RAISE; END IF;
+    END;
+    /
+    
+    BEGIN
+      EXECUTE IMMEDIATE 'DROP TYPE hub_item_tab';
+    EXCEPTION
+      WHEN OTHERS THEN
+        IF SQLCODE != -4043 THEN RAISE; END IF;
+    END;
+    /
+    
+    BEGIN
+      EXECUTE IMMEDIATE 'DROP TYPE hub_item_rec FORCE';
+    EXCEPTION
+      WHEN OTHERS THEN
+        IF SQLCODE != -4043 THEN RAISE; END IF;
+    END;
+    /
+    
+    CREATE TABLE hub_demo_items (
+      id NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+      sku VARCHAR2(128) NOT NULL,
+      title VARCHAR2(512) NOT NULL,
+      category VARCHAR2(256),
+      unit_price_cents NUMBER(12) DEFAULT 0 NOT NULL,
+      stock_units NUMBER(12) DEFAULT 0 NOT NULL,
+      updated_at TIMESTAMP(6) DEFAULT SYSTIMESTAMP NOT NULL,
+      CONSTRAINT hub_demo_items_sku_uk UNIQUE (sku)
+    );
+    
+    CREATE SEQUENCE hub_demo_seq START WITH 1000 INCREMENT BY 1 NOCACHE;
+    
+    CREATE OR REPLACE TYPE hub_item_rec AS OBJECT (
+      sku VARCHAR2(128),
+      title VARCHAR2(512),
+      price_cents NUMBER
+    );
+    /
+    
+    CREATE OR REPLACE TYPE hub_item_tab AS TABLE OF hub_item_rec;
+    /
+    
+    CREATE OR REPLACE PACKAGE hub_demo_pkg AS
+      FUNCTION next_sku_prefix RETURN VARCHAR2;
+      PROCEDURE bump_updated(p_id IN NUMBER);
+      FUNCTION catalog_count RETURN NUMBER;
+    END hub_demo_pkg;
+    /
+    
+    CREATE OR REPLACE PACKAGE BODY hub_demo_pkg AS
+      FUNCTION next_sku_prefix RETURN VARCHAR2 IS
+      BEGIN
+        RETURN 'SKU-' || hub_demo_seq.NEXTVAL;
+      END next_sku_prefix;
+    
+      PROCEDURE bump_updated(p_id IN NUMBER) IS
+      BEGIN
+        UPDATE hub_demo_items SET updated_at = SYSTIMESTAMP WHERE id = p_id;
+      END bump_updated;
+    
+      FUNCTION catalog_count RETURN NUMBER IS
+        c NUMBER;
+      BEGIN
+        SELECT COUNT(*) INTO c FROM hub_demo_items;
+        RETURN c;
+      END catalog_count;
+    END hub_demo_pkg;
+    /
+    
+    CREATE OR REPLACE FUNCTION hub_demo_price_dollars(p_cents IN NUMBER) RETURN NUMBER DETERMINISTIC IS
+    BEGIN
+      RETURN ROUND(p_cents / 100, 2);
+    END hub_demo_price_dollars;
+    /
+    
+    CREATE OR REPLACE PROCEDURE hub_demo_upsert_item(
+      p_sku IN VARCHAR2,
+      p_title IN VARCHAR2,
+      p_cents IN NUMBER,
+      p_category IN VARCHAR2 DEFAULT NULL
+    ) IS
+    BEGIN
+      MERGE INTO hub_demo_items t
+      USING (
+        SELECT p_sku sku, p_title title, p_cents cents, p_category category FROM dual
+      ) s
+      ON (t.sku = s.sku)
+      WHEN MATCHED THEN
+        UPDATE SET
+          title = s.title,
+          unit_price_cents = s.cents,
+          category = NVL(s.category, t.category),
+          updated_at = SYSTIMESTAMP
+      WHEN NOT MATCHED THEN
+        INSERT (sku, title, unit_price_cents, category)
+        VALUES (s.sku, s.title, s.cents, s.category);
+    END hub_demo_upsert_item;
+    /
+    
+    CREATE OR REPLACE TRIGGER hub_demo_items_bu
+    BEFORE UPDATE ON hub_demo_items
+    FOR EACH ROW
+    BEGIN
+      :NEW.updated_at := SYSTIMESTAMP;
+    END;
+    /
+    
+    CREATE OR REPLACE VIEW hub_demo_items_v AS
+    SELECT
+      id,
+      sku,
+      title,
+      category,
+      hub_demo_price_dollars(unit_price_cents) AS price_dollars,
+      stock_units,
+      updated_at
+    FROM hub_demo_items;
+    
+    CREATE MATERIALIZED VIEW hub_demo_mv_summary
+    BUILD IMMEDIATE
+    REFRESH ON DEMAND
+    AS
+    SELECT
+      COUNT(*) AS item_count,
+      NVL(SUM(unit_price_cents), 0) AS total_cents,
+      MAX(updated_at) AS last_updated
+    FROM hub_demo_items;
+    
+    BEGIN
+      hub_demo_upsert_item('ORA-DEMO-001', 'Oracle demo widget', 1999, 'gadgets');
+      hub_demo_upsert_item('ORA-DEMO-002', 'Oracle demo gadget', 2999, 'gadgets');
+    END;
+    /
+    
+    COMMIT;
+    
+    SELECT 'oracle demo schema ready' AS status FROM dual;
+    SELECT object_type, COUNT(*) AS cnt
+    FROM user_objects
+    WHERE object_name LIKE 'HUB_DEMO%' OR object_name LIKE 'HUB_ITEM%'
+    GROUP BY object_type
+    ORDER BY object_type;
+
+  02-hub-scenario-schema.sql: |
+    -- Hub scenario mirror + workload tables (user DEMO).
+    WHENEVER SQLERROR EXIT SQL.SQLCODE
+    
+    BEGIN
+      EXECUTE IMMEDIATE 'DROP TABLE hub_workload_oracle';
+    EXCEPTION
+      WHEN OTHERS THEN
+        IF SQLCODE != -942 THEN RAISE; END IF;
+    END;
+    /
+    
+    BEGIN
+      EXECUTE IMMEDIATE 'DROP TABLE scenario_catalog_mirror_oracle';
+    EXCEPTION
+      WHEN OTHERS THEN
+        IF SQLCODE != -942 THEN RAISE; END IF;
+    END;
+    /
+    
+    CREATE TABLE scenario_catalog_mirror_oracle (
+      id NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+      sku VARCHAR2(128) NOT NULL,
+      title VARCHAR2(512) NOT NULL,
+      category VARCHAR2(256),
+      unit_price_cents NUMBER(12) DEFAULT 0 NOT NULL,
+      stock_units NUMBER(12) DEFAULT 0 NOT NULL,
+      source_mongo_id VARCHAR2(96),
+      kafka_msg_key VARCHAR2(160),
+      updated_at TIMESTAMP(6) DEFAULT SYSTIMESTAMP NOT NULL,
+      CONSTRAINT scenario_catalog_mirror_ora_uk UNIQUE (sku)
+    );
+    
+    CREATE TABLE hub_workload_oracle (
+      id NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+      run_id VARCHAR2(32) NOT NULL,
+      seq NUMBER NOT NULL,
+      name VARCHAR2(4000) NOT NULL,
+      created_at TIMESTAMP(6) DEFAULT SYSTIMESTAMP NOT NULL,
+      CONSTRAINT hub_workload_oracle_run_seq_uk UNIQUE (run_id, seq)
+    );
+    
+    CREATE INDEX hub_workload_oracle_run_id_ix ON hub_workload_oracle (run_id);
+    
+    COMMIT;
+
+  03-exporter-grants.sql: |
+    -- Privileges for iamseth/oracledb_exporter (demo user). Run as SYS (see init-demo-schema.sh).
+    WHENEVER SQLERROR EXIT SQL.SQLCODE
+    
+    BEGIN
+      EXECUTE IMMEDIATE 'GRANT SELECT_CATALOG_ROLE TO demo';
+    EXCEPTION
+      WHEN OTHERS THEN
+        -- Role missing on some editions (-1924), or already granted (-1917).
+        IF SQLCODE NOT IN (-1917, -1924) THEN RAISE; END IF;
+    END;
+    /
+    
+    BEGIN
+      EXECUTE IMMEDIATE 'GRANT CREATE SESSION TO demo';
+    EXCEPTION
+      WHEN OTHERS THEN
+        IF SQLCODE NOT IN (-1917, -1924) THEN RAISE; END IF;
+    END;
+    /
+    
+    COMMIT;
+
+  init-demo-schema.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+    DEMO_PW="${ORACLE_DEMO_PASSWORD:?missing ORACLE_DEMO_PASSWORD}"
+    SYS_PW="${ORACLE_SYS_PASSWORD:-}"
+    SVC="${ORACLE_HOST:-oracle}"
+    # Do not use ORACLE_PORT: Kubernetes injects ORACLE_PORT=tcp://<ip>:1521 for Service "oracle".
+    PORT="${ORACLE_LISTEN_PORT:-1521}"
+    SERVICE="${ORACLE_SERVICE:-FREEPDB1}"
+    DEMO_CSTR="demo/${DEMO_PW}@//${SVC}:${PORT}/${SERVICE}"
+    
+    echo "Waiting for Oracle PDB ${SERVICE} at ${SVC}:${PORT} (user demo)..."
+    for i in $(seq 1 180); do
+      if echo "SELECT 1 FROM DUAL;" | sqlplus -s -L "$DEMO_CSTR" 2>/dev/null | grep -qE '^[[:space:]]*1'; then
+        echo "Oracle reachable (attempt $i)"
+        break
+      fi
+      sleep 5
+      if [[ "$i" -eq 180 ]]; then
+        echo "timeout waiting for ${DEMO_CSTR}" >&2
+        exit 1
+      fi
+    done
+    
+    for script in /scripts/01-demo-schema.sql /scripts/02-hub-scenario-schema.sql; do
+      echo "Applying $(basename "$script") as demo..." >&2
+      sqlplus -s -L "$DEMO_CSTR" @"$script"
+    done
+    
+    if [[ -n "$SYS_PW" ]]; then
+      SYS_CSTR="sys/${SYS_PW}@//${SVC}:${PORT}/${SERVICE} as sysdba"
+      echo "Applying 03-exporter-grants.sql as SYS..." >&2
+      sqlplus -s -L "$SYS_CSTR" @/scripts/03-exporter-grants.sql
+    else
+      echo "ORACLE_SYS_PASSWORD unset; skipping 03-exporter-grants.sql (exporter may show limited metrics)." >&2
+    fi
+    
+    echo "oracle-demo-bootstrap done."
+---
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: oracle-demo-bootstrap
+  namespace: demo-hub
+  labels:
+    demo-hub.io/group: oracle
+    app.kubernetes.io/part-of: demo-hub
+spec:
+  activeDeadlineSeconds: 7200
+  ttlSecondsAfterFinished: 86400
+  backoffLimit: 4
+  template:
+    metadata:
+      labels:
+        demo-hub.io/group: oracle
+        app.kubernetes.io/part-of: demo-hub
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: run
+          image: gvenzl/oracle-free:23-full-faststart
+          imagePullPolicy: IfNotPresent
+          command:
+            - "bash"
+            - "/scripts/init-demo-schema.sh"
+          env:
+            - name: ORACLE_HOST
+              value: "oracle"
+            - name: ORACLE_LISTEN_PORT
+              value: "1521"
+            - name: ORACLE_SERVICE
+              value: "FREEPDB1"
+            - name: ORACLE_DEMO_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: oracle-demo-password
+            - name: ORACLE_SYS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: oracle-sys-password
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+      volumes:
+        - name: scripts
+          configMap:
+            name: oracle-scripts
+            defaultMode: 0755
+---
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: demo-tools-hints
+  namespace: demo-hub
+  labels:
+    demo-hub.io/group: toolbox
+    app.kubernetes.io/part-of: demo-hub
+data:
+  endpoints.sh: |
+    # In-cluster endpoints for demo-hub (namespace demo-hub)
+    export DEMO_HUB_PG=postgresql://demo:demopass@postgresql-primary:5432/demo
+    export DEMO_HUB_REDIS=redis://:demoredispass@redis:6379/0
+    export DEMO_HUB_MONGO=mongodb://mongo-mongos1:27017/
+    export DEMO_HUB_CASSANDRA=cassandra-0.cassandra-headless.demo-hub.svc.cluster.local
+    export DEMO_HUB_OPENSEARCH=http://opensearch:9200
+    export DEMO_HUB_ORACLE=demo/demopass@//oracle:1521/FREEPDB1
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-tools
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/name: demo-tools
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: toolbox
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: demo-tools
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: demo-tools
+        app.kubernetes.io/part-of: demo-hub
+        demo-hub.io/group: toolbox
+    spec:
+      containers:
+        - name: demo-tools
+          image: demo-hub/demo-tools:latest
+          imagePullPolicy: Never
+          command:
+            - "sleep"
+            - "infinity"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "1Gi"
+              cpu: "1"
+          ports:
+            - containerPort: 2222
+              name: tools
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo-tools
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/name: demo-tools
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: toolbox
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: demo-tools
+  ports:
+    - port: 2222
+      targetPort: 2222
+      name: tools
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
   name: kafka-connect
   namespace: demo-hub
   labels:
@@ -21781,12 +22922,14 @@ spec:
             - name: VALUE_CONVERTER
               value: "org.apache.kafka.connect.json.JsonConverter"
             - name: KAFKA_HEAP_OPTS
-              value: "-Xms512m -Xmx8192m"
+              value: "-Xms512m -Xmx4096m"
           resources:
             requests:
-              memory: "1Gi"
+              memory: "128Mi"
+              cpu: "50m"
             limits:
-              memory: "10Gi"
+              memory: "8Gi"
+              cpu: "2"
           ports:
             - containerPort: 8083
               name: http
@@ -22151,11 +23294,18 @@ spec:
           imagePullPolicy: IfNotPresent
           env:
             - name: OPENSEARCH_JAVA_OPTS
-              value: "-Xms512m -Xmx512m -XX:MaxDirectMemorySize=256m"
+              value: "-Xms1g -Xmx1g -XX:MaxDirectMemorySize=512m"
             - name: DISABLE_SECURITY_PLUGIN
               value: "true"
             - name: DISABLE_INSTALL_DEMO_CONFIG
               value: "true"
+          resources:
+            requests:
+              memory: "1536Mi"
+              cpu: "250m"
+            limits:
+              memory: "2560Mi"
+              cpu: "2"
           volumeMounts:
             - name: config
               mountPath: /usr/share/opensearch/config/opensearch.yml
@@ -22226,6 +23376,15 @@ spec:
               value: "[\"http://opensearch:9200\"]"
             - name: DISABLE_SECURITY_DASHBOARDS_PLUGIN
               value: "true"
+            - name: NODE_OPTIONS
+              value: "--max-old-space-size=384"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "768Mi"
+              cpu: "500m"
           ports:
             - containerPort: 5601
               name: http
@@ -22517,17 +23676,18 @@ spec:
                   && nc -z -w 3 cassandra-0.cassandra-headless.demo-hub.svc.cluster.local 9042 2>/dev/null \
                   && nc -z -w 3 redis.demo-hub.svc.cluster.local 6379 2>/dev/null \
                   && nc -z -w 3 mssql-publisher.demo-hub.svc.cluster.local 1433 2>/dev/null \
+                  && nc -z -w 3 oracle.demo-hub.svc.cluster.local 1521 2>/dev/null \
                   && nc -z -w 3 trino.demo-hub.svc.cluster.local 8080 2>/dev/null; then
                   echo "wait-hub-deps: all upstream TCP checks OK (attempt $i)" >&2
                   exit 0
                 fi
                 if [ $((i % 15)) -eq 0 ]; then
-                  echo "wait-hub-deps: attempt $i/200 — kafka:9092=$(p kafka.demo-hub.svc.cluster.local 9092) opensearch:9200=$(p opensearch.demo-hub.svc.cluster.local 9200) postgres:5432=$(p postgresql-primary.demo-hub.svc.cluster.local 5432) postgres-sub:5432=$(p postgres-sub.demo-hub.svc.cluster.local 5432) cassandra-0:9042=$(p cassandra-0.cassandra-headless.demo-hub.svc.cluster.local 9042) redis:6379=$(p redis.demo-hub.svc.cluster.local 6379) mssql-publisher:1433=$(p mssql-publisher.demo-hub.svc.cluster.local 1433) trino:8080=$(p trino.demo-hub.svc.cluster.local 8080) (hub skips mongos; Trino init waits mongos -> :8080)" >&2
+                  echo "wait-hub-deps: attempt $i/200 — kafka:9092=$(p kafka.demo-hub.svc.cluster.local 9092) opensearch:9200=$(p opensearch.demo-hub.svc.cluster.local 9200) postgres:5432=$(p postgresql-primary.demo-hub.svc.cluster.local 5432) postgres-sub:5432=$(p postgres-sub.demo-hub.svc.cluster.local 5432) cassandra-0:9042=$(p cassandra-0.cassandra-headless.demo-hub.svc.cluster.local 9042) redis:6379=$(p redis.demo-hub.svc.cluster.local 6379) mssql-publisher:1433=$(p mssql-publisher.demo-hub.svc.cluster.local 1433) oracle:1521=$(p oracle.demo-hub.svc.cluster.local 1521) trino:8080=$(p trino.demo-hub.svc.cluster.local 8080) (hub skips mongos)" >&2
                 fi
                 sleep 2
               done
               echo "timeout waiting for kafka:9092, opensearch:9200, postgresql-primary:5432, postgres-sub:5432," >&2
-              echo "  cassandra-0:9042 (headless), redis:6379, mssql-publisher:1433, trino:8080" >&2
+              echo "  cassandra-0:9042 (headless), redis:6379, mssql-publisher:1433, oracle:1521, trino:8080" >&2
               exit 1
       containers:
         - name: hub-demo-ui
@@ -22554,6 +23714,16 @@ spec:
               value: "25"
             - name: CASSANDRA_WORKLOAD_WRITE_RETRIES
               value: "3"
+            - name: CASSANDRA_REQUEST_TIMEOUT_SECONDS
+              value: "120"
+            - name: CASSANDRA_MAX_SCHEMA_AGREEMENT_WAIT_SECONDS
+              value: "120"
+            - name: OPENSEARCH_BULK_MAX_BYTES
+              value: "25165824"
+            - name: OPENSEARCH_WORKLOAD_INTER_BULK_SLEEP_MS
+              value: "50"
+            - name: MSSQL_CONNECT_TIMEOUT_SECONDS
+              value: "120"
             - name: MSSQL_HOST
               value: "mssql-publisher"
             - name: MSSQL_USER
@@ -22562,6 +23732,16 @@ spec:
               value: "demo"
             - name: MSSQL_ENCRYPT
               value: "off"
+            - name: ORACLE_HOST
+              value: "oracle"
+            - name: ORACLE_LISTEN_PORT
+              value: "1521"
+            - name: ORACLE_USER
+              value: "demo"
+            - name: ORACLE_SERVICE
+              value: "FREEPDB1"
+            - name: ORACLE_CONNECT_TIMEOUT_SECONDS
+              value: "120"
             - name: TRINO_HTTP
               value: "http://trino:8080"
             - name: POSTGRES_DSN
@@ -22599,6 +23779,18 @@ spec:
                 secretKeyRef:
                   name: demo-hub-credentials
                   key: mssql-sa-password
+            - name: ORACLE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: demo-hub-credentials
+                  key: oracle-demo-password
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "1536Mi"
+              cpu: "2"
           ports:
             - containerPort: 8888
               name: http
@@ -22899,6 +24091,13 @@ spec:
           env:
             - name: TLP_STRESS_CASSANDRA_HOST
               value: "cassandra"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "768Mi"
+              cpu: "1"
           ports:
             - containerPort: 9500
               name: http

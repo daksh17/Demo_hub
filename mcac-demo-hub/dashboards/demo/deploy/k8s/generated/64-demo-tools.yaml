@@ -1,0 +1,76 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: demo-tools-hints
+  namespace: demo-hub
+  labels:
+    demo-hub.io/group: toolbox
+    app.kubernetes.io/part-of: demo-hub
+data:
+  endpoints.sh: |
+    # In-cluster endpoints for demo-hub (namespace demo-hub)
+    export DEMO_HUB_PG=postgresql://demo:demopass@postgresql-primary:5432/demo
+    export DEMO_HUB_REDIS=redis://:demoredispass@redis:6379/0
+    export DEMO_HUB_MONGO=mongodb://mongo-mongos1:27017/
+    export DEMO_HUB_CASSANDRA=cassandra-0.cassandra-headless.demo-hub.svc.cluster.local
+    export DEMO_HUB_OPENSEARCH=http://opensearch:9200
+    export DEMO_HUB_ORACLE=demo/demopass@//oracle:1521/FREEPDB1
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-tools
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/name: demo-tools
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: toolbox
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: demo-tools
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: demo-tools
+        app.kubernetes.io/part-of: demo-hub
+        demo-hub.io/group: toolbox
+    spec:
+      containers:
+        - name: demo-tools
+          image: demo-hub/demo-tools:latest
+          imagePullPolicy: Never
+          command:
+            - "sleep"
+            - "infinity"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "1Gi"
+              cpu: "1"
+          ports:
+            - containerPort: 2222
+              name: tools
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo-tools
+  namespace: demo-hub
+  labels:
+    app.kubernetes.io/name: demo-tools
+    app.kubernetes.io/part-of: demo-hub
+    demo-hub.io/group: toolbox
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: demo-tools
+  ports:
+    - port: 2222
+      targetPort: 2222
+      name: tools

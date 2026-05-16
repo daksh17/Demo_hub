@@ -28,12 +28,15 @@ spec:
             - -c
             - |
               set -e
-              f=/opt/bitnami/postgresql/share/extension/repmgr.control
-              if [ ! -f "$f" ]; then
-                echo "Missing $f in image mcac-demo/postgresql-repmgr:16.6.0." >&2
-                echo "Rebuild: docker build --no-cache -t mcac-demo/postgresql-repmgr:16.6.0 -f deploy/docker/postgres-kafka/Dockerfile.repmgr deploy/docker/postgres-kafka" >&2
-                exit 1
-              fi
+              for f in \
+                /opt/bitnami/postgresql/share/extension/repmgr.control \
+                /opt/bitnami/postgresql/share/extension/pg_profile.control; do
+                if [ ! -f "$f" ]; then
+                  echo "Missing $f in image mcac-demo/postgresql-repmgr:16.6.0." >&2
+                  echo "Rebuild: docker build --no-cache -t mcac-demo/postgresql-repmgr:16.6.0 -f deploy/docker/postgres-kafka/Dockerfile.repmgr deploy/docker/postgres-kafka" >&2
+                  exit 1
+                fi
+              done
         - name: mcac-wal-archive-conf
           image: mcac-demo/postgresql-repmgr:16.6.0
           imagePullPolicy: IfNotPresent
@@ -47,9 +50,24 @@ spec:
               set -e
               conf_dir=/bitnami/postgresql/conf/conf.d
               mkdir -p "$conf_dir"
+              printf '%s\n' "cron.host = ''" > "$conf_dir/98-mcac-cron-host.conf"
               printf '%s\n' "archive_mode = ${MCAC_ARCHIVE_MODE}" \
                 "archive_command = '/opt/bitnami/scripts/mcac-wal-archive.sh %p %f'" \
                 > "$conf_dir/99-mcac-archive.conf"
+          volumeMounts:
+            - name: data
+              mountPath: /bitnami/postgresql
+        - name: mcac-pghba-local-demo
+          image: mcac-demo/postgresql-repmgr:16.6.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              if [ -f /docker-entrypoint-initdb.d/07-pg_hba-local-demo-postgres-trust.sh ]; then
+                /docker-entrypoint-initdb.d/07-pg_hba-local-demo-postgres-trust.sh
+              fi
           volumeMounts:
             - name: data
               mountPath: /bitnami/postgresql
@@ -69,7 +87,7 @@ spec:
             - name: POSTGRESQL_SHARED_PRELOAD_LIBRARIES
               value: "repmgr,pgaudit,pg_stat_statements,pg_cron"
             - name: POSTGRESQL_EXTRA_FLAGS
-              value: "-c wal_level=logical -c max_replication_slots=8 -c max_wal_senders=8 -c pg_stat_statements.max=10000 -c pg_stat_statements.track=all -c cron.database_name=postgres"
+              value: "-c wal_level=logical -c max_replication_slots=8 -c max_wal_senders=8 -c pg_stat_statements.max=10000 -c pg_stat_statements.track=all -c cron.database_name=postgres -c track_io_timing=on -c track_functions=all"
             - name: POSTGRESQL_REPLICATION_PASSWORD
               valueFrom:
                 secretKeyRef:
@@ -83,6 +101,13 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /bitnami/postgresql
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                  - /bin/bash
+                  - -lc
+                  - "set +e; for i in $(seq 1 90); do if [ -f /opt/bitnami/postgresql/conf/pg_hba.conf ] || [ -f /bitnami/postgresql/conf/pg_hba.conf ] || [ -f /bitnami/postgresql/data/pg_hba.conf ]; then /docker-entrypoint-initdb.d/07-pg_hba-local-demo-postgres-trust.sh; D=\"${PGDATA:-/bitnami/postgresql/data}\"; if /opt/bitnami/postgresql/bin/pg_ctl -D \"$D\" reload -s 2>/dev/null; then exit 0; fi; fi; sleep 1; done; exit 0"
           ports:
             - containerPort: 5432
               name: pg
@@ -140,12 +165,15 @@ spec:
             - -c
             - |
               set -e
-              f=/opt/bitnami/postgresql/share/extension/repmgr.control
-              if [ ! -f "$f" ]; then
-                echo "Missing $f in image mcac-demo/postgresql-repmgr:16.6.0." >&2
-                echo "Rebuild: docker build --no-cache -t mcac-demo/postgresql-repmgr:16.6.0 -f deploy/docker/postgres-kafka/Dockerfile.repmgr deploy/docker/postgres-kafka" >&2
-                exit 1
-              fi
+              for f in \
+                /opt/bitnami/postgresql/share/extension/repmgr.control \
+                /opt/bitnami/postgresql/share/extension/pg_profile.control; do
+                if [ ! -f "$f" ]; then
+                  echo "Missing $f in image mcac-demo/postgresql-repmgr:16.6.0." >&2
+                  echo "Rebuild: docker build --no-cache -t mcac-demo/postgresql-repmgr:16.6.0 -f deploy/docker/postgres-kafka/Dockerfile.repmgr deploy/docker/postgres-kafka" >&2
+                  exit 1
+                fi
+              done
         - name: mcac-wal-archive-conf
           image: mcac-demo/postgresql-repmgr:16.6.0
           imagePullPolicy: IfNotPresent
@@ -159,9 +187,24 @@ spec:
               set -e
               conf_dir=/bitnami/postgresql/conf/conf.d
               mkdir -p "$conf_dir"
+              printf '%s\n' "cron.host = ''" > "$conf_dir/98-mcac-cron-host.conf"
               printf '%s\n' "archive_mode = ${MCAC_ARCHIVE_MODE}" \
                 "archive_command = '/opt/bitnami/scripts/mcac-wal-archive.sh %p %f'" \
                 > "$conf_dir/99-mcac-archive.conf"
+          volumeMounts:
+            - name: data
+              mountPath: /bitnami/postgresql
+        - name: mcac-pghba-local-demo
+          image: mcac-demo/postgresql-repmgr:16.6.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              if [ -f /docker-entrypoint-initdb.d/07-pg_hba-local-demo-postgres-trust.sh ]; then
+                /docker-entrypoint-initdb.d/07-pg_hba-local-demo-postgres-trust.sh
+              fi
           volumeMounts:
             - name: data
               mountPath: /bitnami/postgresql
@@ -181,7 +224,7 @@ spec:
             - name: POSTGRESQL_SHARED_PRELOAD_LIBRARIES
               value: "repmgr,pgaudit,pg_stat_statements,pg_cron"
             - name: POSTGRESQL_EXTRA_FLAGS
-              value: "-c wal_level=replica -c primary_slot_name=pgdemo_phys_replica_1 -c pg_stat_statements.max=10000 -c pg_stat_statements.track=all -c cron.database_name=postgres"
+              value: "-c wal_level=replica -c primary_slot_name=pgdemo_phys_replica_1 -c pg_stat_statements.max=10000 -c pg_stat_statements.track=all -c cron.database_name=postgres -c track_io_timing=on -c track_functions=all"
             - name: POSTGRESQL_REPLICATION_PASSWORD
               valueFrom:
                 secretKeyRef:
@@ -195,6 +238,13 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /bitnami/postgresql
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                  - /bin/bash
+                  - -lc
+                  - "set +e; for i in $(seq 1 90); do if [ -f /opt/bitnami/postgresql/conf/pg_hba.conf ] || [ -f /bitnami/postgresql/conf/pg_hba.conf ] || [ -f /bitnami/postgresql/data/pg_hba.conf ]; then /docker-entrypoint-initdb.d/07-pg_hba-local-demo-postgres-trust.sh; D=\"${PGDATA:-/bitnami/postgresql/data}\"; if /opt/bitnami/postgresql/bin/pg_ctl -D \"$D\" reload -s 2>/dev/null; then exit 0; fi; fi; sleep 1; done; exit 0"
           ports:
             - containerPort: 5432
               name: pg
@@ -252,12 +302,15 @@ spec:
             - -c
             - |
               set -e
-              f=/opt/bitnami/postgresql/share/extension/repmgr.control
-              if [ ! -f "$f" ]; then
-                echo "Missing $f in image mcac-demo/postgresql-repmgr:16.6.0." >&2
-                echo "Rebuild: docker build --no-cache -t mcac-demo/postgresql-repmgr:16.6.0 -f deploy/docker/postgres-kafka/Dockerfile.repmgr deploy/docker/postgres-kafka" >&2
-                exit 1
-              fi
+              for f in \
+                /opt/bitnami/postgresql/share/extension/repmgr.control \
+                /opt/bitnami/postgresql/share/extension/pg_profile.control; do
+                if [ ! -f "$f" ]; then
+                  echo "Missing $f in image mcac-demo/postgresql-repmgr:16.6.0." >&2
+                  echo "Rebuild: docker build --no-cache -t mcac-demo/postgresql-repmgr:16.6.0 -f deploy/docker/postgres-kafka/Dockerfile.repmgr deploy/docker/postgres-kafka" >&2
+                  exit 1
+                fi
+              done
         - name: mcac-wal-archive-conf
           image: mcac-demo/postgresql-repmgr:16.6.0
           imagePullPolicy: IfNotPresent
@@ -271,9 +324,24 @@ spec:
               set -e
               conf_dir=/bitnami/postgresql/conf/conf.d
               mkdir -p "$conf_dir"
+              printf '%s\n' "cron.host = ''" > "$conf_dir/98-mcac-cron-host.conf"
               printf '%s\n' "archive_mode = ${MCAC_ARCHIVE_MODE}" \
                 "archive_command = '/opt/bitnami/scripts/mcac-wal-archive.sh %p %f'" \
                 > "$conf_dir/99-mcac-archive.conf"
+          volumeMounts:
+            - name: data
+              mountPath: /bitnami/postgresql
+        - name: mcac-pghba-local-demo
+          image: mcac-demo/postgresql-repmgr:16.6.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              if [ -f /docker-entrypoint-initdb.d/07-pg_hba-local-demo-postgres-trust.sh ]; then
+                /docker-entrypoint-initdb.d/07-pg_hba-local-demo-postgres-trust.sh
+              fi
           volumeMounts:
             - name: data
               mountPath: /bitnami/postgresql
@@ -293,7 +361,7 @@ spec:
             - name: POSTGRESQL_SHARED_PRELOAD_LIBRARIES
               value: "repmgr,pgaudit,pg_stat_statements,pg_cron"
             - name: POSTGRESQL_EXTRA_FLAGS
-              value: "-c wal_level=replica -c primary_slot_name=pgdemo_phys_replica_2 -c pg_stat_statements.max=10000 -c pg_stat_statements.track=all -c cron.database_name=postgres"
+              value: "-c wal_level=replica -c primary_slot_name=pgdemo_phys_replica_2 -c pg_stat_statements.max=10000 -c pg_stat_statements.track=all -c cron.database_name=postgres -c track_io_timing=on -c track_functions=all"
             - name: POSTGRESQL_REPLICATION_PASSWORD
               valueFrom:
                 secretKeyRef:
@@ -307,6 +375,13 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /bitnami/postgresql
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                  - /bin/bash
+                  - -lc
+                  - "set +e; for i in $(seq 1 90); do if [ -f /opt/bitnami/postgresql/conf/pg_hba.conf ] || [ -f /bitnami/postgresql/conf/pg_hba.conf ] || [ -f /bitnami/postgresql/data/pg_hba.conf ]; then /docker-entrypoint-initdb.d/07-pg_hba-local-demo-postgres-trust.sh; D=\"${PGDATA:-/bitnami/postgresql/data}\"; if /opt/bitnami/postgresql/bin/pg_ctl -D \"$D\" reload -s 2>/dev/null; then exit 0; fi; fi; sleep 1; done; exit 0"
           ports:
             - containerPort: 5432
               name: pg

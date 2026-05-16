@@ -11,7 +11,7 @@ Implementation: [`demo-ui/scenario.py`](demo-ui/scenario.py) (FastAPI handlers i
 | Where | What to look at |
 |--------|------------------|
 | **Live UI** | **Scenario** → **Pipeline line diagram** (horizontal spine, steps **1–5**) and the **vertical “Flow diagram”** in the sidebar (same five stages top → bottom). |
-| **This repo (static)** | **[`diagrams/01-sequence-order-flow.mmd`](diagrams/01-sequence-order-flow.mmd)** — broader order + CDC story. For **Mongo-heavy** paths see **`03-flowchart-mongo-path.mmd`**, for **Postgres / fulfillment** see **`02-flowchart-postgres-path.mmd`**, for **Cassandra + Redis + OpenSearch** see **`04-flowchart-cassandra-redis-os.mmd`**. Overview including **`scenario.*`** vs Connect: **`06-flowchart-multi-db-faker-connect-overview.mmd`**. Rendered **SVG** versions sit alongside each **`.mmd`** file. |
+| **This repo (static)** | **[`diagrams/01-sequence-order-flow.mmd`](diagrams/01-sequence-order-flow.mmd)** — broader order + CDC story. For **Mongo-heavy** paths see **`03-flowchart-mongo-path.mmd`**, for **Postgres / fulfillment** see **`02-flowchart-postgres-path.mmd`**, for **Cassandra + Redis + OpenSearch** see **`04-flowchart-cassandra-redis-os.mmd`**, for **Oracle (K8s)** see **`07-flowchart-oracle-path.mmd`**. Overview including **`scenario.*`** vs Connect: **`06-flowchart-multi-db-faker-connect-overview.mmd`**. Rendered **SVG** versions sit alongside each **`.mmd`** file. |
 
 The hub’s main **[`README.md`](README.md)** also inlines those SVGs and collapsible Mermaid blocks for GitHub.
 
@@ -33,7 +33,7 @@ When you use **Scenario**, you run **five explicit operations** (five numbered p
 | # | Python entry | Role |
 |---|----------------|------|
 | 1 | `op_seed_catalog` | Load generator → Mongo (`scenario_products`, optional `scenario_suppliers`) |
-| 2 | `op_pipeline_mongo_to_postgres_and_kafka` | **Batch sync**: Mongo → Postgres mirror + Kafka + OpenSearch + Redis (+ MSSQL MERGE when configured) |
+| 2 | `op_pipeline_mongo_to_postgres_and_kafka` | **Batch sync**: Mongo → Postgres mirror + Kafka + OpenSearch + Redis (+ MSSQL / Oracle MERGE when configured) |
 | 3 | `op_place_order` | **OLTP**: Postgres `scenario_orders` + `scenario_customers` + `scenario_payments` + Kafka + OpenSearch + Cassandra + Redis |
 | 4 | `op_pipeline_postgres_to_fulfillment_and_kafka` | **Batch sync**: Postgres fulfillment lines + Kafka + OpenSearch + Cassandra (+ Redis summary refresh) |
 | 5 | `op_pipeline_fulfilled_to_shipments` | **Shipping**: Postgres `scenario_shipments` + `scenario.shipments.events` + OpenSearch + Cassandra timeline + `scenario_carrier_shipments` + Redis `scenario:shipments:recent` |
@@ -62,7 +62,7 @@ Full **Kafka** topic names ( **`scenario.`** prefix ):
 
 Redis dashboard summary refreshed after seed.
 
-### Step 2 — Sync catalog → Postgres + Kafka + OpenSearch + Redis
+### Step 2 — Sync catalog → Postgres + Kafka + OpenSearch + Redis (+ optional MSSQL / Oracle)
 
 | Role | System | Detail |
 |------|--------|--------|
@@ -71,6 +71,8 @@ Redis dashboard summary refreshed after seed.
 | **Sink** | **Kafka** | Produce `scenario.catalog.changes` |
 | **Sink** | **OpenSearch** | Index same logical payload (`mongo→kafka+os`) |
 | **Sink** | **Redis** | `LPUSH` recent list `scenario:kafka:recent`, refresh `scenario:dashboard:summary` |
+| **Sink** (optional) | **SQL Server** | MERGE `dbo.scenario_catalog_mirror_mssql` when `MSSQL_HOST` is set (Compose / K8s publisher) |
+| **Sink** (optional) | **Oracle** | MERGE `scenario_catalog_mirror_oracle` when `ORACLE_HOST` is set (K8s `oracle` + Job `oracle-demo-bootstrap`). Response: **`oracle_rows_upserted`**; on failure see **`oracle_merge_errors`** or **`oracle_connect_error`**. |
 
 ### Step 3 — Place order
 
@@ -136,6 +138,8 @@ flowchart LR
     M2 --> K1[Kafka scenario.catalog.changes]
     M2 --> OS1[OpenSearch hub-scenario-pipeline]
     M2 --> R1[Redis summary + recent]
+    M2 -.-> MS1[(MSSQL mirror optional)]
+    M2 -.-> O1[(Oracle mirror optional)]
   end
 
   subgraph s3 [3 · Order]
@@ -177,7 +181,7 @@ flowchart LR
 ```mermaid
 flowchart TB
   A[Seed: Faker → Mongo scenario_products + optional scenario_suppliers]
-  B[Sync: Postgres mirror + Kafka + OpenSearch + Redis\nscenario.catalog.changes]
+  B[Sync: Postgres mirror + Kafka + OpenSearch + Redis\noptional MSSQL + Oracle MERGE\nscenario.catalog.changes]
   C[Order: scenario_orders + customers + payments + Kafka + OS + Redis + Cassandra]
   D[Fulfill: fulfillment_lines + Kafka + OS + Cassandra FULFILLMENT_READY]
   E[Ship: scenario_shipments + scenario.shipments.events + carrier_shipments + Redis]
@@ -193,6 +197,8 @@ flowchart TB
 | UI | `http://localhost:8888/scenario` |
 | Catalog collections | `demo.scenario_products`, `demo.scenario_suppliers` |
 | Postgres tables | `scenario_catalog_mirror`, `scenario_orders`, `scenario_fulfillment_lines`, `scenario_customers`, `scenario_payments`, `scenario_shipments` |
+| Oracle (K8s) | `scenario_catalog_mirror_oracle`, `hub_workload_oracle` (user `demo` / PDB `FREEPDB1`) |
+| MSSQL | `dbo.scenario_catalog_mirror_mssql` |
 | Cassandra | `demo_hub.scenario_timeline`, `demo_hub.scenario_carrier_shipments` |
 | Redis keys | `scenario:dashboard:summary`, `scenario:kafka:recent`, `scenario:order:latest:*`, `scenario:customer:*`, `scenario:shipments:recent` |
 

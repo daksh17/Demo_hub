@@ -35,6 +35,32 @@ MSSQL_SA_PASSWORD = os.environ.get("MSSQL_SA_PASSWORD", "")
 MSSQL_DATABASE = os.environ.get("MSSQL_DATABASE", "demo")
 # Docker SQL Server: pymssql often needs encrypt=off unless you configure TLS.
 _MSSQL_ENCRYPT = os.environ.get("MSSQL_ENCRYPT", "off").strip().lower()
+MSSQL_CONNECT_TIMEOUT_SECONDS = int(
+    os.environ.get("MSSQL_CONNECT_TIMEOUT_SECONDS", "120")
+)
+
+# Optional Oracle (K8s: oracle / FREEPDB1, user demo).
+ORACLE_HOST = os.environ.get("ORACLE_HOST", "").strip()
+
+
+def _oracle_listen_port() -> int:
+    raw = (
+        os.environ.get("ORACLE_LISTEN_PORT")
+        or os.environ.get("ORACLE_PORT")
+        or "1521"
+    ).strip()
+    if raw.startswith("tcp://"):
+        return int(raw.rsplit(":", 1)[-1])
+    return int(raw)
+
+
+ORACLE_PORT = _oracle_listen_port()
+ORACLE_USER = os.environ.get("ORACLE_USER", "demo").strip() or "demo"
+ORACLE_PASSWORD = os.environ.get("ORACLE_PASSWORD", "").strip()
+ORACLE_SERVICE = os.environ.get("ORACLE_SERVICE", "FREEPDB1").strip() or "FREEPDB1"
+ORACLE_CONNECT_TIMEOUT_SECONDS = int(
+    os.environ.get("ORACLE_CONNECT_TIMEOUT_SECONDS", "120")
+)
 
 MONGO_COLL = "scenario_products"
 MONGO_COLL_SUPPLIERS = "scenario_suppliers"
@@ -429,7 +455,7 @@ def _mssql_connect() -> tuple[Any | None, str | None]:
         user=MSSQL_USER,
         password=MSSQL_SA_PASSWORD,
         database=MSSQL_DATABASE,
-        timeout=30,
+        timeout=max(5, MSSQL_CONNECT_TIMEOUT_SECONDS),
     )
     if _MSSQL_ENCRYPT in ("off", "false", "0", "no"):
         kw["encrypt"] = "off"
@@ -600,6 +626,197 @@ def fetch_workload_sample_mssql(run_id: str, limit: int) -> dict[str, Any]:
         conn.close()
 
 
+def _oracle_connect() -> tuple[Any | None, str | None]:
+    try:
+        import oracledb  # type: ignore
+    except ImportError as e:
+        return None, f"oracledb not installed ({e})"
+    if not ORACLE_HOST or not ORACLE_PASSWORD:
+        return None, "ORACLE_HOST or ORACLE_PASSWORD is not set"
+    try:
+        conn = oracledb.connect(
+            user=ORACLE_USER,
+            password=ORACLE_PASSWORD,
+            host=ORACLE_HOST,
+            port=ORACLE_PORT,
+            service_name=ORACLE_SERVICE,
+            tcp_connect_timeout=max(5, ORACLE_CONNECT_TIMEOUT_SECONDS),
+        )
+        return conn, None
+    except Exception as e:
+        return None, f"connect failed: {e}"
+
+
+def _oracle_row_to_json(row: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for k, v in row.items():
+        if hasattr(v, "isoformat"):
+            out[k] = v.isoformat()
+        elif hasattr(v, "as_tuple"):
+            out[k] = float(v)
+        else:
+            out[k] = v
+    return out
+
+
+def oracle_merge_catalog_row(
+    conn: Any,
+    sku: str,
+    title: str,
+    category: str | None,
+    unit_price_cents: int,
+    stock_units: int,
+    source_mongo_id: str,
+    kafka_msg_key: str,
+    merge_errors: list[str] | None = None,
+) -> bool:
+    if conn is None:
+        return False
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            MERGE INTO scenario_catalog_mirror_oracle t
+            USING (
+              SELECT :sku AS sku, :title AS title, :category AS category,
+                     :unit_price_cents AS unit_price_cents, :stock_units AS stock_units,
+                     :source_mongo_id AS source_mongo_id, :kafka_msg_key AS kafka_msg_key
+              FROM dual
+            ) s
+            ON (t.sku = s.sku)
+            WHEN MATCHED THEN UPDATE SET
+              title = s.title, category = s.category, unit_price_cents = s.unit_price_cents,
+              stock_units = s.stock_units, source_mongo_id = s.source_mongo_id,
+              kafka_msg_key = s.kafka_msg_key, updated_at = SYSTIMESTAMP
+            WHEN NOT MATCHED THEN INSERT (
+              sku, title, category, unit_price_cents, stock_units, source_mongo_id, kafka_msg_key
+            ) VALUES (
+              s.sku, s.title, s.category, s.unit_price_cents, s.stock_units,
+              s.source_mongo_id, s.kafka_msg_key
+            )
+            """,
+            {
+                "sku": sku,
+                "title": title[:512],
+                "category": category,
+                "unit_price_cents": unit_price_cents,
+                "stock_units": stock_units,
+                "source_mongo_id": (source_mongo_id or "")[:96] or None,
+                "kafka_msg_key": (kafka_msg_key or "")[:160] or None,
+            },
+        )
+        return True
+    except Exception as e:
+        if merge_errors is not None and len(merge_errors) < 3:
+            merge_errors.append(str(e))
+        return False
+
+
+def fetch_view_oracle() -> dict[str, Any]:
+    conn, err = _oracle_connect()
+    if conn is None:
+        return {"ok": False, "error": err or "Oracle connection unavailable."}
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, sku, title, category, unit_price_cents, stock_units,
+                   source_mongo_id, kafka_msg_key, updated_at
+            FROM (
+              SELECT * FROM scenario_catalog_mirror_oracle ORDER BY id DESC
+            )
+            WHERE ROWNUM <= 40
+            """
+        )
+        cols = [d[0].lower() for d in cur.description]
+        rows = [_oracle_row_to_json(dict(zip(cols, r))) for r in cur.fetchall()]
+        return {"ok": True, "table": "scenario_catalog_mirror_oracle", "rows": rows}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    finally:
+        conn.close()
+
+
+ORACLE_WORKLOAD_NAME_MAX_CHARS = int(
+    os.environ.get("ORACLE_WORKLOAD_NAME_MAX_CHARS", "4000")
+)
+
+
+def workload_oracle_batch(
+    run_id: str,
+    seq_base: int,
+    total_records: int,
+    batch_size: int,
+    pad: str,
+) -> tuple[int, str | None]:
+    conn, err = _oracle_connect()
+    if conn is None:
+        return 0, err or "oracle unavailable"
+    lim = max(64, min(ORACLE_WORKLOAD_NAME_MAX_CHARS, 4000))
+    n = 0
+    try:
+        cur = conn.cursor()
+        for start in range(0, total_records, batch_size):
+            chunk = []
+            for j in range(start, min(start + batch_size, total_records)):
+                i = seq_base + j
+                name = (f"wl-{run_id}-{i}|{pad}")[:lim]
+                chunk.append({"run_id": run_id, "seq": i, "name": name})
+            cur.executemany(
+                """
+                INSERT INTO hub_workload_oracle (run_id, seq, name)
+                VALUES (:run_id, :seq, :name)
+                """,
+                chunk,
+            )
+            n += len(chunk)
+        conn.commit()
+        return n, None
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return n, str(e)
+    finally:
+        conn.close()
+
+
+def fetch_workload_sample_oracle(run_id: str, limit: int) -> dict[str, Any]:
+    conn, err = _oracle_connect()
+    if conn is None:
+        return {"ok": False, "error": err or "Oracle connection unavailable."}
+    try:
+        lim = max(1, min(int(limit), 500))
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, run_id, seq, name, created_at
+            FROM (
+              SELECT id, run_id, seq, name, created_at
+              FROM hub_workload_oracle
+              WHERE run_id = :run_id
+              ORDER BY seq DESC
+            )
+            WHERE ROWNUM <= :lim
+            """,
+            {"run_id": run_id, "lim": lim},
+        )
+        cols = [d[0].lower() for d in cur.description]
+        rows = []
+        for r in cur.fetchall():
+            d = _oracle_row_to_json(dict(zip(cols, r)))
+            if d.get("name"):
+                nm = str(d["name"])
+                d["name"] = nm[:200] + ("…" if len(nm) > 200 else "")
+            rows.append(d)
+        return {"ok": True, "count": len(rows), "rows": rows}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    finally:
+        conn.close()
+
+
 def op_pipeline_mongo_to_postgres_and_kafka() -> dict[str, Any]:
     """
     Consume-from-Mongo pattern (here: synchronous pull). Writes mirror rows in Postgres,
@@ -612,8 +829,11 @@ def op_pipeline_mongo_to_postgres_and_kafka() -> dict[str, Any]:
     mc.close()
     mirrored = 0
     mssql_ok = 0
+    oracle_ok = 0
     kafka_ok = 0
     mssql_conn, mssql_err = _mssql_connect()
+    oracle_conn, oracle_err = _oracle_connect()
+    oracle_merge_errors: list[str] = []
     try:
         with httpx.Client(timeout=60.0) as hc:
             ensure_scenario_os_index(hc)
@@ -671,16 +891,38 @@ def op_pipeline_mongo_to_postgres_and_kafka() -> dict[str, Any]:
                         msg_key,
                     ):
                         mssql_ok += 1
+                    if oracle_merge_catalog_row(
+                        oracle_conn,
+                        str(sku),
+                        str(d.get("title", "")),
+                        d.get("category"),
+                        int(d.get("unit_price_cents", 0)),
+                        int(d.get("stock_units", 0)),
+                        str(d.get("_id", "")),
+                        msg_key,
+                        oracle_merge_errors,
+                    ):
+                        oracle_ok += 1
                 conn.commit()
                 if mssql_conn is not None:
                     try:
                         mssql_conn.commit()
                     except Exception:
                         pass
+                if oracle_conn is not None:
+                    try:
+                        oracle_conn.commit()
+                    except Exception:
+                        pass
     finally:
         if mssql_conn is not None:
             try:
                 mssql_conn.close()
+            except Exception:
+                pass
+        if oracle_conn is not None:
+            try:
+                oracle_conn.close()
             except Exception:
                 pass
 
@@ -700,13 +942,29 @@ def op_pipeline_mongo_to_postgres_and_kafka() -> dict[str, Any]:
         "mongo_docs_processed": len(docs),
         "postgres_rows_touched": mirrored,
         "mssql_rows_upserted": mssql_ok,
+        "oracle_rows_upserted": oracle_ok,
         "kafka_events_sent": kafka_ok,
         "opensearch_mirrored": mirrored,
         "note": "OpenSearch holds the same logical stream Connect would sink from Kafka. "
-        "SQL Server mirror + Debezium CDC when mssql-publisher is configured.",
+        "SQL Server mirror + Debezium CDC when mssql-publisher is configured. "
+        "Oracle mirror when oracle service is configured.",
     }
     if mssql_conn is None and mssql_err and MSSQL_HOST and MSSQL_SA_PASSWORD:
         out["mssql_connect_error"] = mssql_err
+    if oracle_conn is None and oracle_err and ORACLE_HOST and ORACLE_PASSWORD:
+        out["oracle_connect_error"] = oracle_err
+    if oracle_merge_errors:
+        out["oracle_merge_errors"] = oracle_merge_errors
+    if (
+        oracle_conn is not None
+        and len(docs) > 0
+        and oracle_ok == 0
+        and not oracle_merge_errors
+    ):
+        out["oracle_merge_hint"] = (
+            "Connected but no MERGE succeeded; run Job oracle-demo-bootstrap "
+            "(creates scenario_catalog_mirror_oracle)."
+        )
     return out
 
 

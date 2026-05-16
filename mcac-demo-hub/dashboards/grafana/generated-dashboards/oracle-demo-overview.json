@@ -1,0 +1,257 @@
+{
+  "annotations": { "list": [] },
+  "description": "Oracle 23c Free demo (gvenzl/oracle-free) via iamseth/oracledb_exporter. Job oracle_demo; PDB FREEPDB1 user demo.",
+  "editable": true,
+  "gnetId": null,
+  "graphTooltip": 1,
+  "hideControls": false,
+  "id": null,
+  "links": [],
+  "refresh": "30s",
+  "rows": [
+    {
+      "collapse": false,
+      "collapsed": false,
+      "height": "300px",
+      "panels": [
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "$PROMETHEUS_DS",
+          "fill": 1,
+          "fillGradient": 0,
+          "gridPos": { "h": 8, "w": 8, "x": 0, "y": 0 },
+          "id": 801,
+          "legend": { "alignAsTable": true, "avg": false, "current": true, "max": true, "min": false, "show": true, "values": true },
+          "lines": true,
+          "linewidth": 1,
+          "nullPointMode": "null",
+          "percentage": false,
+          "pointradius": 2,
+          "points": false,
+          "renderer": "flot",
+          "seriesOverrides": [],
+          "spaceLength": 10,
+          "stack": false,
+          "steppedLine": false,
+          "targets": [
+            {
+              "expr": "oracledb_up{job=\"oracle_demo\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "{{instance}}",
+              "refId": "A"
+            }
+          ],
+          "thresholds": [],
+          "title": "oracledb_up (scrape health)",
+          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "type": "graph",
+          "xaxis": { "mode": "time", "show": true, "values": [] },
+          "yaxes": [
+            { "format": "short", "logBase": 1, "max": 1, "min": 0, "show": true },
+            { "format": "short", "logBase": 1, "show": false }
+          ]
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "$PROMETHEUS_DS",
+          "fill": 1,
+          "fillGradient": 0,
+          "gridPos": { "h": 8, "w": 8, "x": 8, "y": 0 },
+          "id": 802,
+          "legend": { "alignAsTable": true, "avg": false, "current": true, "max": true, "min": false, "show": true, "values": true },
+          "lines": true,
+          "linewidth": 1,
+          "nullPointMode": "null",
+          "percentage": false,
+          "pointradius": 2,
+          "points": false,
+          "renderer": "flot",
+          "seriesOverrides": [],
+          "spaceLength": 10,
+          "stack": false,
+          "steppedLine": false,
+          "targets": [
+            {
+              "expr": "oracledb_sessions_activity{job=\"oracle_demo\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "{{status}}",
+              "refId": "A"
+            }
+          ],
+          "thresholds": [],
+          "title": "Session activity (oracledb_sessions_activity)",
+          "tooltip": { "shared": true, "sort": 2, "value_type": "individual" },
+          "type": "graph",
+          "xaxis": { "mode": "time", "show": true, "values": [] },
+          "yaxes": [
+            { "format": "short", "logBase": 1, "min": 0, "show": true },
+            { "format": "short", "logBase": 1, "show": false }
+          ]
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "$PROMETHEUS_DS",
+          "fill": 1,
+          "fillGradient": 0,
+          "gridPos": { "h": 8, "w": 8, "x": 16, "y": 0 },
+          "id": 803,
+          "legend": { "alignAsTable": true, "avg": true, "current": true, "max": true, "min": false, "show": true, "values": true },
+          "lines": true,
+          "linewidth": 1,
+          "nullPointMode": "null",
+          "percentage": false,
+          "pointradius": 2,
+          "points": false,
+          "renderer": "flot",
+          "seriesOverrides": [],
+          "spaceLength": 10,
+          "stack": false,
+          "steppedLine": false,
+          "targets": [
+            {
+              "expr": "rate(oracledb_activity_execute_count{job=\"oracle_demo\"}[5m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "execute/s",
+              "refId": "A"
+            }
+          ],
+          "thresholds": [],
+          "title": "SQL execute rate",
+          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "type": "graph",
+          "xaxis": { "mode": "time", "show": true, "values": [] },
+          "yaxes": [
+            { "format": "short", "logBase": 1, "min": 0, "show": true },
+            { "format": "short", "logBase": 1, "show": false }
+          ]
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "$PROMETHEUS_DS",
+          "fill": 1,
+          "fillGradient": 0,
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+          "id": 804,
+          "legend": { "alignAsTable": true, "avg": false, "current": true, "max": true, "min": false, "show": true, "values": true },
+          "lines": true,
+          "linewidth": 1,
+          "nullPointMode": "null",
+          "percentage": false,
+          "pointradius": 2,
+          "points": false,
+          "renderer": "flot",
+          "seriesOverrides": [],
+          "spaceLength": 10,
+          "stack": false,
+          "steppedLine": false,
+          "targets": [
+            {
+              "expr": "oracledb_tablespace_used_percent{job=\"oracle_demo\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "{{tablespace}}",
+              "refId": "A"
+            }
+          ],
+          "thresholds": [],
+          "title": "Tablespace used %",
+          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "type": "graph",
+          "xaxis": { "mode": "time", "show": true, "values": [] },
+          "yaxes": [
+            { "format": "percent", "logBase": 1, "max": 100, "min": 0, "show": true },
+            { "format": "short", "logBase": 1, "show": false }
+          ]
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "$PROMETHEUS_DS",
+          "fill": 1,
+          "fillGradient": 0,
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+          "id": 805,
+          "legend": { "alignAsTable": true, "avg": true, "current": false, "max": true, "min": false, "show": true, "values": true },
+          "lines": true,
+          "linewidth": 1,
+          "nullPointMode": "null",
+          "percentage": false,
+          "pointradius": 2,
+          "points": false,
+          "renderer": "flot",
+          "seriesOverrides": [],
+          "spaceLength": 10,
+          "stack": false,
+          "steppedLine": false,
+          "targets": [
+            {
+              "expr": "rate(oracledb_wait_time_user_io{job=\"oracle_demo\"}[5m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "user_io wait/s",
+              "refId": "A"
+            }
+          ],
+          "thresholds": [],
+          "title": "User I/O wait time rate",
+          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "type": "graph",
+          "xaxis": { "mode": "time", "show": true, "values": [] },
+          "yaxes": [
+            { "format": "short", "logBase": 1, "min": 0, "show": true },
+            { "format": "short", "logBase": 1, "show": false }
+          ]
+        }
+      ],
+      "repeat": null,
+      "showTitle": true,
+      "title": "Oracle (demo hub, oracledb_exporter)",
+      "titleSize": "h6",
+      "type": "row"
+    }
+  ],
+  "schemaVersion": 14,
+  "style": "dark",
+  "tags": ["oracle", "demo"],
+  "templating": {
+    "list": [
+      {
+        "current": { "text": "prometheus", "value": "prometheus" },
+        "hide": 2,
+        "label": null,
+        "name": "PROMETHEUS_DS",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "type": "datasource"
+      }
+    ]
+  },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {
+    "refresh_intervals": ["5s", "10s", "30s", "1m", "5m", "15m", "30m", "1h"],
+    "time_options": ["5m", "15m", "1h", "6h", "12h", "24h"]
+  },
+  "timezone": "browser",
+  "title": "Oracle (demo hub)",
+  "uid": "demo-oracle",
+  "version": 1
+}

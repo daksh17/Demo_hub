@@ -395,3 +395,16 @@ scrape_configs:
         labels:
           mssql_role: subscriber
           mssql_cluster: demo-hub
+
+  # Oracle 23c Free (iamseth/oracledb_exporter — demo PDB FREEPDB1)
+  - job_name: "oracle_demo"
+    scrape_interval: 30s
+    scrape_timeout: 25s
+    metrics_path: /metrics
+    scheme: http
+    static_configs:
+      - targets:
+          - oracle-exporter:9161
+        labels:
+          oracle_cluster: demo-hub
+          oracle_service: FREEPDB1

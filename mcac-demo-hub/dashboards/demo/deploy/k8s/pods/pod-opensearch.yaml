@@ -14,7 +14,7 @@ spec:
       imagePullPolicy: IfNotPresent
       env:
         - name: OPENSEARCH_JAVA_OPTS
-          value: "-Xms512m -Xmx512m -XX:MaxDirectMemorySize=256m"
+          value: "-Xms1g -Xmx1g -XX:MaxDirectMemorySize=512m"
         - name: DISABLE_SECURITY_PLUGIN
           value: "true"
         - name: DISABLE_INSTALL_DEMO_CONFIG

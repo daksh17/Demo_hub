@@ -111,16 +111,20 @@ ENV LD_PRELOAD=/opt/bitnami/common/lib/libnss_wrapper.so
 ENV NSS_WRAPPER_PASSWD=/opt/bitnami/mcac-nss/passwd
 ENV NSS_WRAPPER_GROUP=/opt/bitnami/mcac-nss/group
 
-# WAL archive helper (archive_command set in conf.d — not via POSTGRESQL_EXTRA_FLAGS; Bitnami splits flags on spaces, breaking mkdir -p / test -f).
+# WAL archive + pg_cron cron.host: set in conf.d (init on K8s, bind-mount on Compose) — not via POSTGRESQL_EXTRA_FLAGS; Bitnami splits flags on spaces (breaks quoted values and some -c forms).
 # K8s init writes archive_command to this path (must stay in sync with gen_demo_hub_k8s._postgres_ha_init_containers).
 COPY mcac-wal-archive.sh /opt/bitnami/scripts/mcac-wal-archive.sh
 RUN chmod 0755 /opt/bitnami/scripts/mcac-wal-archive.sh && chown 1001:0 /opt/bitnami/scripts/mcac-wal-archive.sh
 
-# pg_cron, pg_repack, pg_partman — compiled with Bitnami pg_config (same tree as repmgr).
+COPY 07-pg_hba-local-demo-postgres-trust.sh /docker-entrypoint-initdb.d/07-pg_hba-local-demo-postgres-trust.sh
+RUN chmod 0755 /docker-entrypoint-initdb.d/07-pg_hba-local-demo-postgres-trust.sh && chown 1001:0 /docker-entrypoint-initdb.d/07-pg_hba-local-demo-postgres-trust.sh
+
+# pg_cron, pg_repack, pg_partman — compiled with Bitnami pg_config; pg_profile SQL extension tarball.
 USER root
 ARG PG_CRON_VERSION=1.6.4
 ARG PG_REPACK_VERSION=1.5.2
 ARG PG_PARTMAN_VERSION=5.2.4
+ARG PG_PROFILE_VERSION=4.11
 RUN set -eux; \
   PG_CONFIG=/opt/bitnami/postgresql/bin/pg_config; \
   export PG_CONFIG; \
@@ -141,6 +145,8 @@ RUN set -eux; \
   cd "$PARTMAN_DIR"; make install; cd /tmp; rm -rf "$PARTMAN_DIR"; \
   PKGLIB="$("$PG_CONFIG" --pkglibdir)"; \
   SHARE="$("$PG_CONFIG" --sharedir)"; \
+  curl -fsSL "https://github.com/zubkov-andrei/pg_profile/releases/download/${PG_PROFILE_VERSION}/pg_profile--${PG_PROFILE_VERSION}.tar.gz" \
+    | tar xz -C "${SHARE}/extension"; \
   chown -R 1001:1001 "$PKGLIB" "${SHARE}/extension" /opt/bitnami/postgresql/share/extension \
     /opt/bitnami/postgresql/bin/pg_repack 2>/dev/null || true; \
   apt-get purge -y build-essential liblz4-dev zlib1g-dev libssl-dev libreadline-dev libxslt1-dev; \

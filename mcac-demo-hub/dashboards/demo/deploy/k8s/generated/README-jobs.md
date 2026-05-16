@@ -10,8 +10,11 @@ Generated Jobs (apply **after** workloads are running):
 | **cassandra-demo-schema** | `demo_hub` keyspace with **RF=3** + placeholder table (ring replication). |
 | **mongo-demo-bootstrap** | Config RS → shard RS → addShard → sharded collections (mirrors `mongo-sharded/*.sh` + `prepare-demo-collections.sh`). |
 | **mssql-demo-bootstrap** | Publisher + subscriber schema (`sqlcmd`), optional replication try, then **register-mssql-connectors.sh** against **kafka-connect:8083** (needs Connect rollout first — see `apply-data-bootstrap.sh`). |
+| **oracle-demo-bootstrap** | Demo schema on **oracle** (`gvenzl/oracle-free`, PDB `FREEPDB1`, user `demo`) — tables, packages, procedures, functions, triggers, views, MVs. |
 
 Re-run: `kubectl delete job -n demo-hub <name>` then `kubectl apply -f …` again.
+
+**demo-tools** Deployment: client toolbox pod (`demo-hub/demo-tools:latest`, build `build-demo-tools-image.sh`). `kubectl exec -it deploy/demo-tools -- bash -l`.
 
 Not generated here: **postgres/mongo kafka-connect-register** beyond MSSQL (use host scripts against `kafka-connect:8083` if needed). MCAC agent JAR is populated by StatefulSet **initContainer** (`mcac-copy-agent`); build **`mcac-demo/mcac-init:local`** from the repo-root **Dockerfile** (`deploy/k8s/scripts/build-mcac-init-image.sh`).
 

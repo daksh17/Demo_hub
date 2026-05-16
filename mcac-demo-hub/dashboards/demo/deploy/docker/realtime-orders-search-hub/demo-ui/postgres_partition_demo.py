@@ -329,7 +329,7 @@ def partition_demo_sql_blueprint(
         }
     )
 
-    blocks = []
+    blocks: list[str] = []
     for s in sections:
         hdr = f"-- === {s['title']} ==="
         nb = s.get("note")
@@ -966,3 +966,46 @@ def partition_demo_extra_seed(app_dsn: str, kind: PartitionKind, n: int) -> dict
 def partition_demo_remove_cron(admin_dsn: str) -> dict[str, Any]:
     _unschedule_cron(admin_dsn)
     return {"ok": True, "unscheduled": _CRON_JOB}
+
+
+def partition_demo_repair_pg_cron_nodename(admin_dsn: str) -> dict[str, Any]:
+    """
+    Set ``cron.job.nodename`` to empty string for hub partman maintenance rows.
+
+    pg_cron opens a new libpq connection per run; default ``nodename`` is ``localhost``,
+    which often resolves to IPv6 while PostgreSQL listens on IPv4 only → ``connection failed``.
+    An empty ``nodename`` uses a Unix-domain socket to the same postmaster.
+    """
+    pg_meta = _admin_dsn_for_db(admin_dsn, "postgres")
+    where_inner = _cron_jobs_where_clause().strip()
+    try:
+        with psycopg.connect(pg_meta, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    UPDATE cron.job
+                    SET nodename = ''
+                    WHERE ({where_inner})
+                      AND (nodename IS DISTINCT FROM '')
+                    RETURNING jobid
+                    """,
+                    (_CRON_JOB, _PARTMAN_CRON_CMD_MARKER),
+                )
+                jobids = [row[0] for row in cur.fetchall()]
+    except psycopg.Error as e:
+        if isinstance(e, pg_errors.UndefinedColumn) and "nodename" in str(e).lower():
+            return {
+                "ok": False,
+                "error": str(e),
+                "hint": "This pg_cron build has no nodename column; upgrade pg_cron or set host in postgresql.conf.",
+            }
+        raise
+    return {
+        "ok": True,
+        "updated": len(jobids),
+        "jobids": jobids,
+        "note": (
+            "Past rows in cron.job_run_details stay as failed until new runs succeed. "
+            "Optional: TRUNCATE cron.job_run_details; (superuser) to clear history."
+        ),
+    }

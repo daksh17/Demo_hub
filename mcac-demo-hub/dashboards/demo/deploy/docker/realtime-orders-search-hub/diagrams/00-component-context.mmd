@@ -16,6 +16,15 @@ flowchart TB
     MSUB[(Subscriber :14332)]
   end
 
+  subgraph oracle_demo [Oracle K8s demo-hub]
+    ORA[(Oracle FREEPDB1 :1521)]
+    OEXP[oracle-exporter]
+  end
+
+  subgraph toolbox [Client toolbox K8s]
+    TOOLS[demo-tools pod<br/>psql · mongosh · cqlsh · ora2pg]
+  end
+
   subgraph mongo [MongoDB sharded]
     MONGOS[mongos :27025 host]
     TIC[tic / tac / toe shards]
@@ -42,7 +51,11 @@ flowchart TB
   U --> API
   API --> PG
   API --> MPUB
+  API --> ORA
   API --> MONGOS
+  TOOLS -.-> PG
+  TOOLS -.-> ORA
+  TOOLS -.-> MONGOS
   API --> CS
   API --> RD
   API --> OS
@@ -68,6 +81,8 @@ flowchart TB
   MONGOS --> PROM
   MPUB --> PROM
   MSUB --> PROM
+  ORA --> OEXP
+  OEXP --> PROM
   K --> PROM
   CS --> PROM
   RD --> PROM
