@@ -1,47 +1,91 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  annotations:
-    kompose.cmd: kompose convert -o ./k8s/
-    kompose.version: 1.21.0 (992df58d8)
-  creationTimestamp: null
-  labels:
-    io.kompose.service: dse
   name: dse
+  namespace: killrvideo
+  labels:
+    app: dse
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
-      io.kompose.service: dse
-  strategy: {}
+      app: dse
   template:
     metadata:
-      annotations:
-        kompose.cmd: kompose convert -o ./k8s/
-        kompose.version: 1.21.0 (992df58d8)
-      creationTimestamp: null
       labels:
-        io.kompose.service: dse
+        app: dse
     spec:
       containers:
-      - args:
-        - -s -g
-        env:
-        - name: DS_LICENSE
-          value: accept
-        image: datastax/dse-server:6.7.0
-        imagePullPolicy: ""
-        name: dse
-        ports:
-        - containerPort: 9042
-        - containerPort: 8983
-        - containerPort: 8182
-        resources: {}
-        securityContext:
-          capabilities:
-            add:
-            - IPC_LOCK
-      restartPolicy: Always
-      serviceAccountName: ""
-      volumes: null
-status: {}
+        - name: dse
+          image: datastax/dse-server:6.7.0
+          command:
+            - /entrypoint.sh
+            - dse
+            - cassandra
+            - -f
+            - -s
+            - -g
+          ports:
+            - containerPort: 9042
+            - containerPort: 8983
+            - containerPort: 8182
+          env:
+            - name: DS_LICENSE
+              value: accept
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: JVM_EXTRA_OPTS
+              value: "-Xms4g -Xmx4g -Ddse.system_memory_in_mb=12288 -XX:MaxDirectMemorySize=4g -Dinsights.default_mode=disabled"
+            # DataStax docker env vars (merged into default cassandra.yaml by entrypoint)
+            - name: LISTEN_ADDRESS
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: BROADCAST_ADDRESS
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: NATIVE_TRANSPORT_ADDRESS
+              value: "0.0.0.0"
+            - name: NATIVE_TRANSPORT_BROADCAST_ADDRESS
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: SEEDS
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          securityContext:
+            capabilities:
+              add:
+                - IPC_LOCK
+          volumeMounts:
+            - name: dse-data
+              mountPath: /var/lib/cassandra
+          startupProbe:
+            tcpSocket:
+              port: 9042
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            tcpSocket:
+              port: 9042
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests:
+              memory: 8Gi
+              cpu: "1"
+            limits:
+              memory: 14Gi
+              cpu: "4"
+      volumes:
+        - name: dse-data
+          persistentVolumeClaim:
+            claimName: dse-data

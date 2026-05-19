@@ -1,0 +1,20 @@
+# Shared init-container snippet: wait until dse-config has created the killrvideo keyspace.
+# Used by backend (and inlined in generator via backend readiness).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: wait-for-keyspace
+  namespace: killrvideo
+data:
+  wait.sh: |
+    #!/bin/sh
+    set -e
+    until cqlsh dse 9042 -e "SELECT now() FROM system.local" >/dev/null 2>&1; do
+      echo "waiting for dse cql on dse:9042..."
+      sleep 5
+    done
+    until cqlsh dse 9042 -e "DESCRIBE KEYSPACE killrvideo" 2>/dev/null | grep -q killrvideo; do
+      echo "waiting for keyspace killrvideo..."
+      sleep 10
+    done
+    echo "killrvideo keyspace is ready"

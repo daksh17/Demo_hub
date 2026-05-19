@@ -1,41 +1,36 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  annotations:
-    kompose.cmd: kompose convert -o ./k8s/
-    kompose.service.type: nodeport
-    kompose.version: 1.21.0 (992df58d8)
-  creationTimestamp: null
-  labels:
-    io.kompose.service: web
   name: web
+  namespace: killrvideo
+  labels:
+    app: web
 spec:
   replicas: 1
   selector:
     matchLabels:
-      io.kompose.service: web
-  strategy: {}
+      app: web
   template:
     metadata:
-      annotations:
-        kompose.cmd: kompose convert -o ./k8s/
-        kompose.service.type: nodeport
-        kompose.version: 1.21.0 (992df58d8)
-      creationTimestamp: null
       labels:
-        io.kompose.service: web
+        app: web
     spec:
+      initContainers:
+        - name: wait-for-backend
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              until nc -z backend 50101; do
+                echo "waiting for backend:50101..."
+                sleep 5
+              done
       containers:
-      - env:
-        - name: KILLRVIDEO_LOGGING_LEVEL
-          value: debug
-        image: killrvideo/killrvideo-web:3
-        imagePullPolicy: ""
-        name: web
-        ports:
-        - containerPort: 3000
-        resources: {}
-      restartPolicy: Always
-      serviceAccountName: ""
-      volumes: null
-status: {}
+        - name: web
+          image: killrvideo/killrvideo-web:3
+          ports:
+            - containerPort: 3000
+          env:
+            - name: KILLRVIDEO_LOGGING_LEVEL
+              value: debug

@@ -123,12 +123,78 @@ Use the official KillrVideo docs to implement or extend each part of the archite
 
 ## Prerequisites
 
-- **Docker** and **Docker Compose** (v2 recommended: `docker compose` with a space).
+- **Docker** and **Docker Compose** (v2 recommended: `docker compose` with a space), **or** a local Kubernetes cluster (OrbStack, Docker Desktop, kind, minikube).
 - A few minutes for first-time image pulls and DSE startup.
 
 ---
 
-## Quick Start
+## Quick Start (Kubernetes)
+
+Manifests live under **`k8s/`** (Kustomize). They mirror `docker-compose-all-in-one.yml` (DSE, schema bootstrap job, backend, web, studio, generator). Optional Kafka overlay: `k8s/overlays/with-kafka/`.
+
+More detail and troubleshooting: **[k8s/README.md](k8s/README.md)**.
+
+### Start
+
+```bash
+cd killrvideo-all-in-one
+chmod +x scripts/k8s-*.sh
+./scripts/k8s-up.sh
+```
+
+Watch until pods are ready (first start: **5–10 minutes** for DSE):
+
+```bash
+kubectl get pods -n killrvideo -w
+```
+
+Open the UIs (same ports as Docker Compose):
+
+```bash
+./scripts/k8s-port-forward.sh
+```
+
+| Service | URL |
+|---------|-----|
+| Web UI | http://localhost:3000 |
+| Studio | http://localhost:9091 |
+| Backend gRPC | `kubectl port-forward -n killrvideo svc/backend 50101:50101` |
+
+Allow **3–5 minutes** after the backend is ready for the generator to populate videos.
+
+### Stop
+
+```bash
+./scripts/k8s-down.sh
+```
+
+Removes the `killrvideo` namespace and all resources.
+
+### Start again
+
+```bash
+./scripts/k8s-up.sh
+./scripts/k8s-port-forward.sh
+```
+
+### If DSE fails after restart
+
+Wipe DSE data and redeploy (fixes crash loops or stale `localhost` bind):
+
+```bash
+./scripts/k8s-reset-dse.sh
+./scripts/k8s-port-forward.sh
+```
+
+### Notes
+
+- Allocate **12 GB+** RAM to OrbStack/Docker Desktop; DSE Search+Graph is heavy (JVM capped in manifests).
+- `Collectd start failed` in DSE logs is harmless (Insights metrics); safe to ignore.
+- Images are **amd64**; OrbStack/Docker Desktop on Apple Silicon usually handles this via emulation.
+
+---
+
+## Quick Start (Docker)
 
 ```bash
 cd killrvideo-all-in-one
