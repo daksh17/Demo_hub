@@ -1,20 +1,18 @@
-apiVersion: apps/v1
-kind: Deployment
+apiVersion: batch/v1
+kind: Job
 metadata:
-  name: studio
+  name: dse-config
   namespace: killrvideo
   labels:
-    app: studio
+    app: dse-config
 spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: studio
+  backoffLimit: 10
   template:
     metadata:
       labels:
-        app: studio
+        app: dse-config
     spec:
+      restartPolicy: OnFailure
       initContainers:
         - name: wait-for-dse
           image: busybox:1.36
@@ -27,10 +25,8 @@ spec:
                 sleep 5
               done
       containers:
-        - name: studio
-          image: datastax/dse-studio:6.7.0
-          ports:
-            - containerPort: 9091
+        - name: dse-config
+          image: killrvideo/killrvideo-dse-config:3
           env:
-            - name: DS_LICENSE
-              value: accept
+            - name: KILLRVIDEO_SERVICE_DISCOVERY_DISABLED
+              value: "true"

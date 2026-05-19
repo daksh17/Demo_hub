@@ -1,25 +1,20 @@
 apiVersion: v1
 kind: Service
 metadata:
-  annotations:
-    kompose.cmd: kompose convert -o ./k8s/
-    kompose.version: 1.21.0 (992df58d8)
-  creationTimestamp: null
-  labels:
-    io.kompose.service: dse
   name: dse
+  namespace: killrvideo
+  labels:
+    app: dse
 spec:
-  ports:
-  - name: "9042"
-    port: 9042
-    targetPort: 9042
-  - name: "8983"
-    port: 8983
-    targetPort: 8983
-  - name: "8182"
-    port: 8182
-    targetPort: 8182
   selector:
-    io.kompose.service: dse
-status:
-  loadBalancer: {}
+    app: dse
+  ports:
+    - name: cql
+      port: 9042
+      targetPort: 9042
+    - name: search
+      port: 8983
+      targetPort: 8983
+    - name: graph
+      port: 8182
+      targetPort: 8182

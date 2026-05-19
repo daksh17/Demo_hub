@@ -1,21 +1,15 @@
 apiVersion: v1
 kind: Service
 metadata:
-  annotations:
-    kompose.cmd: kompose convert -o ./k8s/
-    kompose.service.type: nodeport
-    kompose.version: 1.21.0 (992df58d8)
-  creationTimestamp: null
-  labels:
-    io.kompose.service: studio
   name: studio
+  namespace: killrvideo
+  labels:
+    app: studio
 spec:
-  ports:
-  - name: "9091"
-    port: 9091
-    targetPort: 9091
+  type: ClusterIP
   selector:
-    io.kompose.service: studio
-  type: NodePort
-status:
-  loadBalancer: {}
+    app: studio
+  ports:
+    - name: http
+      port: 9091
+      targetPort: 9091
